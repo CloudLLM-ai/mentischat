@@ -210,18 +210,20 @@ impl Bus {
                 |r| r.get(0),
             )
             .map_err(sqlite_storage)?;
-        g.conn
-            .execute(
+        {
+            let tx = g.conn.transaction().map_err(sqlite_storage)?;
+            tx.execute(
                 "DELETE FROM messages WHERE recipient = ?1",
                 params![name.as_str()],
             )
             .map_err(sqlite_storage)?;
+            tx.execute("DELETE FROM roster WHERE name = ?1", params![name.as_str()])
+                .map_err(sqlite_storage)?;
+            tx.commit().map_err(sqlite_storage)?;
+        }
         // Dropping senders wakes those pulls; they re-lock, see the name is
         // gone, and fail unregistered.
         g.waiters.remove(name.as_str());
-        g.conn
-            .execute("DELETE FROM roster WHERE name = ?1", params![name.as_str()])
-            .map_err(sqlite_storage)?;
         Ok(DiscardOutcome {
             agent: name.to_string(),
             discarded,
@@ -231,6 +233,9 @@ impl Bus {
     /// Current roster sorted by name ascending.
     pub async fn list_agents(&self) -> Result<Vec<RosterEntry>, MailErr> {
         let g = self.inner.lock().await;
+        if g.closed {
+            return Err(MailErr::ShuttingDown);
+        }
         let mut stmt = g
             .conn
             .prepare("SELECT name, last_seen FROM roster ORDER BY name ASC")
@@ -408,6 +413,9 @@ impl Bus {
     /// Does not promote, ack, or touch `last_seen`.
     pub async fn stats(&self) -> Result<(i64, i64), MailErr> {
         let g = self.inner.lock().await;
+        if g.closed {
+            return Err(MailErr::ShuttingDown);
+        }
         let agents: i64 = g
             .conn
             .query_row("SELECT COUNT(*) FROM roster", [], |r| r.get(0))
@@ -436,29 +444,40 @@ fn empty_page(name: &crate::names::AgentName) -> InboxPage {
     }
 }
 
-fn sqlite_storage(_e: rusqlite::Error) -> MailErr {
+fn sqlite_storage(e: rusqlite::Error) -> MailErr {
+    tracing::error!(error = %e, "sqlite error");
     MailErr::StorageFull { pending: -1 }
 }
 
 fn ensure_registered(g: &Inner, name: &str) -> Result<(), MailErr> {
-    let known = roster_sorted(g);
-    if known.iter().any(|n| n == name) {
+    let exists: bool = g
+        .conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM roster WHERE name = ?1)",
+            params![name],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_storage)?;
+    if exists {
         return Ok(());
     }
     Err(MailErr::Unregistered {
         agent: name.to_string(),
-        known,
+        known: roster_sorted(g)?,
     })
 }
 
-fn roster_sorted(g: &Inner) -> Vec<String> {
-    let mut stmt = match g.conn.prepare("SELECT name FROM roster ORDER BY name ASC") {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    stmt.query_map([], |r| r.get::<_, String>(0))
-        .map(|rows| rows.filter_map(Result::ok).collect())
-        .unwrap_or_default()
+fn roster_sorted(g: &Inner) -> Result<Vec<String>, MailErr> {
+    let mut stmt = g
+        .conn
+        .prepare("SELECT name FROM roster ORDER BY name ASC")
+        .map_err(sqlite_storage)?;
+    let names = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(sqlite_storage)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sqlite_storage)?;
+    Ok(names)
 }
 
 fn apply_acks(g: &mut Inner, name: &str, ack_ids: &[String]) -> Result<(), MailErr> {

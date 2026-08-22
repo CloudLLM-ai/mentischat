@@ -6,8 +6,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use llm_chat::bus::Bus;
-
-const BIND_ADDR: &str = "127.0.0.1:9480";
+use llm_chat::BIND_ADDR;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -16,12 +15,15 @@ async fn main() -> ExitCode {
         .compact()
         .init();
 
-    let data_dir = match std::env::var("HOME") {
-        Ok(home) => PathBuf::from(home).join(".llm_chat"),
-        Err(_) => {
-            eprintln!("llm_chat: HOME is not set; cannot locate data dir");
-            return ExitCode::FAILURE;
-        }
+    let data_dir = match std::env::var("LLM_CHAT_DIR") {
+        Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => match std::env::var("HOME") {
+            Ok(home) => PathBuf::from(home).join(".llm_chat"),
+            Err(_) => {
+                eprintln!("llm_chat: HOME is not set; cannot locate data dir");
+                return ExitCode::FAILURE;
+            }
+        },
     };
 
     let bus = Arc::new(match Bus::new(&data_dir) {
@@ -51,12 +53,10 @@ async fn main() -> ExitCode {
     let app = llm_chat::build_router(bus.clone());
     let shutdown_bus = bus.clone();
 
-    println!(
-        "llm_chat: serving http://{BIND_ADDR}/mcp and REST on {}",
-        listener
-            .local_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_default()
+    tracing::info!(
+        addr = %BIND_ADDR,
+        data = %data_dir.display(),
+        "serving MCP at /mcp and REST"
     );
 
     let serve = axum::serve(
@@ -95,5 +95,6 @@ async fn shutdown_signal(bus: Arc<Bus>) {
     {
         let _ = tokio::signal::ctrl_c().await;
     }
+    tracing::info!("shutting down");
     bus.shutdown().await;
 }

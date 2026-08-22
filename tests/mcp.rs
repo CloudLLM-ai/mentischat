@@ -224,3 +224,49 @@ async fn foreign_origin_gets_403() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status().as_u16(), 200);
 }
+
+#[tokio::test]
+async fn merged_unknown_rest_path_is_not_found_not_mcp_405() {
+    let (_d, app) = app();
+    let req = http::Request::builder()
+        .method("GET")
+        .uri("/definitely-not-a-route")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status().as_u16(), 404);
+    let bytes = BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["error"], "not_found");
+}
+
+#[tokio::test]
+async fn merged_health_is_served_beside_mcp() {
+    let (_d, app) = app();
+    let req = http::Request::builder()
+        .method("GET")
+        .uri("/health")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let bytes = BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["ok"], true);
+}
+
+#[tokio::test]
+async fn non_loopback_peer_is_403() {
+    let dir = tempfile::tempdir().unwrap();
+    let bus = Arc::new(Bus::new(&dir.path().join("offbox")).unwrap());
+    let app = llm_chat::build_router(bus).layer(axum::extract::connect_info::MockConnectInfo(
+        std::net::SocketAddr::from(([8, 8, 8, 8], 9)),
+    ));
+    let req = http::Request::builder()
+        .method("GET")
+        .uri("/health")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status().as_u16(), 403);
+}

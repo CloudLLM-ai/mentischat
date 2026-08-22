@@ -109,6 +109,7 @@ impl ToolProtocol for MailboxProtocol {
         tool_name: &str,
         parameters: Value,
     ) -> Result<ToolResult, Box<dyn std::error::Error + Send + Sync>> {
+        tracing::info!(tool = tool_name, "mcp tool");
         let outcome: Result<Value, MailboxError> = match tool_name {
             "register" => self.register(&parameters).await,
             "deregister" => self.deregister(&parameters).await,
@@ -172,7 +173,7 @@ impl MailboxProtocol {
         let wait_ms = parse_wait_ms(params.get("wait_ms"))?;
         let ack_ids = parse_ack_ids(params.get("ack_ids"))?;
         let page = self.bus.check_inbox(&agent, wait_ms, ack_ids).await?;
-        serde_json::to_value(page).map_err(|_| MailboxError::InvalidBody)
+        Ok(serde_json::to_value(page).expect("InboxPage is always serializable"))
     }
 
     async fn list_agents(&self) -> Result<Value, MailboxError> {

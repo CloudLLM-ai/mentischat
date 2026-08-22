@@ -46,14 +46,29 @@ Every tool also exists as a REST route (`/agents`, `/messages`,
 
 ## Build & run
 
-Requires Rust stable.
+Requires Rust stable. Local boot matches MentisDB: a repo-root `start_*`
+script that `cargo run`s the binary in the foreground; Ctrl-C (or
+`./stop_llm_chat`) stops it.
+
+```bash
+./start_llm_chat                 # cargo run --bin llm_chat
+# Ctrl-C in that terminal, or:
+./stop_llm_chat                  # SIGTERM the process on :9480
+```
+
+Same path after a release build or `cargo install --path . --locked` (the
+MentisDB `mentisdb` on `PATH` equivalent):
 
 ```bash
 cargo build --release
-./target/release/llm_chat            # serves http://127.0.0.1:9480/mcp
+./target/release/llm_chat        # serves http://127.0.0.1:9480/mcp
+# or:
+cargo install --path . --locked
+llm_chat
 ```
 
 Data lives in `~/.llm_chat/pending.sqlite` (mode `0700` dir / `0600` file).
+Override the directory with `LLM_CHAT_DIR`.
 
 ### Wire your harnesses
 

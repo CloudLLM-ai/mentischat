@@ -46,14 +46,14 @@ Every tool also exists as a REST route (`/agents`, `/messages`,
 
 ## Build & run
 
-Requires Rust stable. Local boot matches MentisDB: a repo-root `start_*`
-script that `cargo run`s the binary in the foreground; Ctrl-C (or
-`./stop_mentischat`) stops it.
+Requires Rust stable. Local boot matches MentisDB: `make start` runs the
+daemon in the foreground via cargo; Ctrl-C (or `make stop` in another
+terminal) stops it.
 
 ```bash
-./start_mentischat                 # cargo run --bin mentischat
+make start                          # cargo run --bin mentischat
 # Ctrl-C in that terminal, or:
-./stop_mentischat                  # SIGTERM the process on :9480
+make stop                           # SIGTERM the process on :9480
 ```
 
 Same path after a release build or `cargo install --path . --locked` (the
@@ -106,7 +106,7 @@ launchctl load ~/Library/LaunchAgents/com.mentischat.plist
 
 ```bash
 cargo test          # bus behavior, REST surface, MCP wire protocol
-make-free gates:    cargo clippy --all-targets -- -D warnings && cargo fmt --check
+make clippy         # cargo fmt + clippy --all-targets --all-features -- -D warnings
 ```
 
 ## Trust model & scope

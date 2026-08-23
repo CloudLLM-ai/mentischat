@@ -87,6 +87,7 @@ mentischat/
   Cargo.lock            # committed; pins cloudllm_mcp =0.3.6 et al.
   .gitignore            # /target
   PLAN.md
+  Makefile              # cargo tool handler; make start / make stop for local boot
   src/
     main.rs       bind, fail on EADDRINUSE, SIGINT/SIGTERM graceful close
     store.rs      rusqlite open/migrate; roster + messages rows
@@ -99,8 +100,7 @@ mentischat/
     bus.rs        in-process bus behavior (tempdir)
     http.rs       REST via tower oneshot on the merged Router (no real port)
     mcp.rs        initialize + tools/list + tools/call through the router
-  scripts/
-    run.sh        launchd/dev wrapper: exec target/release/mentischat
+  skills/         agent skills (rust-engineer, rust-performance-reviewer)
   launchd/
     com.mentischat.plist
 ```
@@ -136,9 +136,9 @@ http-body-util  = "0.1"
 Build/test/run:
 
 ```
-cargo test
-cargo build --release        # before launchd install
-./target/release/mentischat
+make test
+make build                   # before launchd install (cargo build --release)
+./target/release/mentischat  # or: make start for the foreground dev loop
 ```
 
 ## Durable pending store
@@ -489,7 +489,7 @@ Agent steps: register → list_agents → send_message (both endpoints registere
 ## launchd
 
 - Label `com.mentischat`; `RunAtLoad` true, `KeepAlive` true
-- `ProgramArguments`: `/bin/bash`, `-lc`, absolute path to `scripts/run.sh`; script does `exec "$HOME/workspace/mentischat/target/release/mentischat"` after `cd` to repo root
+- `ProgramArguments`: `/bin/bash`, `-lc`, `exec <repo>/target/release/mentischat` (absolute path, no wrapper script)
 - Logs: `~/Library/Logs/mentischat.stdout.log` / `.stderr.log`
 - Build release before install. Bind failure → process exits → launchd restarts; if 9480 is held by a healthy daemon, the newcomer must keep dying (never steal the port).
 
@@ -512,7 +512,7 @@ Full TUI live check remains manual.
 3. `rest.rs` + `tests/http.rs`
 4. `tools.rs` (`MailboxProtocol`) + compose routers + `tests/mcp.rs`
 5. `main.rs`: bind loopback, EADDRINUSE exit, SIGINT/SIGTERM graceful close
-6. `cargo build --release`, `scripts/run.sh`, launchd plist
+6. `make build` (release), launchd plist
 7. Wire whichever harnesses exist; run one live initialize handshake early (protocol-version caveat)
 8. Verify:
    - `cargo test`

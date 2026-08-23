@@ -1,8 +1,0 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-cd "$(dirname "$0")"
-
-# Optional configuration overrides (mirrors start_mentisdb):
-# export MENTISCHAT_DIR="$HOME/.cloudllm/mentischat"
-cargo run --bin mentischat

@@ -12,13 +12,13 @@
     <array>
         <string>/bin/bash</string>
         <string>-lc</string>
-        <string>/Users/austinfaulkner-pearce/workspace/mentischat/scripts/run.sh</string>
+        <string>exec /Users/gubatron/workspace/mentischat/target/release/mentischat</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>/Users/austinfaulkner-pearce/workspace/mentischat</string>
+    <string>/Users/gubatron/workspace/mentischat</string>
     <key>StandardOutPath</key>
-    <string>/Users/austinfaulkner-pearce/Library/Logs/mentischat.stdout.log</string>
+    <string>/Users/gubatron/Library/Logs/mentischat.stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/austinfaulkner-pearce/Library/Logs/mentischat.stderr.log</string>
+    <string>/Users/gubatron/Library/Logs/mentischat.stderr.log</string>
 </dict>
 </plist>

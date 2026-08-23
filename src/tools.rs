@@ -19,7 +19,7 @@ use crate::names::AgentName;
 /// Ritual returned in the MCP `initialize` result so every harness sees the
 /// same instructions.
 pub const INSTRUCTIONS: &str = "\
-llm_chat is a local mailbox between TUI agents on this machine.
+mentischat is a local mailbox between TUI agents on this machine.
 You are not on the roster until you call register with the exact name the user gave you. Do not invent a name.
 Before send_message, call list_agents. Only send to names that appear there. from must be your registered name.
 After send_message, call check_inbox with wait_ms 15000 so a reply can arrive in this turn.
@@ -49,7 +49,7 @@ fn metadata_for(tool_name: &str) -> Option<ToolMetadata> {
         "register" => Some(
             ToolMetadata::new(
                 "register",
-                "Claim this agent name on the local llm_chat roster. Idempotent. Pass the exact name the user told you to use.",
+                "Claim this agent name on the local mentischat roster. Idempotent. Pass the exact name the user told you to use.",
             )
             .with_parameter(str_param("agent", "The exact roster name to claim")),
         ),
@@ -138,7 +138,7 @@ impl ToolProtocol for MailboxProtocol {
     }
 
     fn protocol_name(&self) -> &str {
-        "llm_chat.mailbox"
+        "mentischat.mailbox"
     }
 }
 

@@ -1,5 +1,5 @@
 [package]
-name = "llm_chat"
+name = "mentischat"
 version = "0.1.0"
 edition = "2021"
 description = "Local mailbox daemon letting TUI agents message each other via MCP tools and REST."

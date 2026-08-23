@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Stop a locally running mentischat daemon. MentisDB is stopped with Ctrl-C
+# (SIGINT) in the foreground terminal; this script sends the same graceful
+# signal (SIGTERM, which mentischat also handles) to whatever is listening on
+# the mailbox port.
+PORT="${MENTISCHAT_PORT:-9480}"
+
+if ! command -v lsof >/dev/null 2>&1; then
+  echo "mentischat: lsof is required to find the process on port ${PORT}" >&2
+  exit 1
+fi
+
+pids="$(lsof -nP -iTCP:"${PORT}" -sTCP:LISTEN -t 2>/dev/null || true)"
+if [ -z "${pids}" ]; then
+  echo "mentischat: nothing listening on port ${PORT}"
+  exit 0
+fi
+
+echo "mentischat: sending SIGTERM to ${pids} (port ${PORT})"
+# shellcheck disable=SC2086
+kill ${pids}

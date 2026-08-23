@@ -129,8 +129,8 @@ impl Bus {
     ///
     /// ```no_run
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let bus = llm_chat::bus::Bus::new(std::path::Path::new("/tmp/llm_chat_demo"))?;
-    /// bus.register(&llm_chat::names::AgentName::parse("demo")?).await?;
+    /// let bus = mentischat::bus::Bus::new(std::path::Path::new("/tmp/mentischat_demo"))?;
+    /// bus.register(&mentischat::names::AgentName::parse("demo")?).await?;
     /// # Ok(())
     /// # }
     /// ```

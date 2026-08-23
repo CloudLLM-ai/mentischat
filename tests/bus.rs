@@ -3,9 +3,9 @@
 
 use std::sync::Arc;
 
-use llm_chat::bus::Bus;
-use llm_chat::errors::MailboxError;
-use llm_chat::names::AgentName;
+use mentischat::bus::Bus;
+use mentischat::errors::MailboxError;
+use mentischat::names::AgentName;
 
 fn name(s: &str) -> AgentName {
     AgentName::parse(s).expect("valid test name")

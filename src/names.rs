@@ -20,7 +20,7 @@ impl AgentName {
     /// # Examples
     ///
     /// ```
-    /// use llm_chat::names::AgentName;
+    /// use mentischat::names::AgentName;
     ///
     /// assert!(AgentName::parse("grok").is_ok());
     /// assert!(AgentName::parse("grok-review.v2").is_ok());

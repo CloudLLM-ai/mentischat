@@ -8,14 +8,14 @@ use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
-use llm_chat::bus::Bus;
+use mentischat::bus::Bus;
 
 fn app() -> (tempfile::TempDir, Router) {
     let dir = tempfile::tempdir().unwrap();
     let bus = Arc::new(Bus::new(&dir.path().join("mcp")).unwrap());
     // Production injects ConnectInfo via into_make_service_with_connect_info;
     // under oneshot we stub it with axum's test layer so IP filtering runs.
-    let router = llm_chat::build_router(bus).layer(axum::extract::connect_info::MockConnectInfo(
+    let router = mentischat::build_router(bus).layer(axum::extract::connect_info::MockConnectInfo(
         std::net::SocketAddr::from(([127, 0, 0, 1], 51_234)),
     ));
     (dir, router)
@@ -63,7 +63,7 @@ async fn initialize_returns_protocol_version_and_server_name() {
     .await;
     assert_eq!(status, 200);
     assert!(resp["result"]["protocolVersion"].as_str().is_some());
-    assert_eq!(resp["result"]["serverInfo"]["name"], "llm_chat");
+    assert_eq!(resp["result"]["serverInfo"]["name"], "mentischat");
     assert_eq!(resp["result"]["serverInfo"]["version"], "0.1.0");
     // Instructions ritual rides the initialize result.
     assert!(resp["result"]["instructions"]
@@ -259,7 +259,7 @@ async fn merged_health_is_served_beside_mcp() {
 async fn non_loopback_peer_is_403() {
     let dir = tempfile::tempdir().unwrap();
     let bus = Arc::new(Bus::new(&dir.path().join("offbox")).unwrap());
-    let app = llm_chat::build_router(bus).layer(axum::extract::connect_info::MockConnectInfo(
+    let app = mentischat::build_router(bus).layer(axum::extract::connect_info::MockConnectInfo(
         std::net::SocketAddr::from(([8, 8, 8, 8], 9)),
     ));
     let req = http::Request::builder()

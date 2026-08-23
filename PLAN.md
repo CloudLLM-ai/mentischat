@@ -1,10 +1,10 @@
-# llm_chat — local agent-to-agent messaging
+# MentisChat — local agent-to-agent messaging
 
 A single localhost daemon that lets TUI agents (opencode, Grok Build, Claude Code, ChatGPT desktop / Codex CLI) message each other via MCP tools and plain REST.
 
 This is a **communication layer**, not a conversation log. The durable record of a dialogue is still each LLM’s own chat transcript. The daemon **does** persist *undelivered* mail (pending + in-flight) so a burst, a crash, or a truncated tool result does not drop messages. Once the recipient **acks**, the row is deleted. There is no history API.
 
-Name is **llm_chat** everywhere: repo folder, crate/binary name, MCP server id, launchd label.
+Display name is **MentisChat**. Identifier is `mentischat` everywhere: repo folder, crate/binary name, MCP server id, launchd label.
 
 **Status:** plan revised for the CloudLLM backbone; ready to implement. Contracts below are the source of truth; do not invent extra tools, a history API, or auth.
 
@@ -55,7 +55,7 @@ ChatGPT/Codex ─┘         + any future agent or script (REST)
 - **HTTP:** one axum **0.8.x** listener on `127.0.0.1:9480` serving BOTH `/mcp` (cloudllm_mcp router) and REST (our router) merged into one `Router`. Axum must stay 0.8.x — `Router` types must match cloudllm_mcp’s for `.merge()`.
 - **Transport:** Streamable HTTP at `POST /mcp` only. Plain JSON responses (cloudllm_mcp hardwires `application/json`; SSE never used). Confirmed stateless upstream: no `Mcp-Session-Id` issued, required, or validated; notifications answered `202 Accepted`.
 - **Bind:** loopback only, never `0.0.0.0`. Startup binds and **exits non-zero on `EADDRINUSE`** — that is the single-instance lock.
-- **Data dir:** `~/.llm_chat/` (mode `0700`). File `pending.sqlite` (mode `0600`) holds roster + unacked messages only. Tests inject a temp dir via `Bus::new(data_dir)`; they must never write `~/.llm_chat/`.
+- **Data dir:** `~/.cloudllm/mentischat/` (mode `0700`). File `pending.sqlite` (mode `0600`) holds roster + unacked messages only. Tests inject a temp dir via `Bus::new(data_dir)`; they must never write `~/.cloudllm/mentischat/`.
 - **Restart:** roster and unacked messages reload from sqlite. Waiters (HTTP) do not. Agents do **not** re-register after a daemon crash. `deregister` is still how a name leaves.
 
 ### Why HTTP, not stdio
@@ -69,7 +69,7 @@ Verified against source: `MCPServerBuilder` + its default adapter serve legacy r
 ```rust
 let mcp_router = mcp::streamable_http_router(
     &http_cfg,
-    &StreamableHttpConfig::new("llm_chat", "1.0.0").with_endpoint_path("/mcp"),
+    &StreamableHttpConfig::new("mentischat", "1.0.0").with_endpoint_path("/mcp"),
     Arc::new(unified_server),
 );
 let app = mcp_router.merge(rest_router(bus.clone()));
@@ -82,7 +82,7 @@ axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).a
 ## File layout
 
 ```
-llm_chat/
+mentischat/
   Cargo.toml
   Cargo.lock            # committed; pins cloudllm_mcp =0.3.6 et al.
   .gitignore            # /target
@@ -100,16 +100,16 @@ llm_chat/
     http.rs       REST via tower oneshot on the merged Router (no real port)
     mcp.rs        initialize + tools/list + tools/call through the router
   scripts/
-    run.sh        launchd/dev wrapper: exec target/release/llm_chat
+    run.sh        launchd/dev wrapper: exec target/release/mentischat
   launchd/
-    com.llm-chat.plist
+    com.mentischat.plist
 ```
 
-`src/main.rs` is the only process entry. `rest::router(Arc<Bus>)` returns the REST `Router`; tests drive the merged app through `tower::ServiceExt::oneshot` — never bind 9480, never write `~/.llm_chat/`.
+`src/main.rs` is the only process entry. `rest::router(Arc<Bus>)` returns the REST `Router`; tests drive the merged app through `tower::ServiceExt::oneshot` — never bind 9480, never write `~/.cloudllm/mentischat/`.
 
 ## Crate manifest
 
-Crate name `llm_chat`. Commit `Cargo.lock`; versions here are intended majors (pin exacts there):
+Crate name `mentischat`. Commit `Cargo.lock`; versions here are intended majors (pin exacts there):
 
 ```toml
 [dependencies]
@@ -138,7 +138,7 @@ Build/test/run:
 ```
 cargo test
 cargo build --release        # before launchd install
-./target/release/llm_chat
+./target/release/mentischat
 ```
 
 ## Durable pending store
@@ -157,7 +157,7 @@ Waiters stay RAM-only (you cannot persist an HTTP request).
 
 **Engine:** `rusqlite` (bundled SQLite). One `Connection` owned by the bus, guarded by the same mutex as all state — calls are microsecond-scale synchronous ops, fine at localhost scale; no second sqlite library. `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`.
 
-**Path:** `{data_dir}/pending.sqlite`. Production `data_dir` = `$HOME/.llm_chat`, created mode `0700`; file mode `0600`.
+**Path:** `{data_dir}/pending.sqlite`. Production `data_dir` = `$HOME/.cloudllm/mentischat`, created mode `0700`; file mode `0600`.
 
 **Schema** (`from` is reserved in SQL, so columns are `sender` / `recipient`; JSON still uses `from` / `to`):
 
@@ -371,14 +371,14 @@ REST success is always **200** + JSON (including POST/DELETE routes). No 201/204
 
 ### Server info
 
-Provided by cloudllm_mcp: `StreamableHttpConfig::new("llm_chat", "1.0.0")` sets the server name/version returned by `initialize`. Protocol negotiation is upstream-handled: supported versions are `["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]`; unknown `MCP-Protocol-Version` headers are rejected 400. Caveat (verified in source): `initialize` replies with the server’s configured version regardless of the client’s request — live-test each harness early (step 7 wires clients before sign-off for exactly this reason).
+Provided by cloudllm_mcp: `StreamableHttpConfig::new("mentischat", "1.0.0")` sets the server name/version returned by `initialize`. Protocol negotiation is upstream-handled: supported versions are `["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]`; unknown `MCP-Protocol-Version` headers are rejected 400. Caveat (verified in source): `initialize` replies with the server’s configured version regardless of the client’s request — live-test each harness early (step 7 wires clients before sign-off for exactly this reason).
 
 Server `instructions`: verify whether `StreamableHttpConfig` exposes an instructions field during scaffolding. If not, fold the ritual below into every tool description so no behavior depends on it.
 
 Instructions ritual (verbatim intent, same for every harness):
 
 ```
-llm_chat is a local mailbox between TUI agents on this machine.
+mentischat is a local mailbox between TUI agents on this machine.
 You are not on the roster until you call register with the exact name the user gave you. Do not invent a name.
 Before send_message, call list_agents. Only send to names that appear there. from must be your registered name.
 After send_message, call check_inbox with wait_ms 15000 so a reply can arrive in this turn.
@@ -423,7 +423,7 @@ Do not add regex constraints to schemas. Validate handler-side and return the ty
 
 Tool descriptions (product copy):
 
-- `register` — Claim this agent name on the local llm_chat roster. Idempotent. Pass the exact name the user told you to use.
+- `register` — Claim this agent name on the local mentischat roster. Idempotent. Pass the exact name the user told you to use.
 - `deregister` — Leave the roster and discard this name’s undelivered messages. Only call when the user says they are done.
 - `send_message` — Queue a message for a registered agent. Fails if `from` or `to` is not registered. After sending, call check_inbox with wait_ms so a reply can arrive.
 - `check_inbox` — Return the next batch of messages for this registered name (at-least-once). Optional wait_ms (0–30000). Optional ack_ids deletes previously returned in-flight messages. Quote bodies, then ack those ids on the next call. If remaining > 0, call again.
@@ -460,14 +460,14 @@ MCP config only **wires** the tools; it does not put an agent on the roster. A c
 
 | Layer | When | Meaning |
 |---|---|---|
-| Wired | once per harness | client can call llm_chat tools |
+| Wired | once per harness | client can call mentischat tools |
 | Registered | until `deregister` | name is on the roster; others may send to it |
 
 All four clients point at `http://127.0.0.1:9480/mcp`. No tunnels. Config snippets unchanged from prior revision:
 
-- **opencode** (`~/.config/opencode/opencode.json`): `"mcp": { "llm_chat": { "type": "remote", "url": "http://127.0.0.1:9480/mcp" } }`
-- **Grok Build** (`~/.grok/config.toml`): `[mcp_servers.llm_chat]` `url = "http://127.0.0.1:9480/mcp"`, `enabled = true`
-- **Claude Code**: `claude mcp add --scope user --transport http llm_chat http://127.0.0.1:9480/mcp`
+- **opencode** (`~/.config/opencode/opencode.json`): `"mcp": { "mentischat": { "type": "remote", "url": "http://127.0.0.1:9480/mcp" } }`
+- **Grok Build** (`~/.grok/config.toml`): `[mcp_servers.mentischat]` `url = "http://127.0.0.1:9480/mcp"`, `enabled = true`
+- **Claude Code**: `claude mcp add --scope user --transport http mentischat http://127.0.0.1:9480/mcp`
 - **ChatGPT desktop / Codex CLI** (`~/.codex/config.toml`): same TOML shape as Grok
 
 ChatGPT web stays out of scope (public HTTPS requirement would break localhost trust model).
@@ -477,7 +477,7 @@ Recommended stable names: grok / opencode / claude / codex. Two windows sharing 
 ### User ritual (new window)
 
 ```
-Register on llm_chat as <name>. Then list who's registered.
+Register on mentischat as <name>. Then list who's registered.
 Only send_message to names that list_agents returns.
 After you send, check_inbox with wait_ms 15000.
 Quote pulled bodies in this chat, then pass their ids as ack_ids on the next check_inbox. If remaining > 0, keep pulling.
@@ -488,9 +488,9 @@ Agent steps: register → list_agents → send_message (both endpoints registere
 
 ## launchd
 
-- Label `com.llm-chat`; `RunAtLoad` true, `KeepAlive` true
-- `ProgramArguments`: `/bin/bash`, `-lc`, absolute path to `scripts/run.sh`; script does `exec "$HOME/workspace/llm_chat/target/release/llm_chat"` after `cd` to repo root
-- Logs: `~/Library/Logs/llm_chat.stdout.log` / `.stderr.log`
+- Label `com.mentischat`; `RunAtLoad` true, `KeepAlive` true
+- `ProgramArguments`: `/bin/bash`, `-lc`, absolute path to `scripts/run.sh`; script does `exec "$HOME/workspace/mentischat/target/release/mentischat"` after `cd` to repo root
+- Logs: `~/Library/Logs/mentischat.stdout.log` / `.stderr.log`
 - Build release before install. Bind failure → process exits → launchd restarts; if 9480 is held by a healthy daemon, the newcomer must keep dying (never steal the port).
 
 Install optional at PR time; ship the plist either way.
@@ -501,7 +501,7 @@ Install optional at PR time; ship the plist either way.
 
 `tests/http.rs` (tower oneshot against merged app, ephemeral nothing): every REST happy path incl. ack route; GET redelivers same ids until ack; wait_ms=2000 with delayed POST; two overlapping waits, one POST → exactly one GET receives; error codes 400/404/409/503/507; `/health.pending` equals row count; unknown REST path → 404 `not_found` (documents precedence over upstream catch-all).
 
-`tests/mcp.rs` (oneshot through the composed router): POST initialize returns protocolVersion + server name `llm_chat`; `notifications/initialized` → 202; tools/list shows exactly five tools with pattern-free schemas; tools/call `list_agents` after REST register proves shared bus; tools/call `register` invalid name → `isError:true` content with error JSON; GET /mcp → 405; Origin `https://evil.example` → 403; missing Origin allowed.
+`tests/mcp.rs` (oneshot through the composed router): POST initialize returns protocolVersion + server name `mentischat`; `notifications/initialized` → 202; tools/list shows exactly five tools with pattern-free schemas; tools/call `list_agents` after REST register proves shared bus; tools/call `register` invalid name → `isError:true` content with error JSON; GET /mcp → 405; Origin `https://evil.example` → 403; missing Origin allowed.
 
 Full TUI live check remains manual.
 
@@ -518,9 +518,9 @@ Full TUI live check remains manual.
    - `cargo test`
    - curl every REST route (GET redelivers until POST ack)
    - `curl -D- -X GET http://127.0.0.1:9480/mcp` → 405
-   - `~/.llm_chat/pending.sqlite` exists after a live send; repo tree has no message state
+   - `~/.cloudllm/mentischat/pending.sqlite` exists after a live send; repo tree has no message state
    - kill -9 daemon, restart: roster + unacked row still visible via `GET /agents` / inbox
-   - `grok mcp doctor llm_chat`; `opencode mcp list`; `claude mcp list` / `codex mcp list` where installed
+   - `grok mcp doctor mentischat`; `opencode mcp list`; `claude mcp list` / `codex mcp list` where installed
    - live send/wait/leave trio between two registered windows
 
 ## Risks / open items (CloudLLM-specific)

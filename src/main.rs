@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use llm_chat::bus::Bus;
-use llm_chat::BIND_ADDR;
+use mentischat::bus::Bus;
+use mentischat::BIND_ADDR;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -15,12 +15,12 @@ async fn main() -> ExitCode {
         .compact()
         .init();
 
-    let data_dir = match std::env::var("LLM_CHAT_DIR") {
+    let data_dir = match std::env::var("MENTISCHAT_DIR") {
         Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
         _ => match std::env::var("HOME") {
-            Ok(home) => PathBuf::from(home).join(".llm_chat"),
+            Ok(home) => PathBuf::from(home).join(".cloudllm").join("mentischat"),
             Err(_) => {
-                eprintln!("llm_chat: HOME is not set; cannot locate data dir");
+                eprintln!("mentischat: HOME is not set; cannot locate data dir");
                 return ExitCode::FAILURE;
             }
         },
@@ -29,7 +29,7 @@ async fn main() -> ExitCode {
     let bus = Arc::new(match Bus::new(&data_dir) {
         Ok(bus) => bus,
         Err(e) => {
-            eprintln!("llm_chat: failed to open {}: {e}", data_dir.display());
+            eprintln!("mentischat: failed to open {}: {e}", data_dir.display());
             return ExitCode::FAILURE;
         }
     });
@@ -37,20 +37,20 @@ async fn main() -> ExitCode {
     let listener = match tokio::net::TcpListener::bind(BIND_ADDR).await {
         Ok(l) => l,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            // Single-instance lock: a healthy llm_chat owns 9480. Never steal.
+            // Single-instance lock: a healthy mentischat owns 9480. Never steal.
             eprintln!(
-                "llm_chat: {} already in use; another instance owns it",
+                "mentischat: {} already in use; another instance owns it",
                 BIND_ADDR
             );
             return ExitCode::FAILURE;
         }
         Err(e) => {
-            eprintln!("llm_chat: bind {BIND_ADDR} failed: {e}");
+            eprintln!("mentischat: bind {BIND_ADDR} failed: {e}");
             return ExitCode::FAILURE;
         }
     };
 
-    let app = llm_chat::build_router(bus.clone());
+    let app = mentischat::build_router(bus.clone());
     let shutdown_bus = bus.clone();
 
     tracing::info!(
@@ -66,7 +66,7 @@ async fn main() -> ExitCode {
     .with_graceful_shutdown(shutdown_signal(shutdown_bus));
 
     if let Err(e) = serve.await {
-        eprintln!("llm_chat: server error: {e}");
+        eprintln!("mentischat: server error: {e}");
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS

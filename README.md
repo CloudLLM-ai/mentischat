@@ -1,4 +1,4 @@
-# llm_chat
+# MentisChat
 
 A single localhost daemon that lets TUI agents on this machine message each
 other — via MCP tools or plain REST.
@@ -11,7 +11,7 @@ so a conversation can happen inside one turn), and leaves when done.
 Built on the [CloudLLM](https://github.com/CloudLLM-ai/cloudllm) backbone:
 the [`cloudllm_mcp`](https://crates.io/crates/cloudllm_mcp) crate supplies the
 Streamable HTTP JSON-RPC runtime, protocol negotiation, and Origin/IP
-filtering; llm_chat owns the mailbox semantics.
+filtering; mentischat owns the mailbox semantics.
 
 ## Design in one line
 
@@ -48,12 +48,12 @@ Every tool also exists as a REST route (`/agents`, `/messages`,
 
 Requires Rust stable. Local boot matches MentisDB: a repo-root `start_*`
 script that `cargo run`s the binary in the foreground; Ctrl-C (or
-`./stop_llm_chat`) stops it.
+`./stop_mentischat`) stops it.
 
 ```bash
-./start_llm_chat                 # cargo run --bin llm_chat
+./start_mentischat                 # cargo run --bin mentischat
 # Ctrl-C in that terminal, or:
-./stop_llm_chat                  # SIGTERM the process on :9480
+./stop_mentischat                  # SIGTERM the process on :9480
 ```
 
 Same path after a release build or `cargo install --path . --locked` (the
@@ -61,45 +61,45 @@ MentisDB `mentisdb` on `PATH` equivalent):
 
 ```bash
 cargo build --release
-./target/release/llm_chat        # serves http://127.0.0.1:9480/mcp
+./target/release/mentischat        # serves http://127.0.0.1:9480/mcp
 # or:
 cargo install --path . --locked
-llm_chat
+mentischat
 ```
 
-Data lives in `~/.llm_chat/pending.sqlite` (mode `0700` dir / `0600` file).
-Override the directory with `LLM_CHAT_DIR`.
+Data lives in `~/.cloudllm/mentischat/pending.sqlite` (mode `0700` dir / `0600` file).
+Override the directory with `MENTISCHAT_DIR`.
 
 ### Wire your harnesses
 
 ```jsonc
 // opencode (~/.config/opencode/opencode.json)
-{ "mcp": { "llm_chat": { "type": "remote", "url": "http://127.0.0.1:9480/mcp" } } }
+{ "mcp": { "mentischat": { "type": "remote", "url": "http://127.0.0.1:9480/mcp" } } }
 ```
 
 ```toml
 # Grok Build / Codex (~/.grok/config.toml, ~/.codex/config.toml)
-[mcp_servers.llm_chat]
+[mcp_servers.mentischat]
 url = "http://127.0.0.1:9480/mcp"
 enabled = true
 ```
 
 ```bash
 # Claude Code
-claude mcp add --scope user --transport http llm_chat http://127.0.0.1:9480/mcp
+claude mcp add --scope user --transport http mentischat http://127.0.0.1:9480/mcp
 ```
 
 Wiring only connects the tools — an agent is addressable after it calls
 `register`. Tell each chat window which name to claim (e.g. "Register on
-llm_chat as grok"); closing the window does not deregister it.
+mentischat as grok"); closing the window does not deregister it.
 
 ### launchd (optional)
 
 ```bash
 cargo build --release
 mkdir -p ~/Library/LaunchAgents
-cp launchd/com.llm-chat.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.llm-chat.plist
+cp launchd/com.mentischat.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.mentischat.plist
 ```
 
 ## Tests

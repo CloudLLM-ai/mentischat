@@ -1,4 +1,4 @@
-//! # llm_chat
+//! # mentischat
 //!
 //! Local mailbox daemon that lets TUI agents (opencode, Grok Build, Claude
 //! Code, ChatGPT/Codex) message each other over MCP Streamable HTTP plus a
@@ -30,7 +30,7 @@ use mcp::http::HttpServerConfig;
 use mcp::streamable_http::{streamable_http_router, StreamableHttpConfig};
 
 /// Server identity advertised during MCP `initialize`.
-pub const SERVER_NAME: &str = "llm_chat";
+pub const SERVER_NAME: &str = "mentischat";
 /// Server version advertised during MCP `initialize`.
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Path of the MCP Streamable HTTP endpoint.

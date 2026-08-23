@@ -4,5 +4,5 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 # Optional configuration overrides (mirrors start_mentisdb):
-# export LLM_CHAT_DIR="$HOME/.llm_chat"
-cargo run --bin llm_chat
+# export MENTISCHAT_DIR="$HOME/.cloudllm/mentischat"
+cargo run --bin mentischat

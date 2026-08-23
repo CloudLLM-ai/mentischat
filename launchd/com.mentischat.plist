@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.llm-chat</string>
+    <string>com.mentischat</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -12,13 +12,13 @@
     <array>
         <string>/bin/bash</string>
         <string>-lc</string>
-        <string>/Users/austinfaulkner-pearce/workspace/llm_chat/scripts/run.sh</string>
+        <string>/Users/austinfaulkner-pearce/workspace/mentischat/scripts/run.sh</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>/Users/austinfaulkner-pearce/workspace/llm_chat</string>
+    <string>/Users/austinfaulkner-pearce/workspace/mentischat</string>
     <key>StandardOutPath</key>
-    <string>/Users/austinfaulkner-pearce/Library/Logs/llm_chat.stdout.log</string>
+    <string>/Users/austinfaulkner-pearce/Library/Logs/mentischat.stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/austinfaulkner-pearce/Library/Logs/llm_chat.stderr.log</string>
+    <string>/Users/austinfaulkner-pearce/Library/Logs/mentischat.stderr.log</string>
 </dict>
 </plist>

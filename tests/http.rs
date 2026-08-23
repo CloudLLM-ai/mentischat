@@ -1,5 +1,5 @@
 //! REST surface integration tests driven through `tower::ServiceExt::oneshot`
-//! against the real router — no sockets, no ports, no `~/.llm_chat`.
+//! against the real router — no sockets, no ports, no `~/.cloudllm/mentischat`.
 
 use std::sync::Arc;
 
@@ -8,8 +8,8 @@ use http_body_util::BodyExt;
 use serde_json::Value;
 use tower::ServiceExt;
 
-use llm_chat::bus::Bus;
-use llm_chat::rest;
+use mentischat::bus::Bus;
+use mentischat::rest;
 
 fn app() -> (tempfile::TempDir, Router) {
     let dir = tempfile::tempdir().unwrap();

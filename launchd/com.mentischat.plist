@@ -11,14 +11,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>-lc</string>
-        <string>exec /Users/gubatron/workspace/mentischat/target/release/mentischat</string>
+        <string>/Users/austinfaulkner-pearce/workspace/mentischat/launchd/run.sh</string>
     </array>
-    <key>WorkingDirectory</key>
-    <string>/Users/gubatron/workspace/mentischat</string>
-    <key>StandardOutPath</key>
-    <string>/Users/gubatron/Library/Logs/mentischat.stdout.log</string>
-    <key>StandardErrorPath</key>
-    <string>/Users/gubatron/Library/Logs/mentischat.stderr.log</string>
 </dict>
 </plist>

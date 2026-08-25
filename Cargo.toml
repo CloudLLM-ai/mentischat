@@ -4,11 +4,22 @@ version = "0.1.0"
 edition = "2021"
 description = "Local mailbox daemon letting TUI agents message each other via MCP tools and REST."
 license = "MIT"
+repository = "https://github.com/CloudLLM-ai/mentischat"
+homepage = "https://github.com/CloudLLM-ai/mentischat"
+documentation = "https://github.com/CloudLLM-ai/mentischat#readme"
+
+[[bin]]
+name = "mentis-wake"
+path = "src/bin/mentis-wake.rs"
 
 [dependencies]
 async-trait = "0.1.92"
 axum = "0.8"
+clap = { version = "4", features = ["derive"] }
 cloudllm_mcp = { version = "=0.3.6", features = ["server"] }
+libc = "0.2"
+portable-pty = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

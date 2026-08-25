@@ -144,6 +144,65 @@ async fn domain_error_is_iserror_true_content_block() {
 }
 
 #[tokio::test]
+async fn register_accepts_nudge_transport_none() {
+    let (_d, app) = app();
+    let (_, resp) = rpc(
+        &app,
+        "tools/call",
+        json!({
+            "name": "register",
+            "arguments": { "agent": "wrapped", "nudgeTransport": "none" }
+        }),
+    )
+    .await;
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let out: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(out["nudgeTransport"], "none");
+    assert!(
+        out["nudgeWindow"].is_null(),
+        "none transport must not bind a window"
+    );
+}
+
+#[tokio::test]
+async fn register_rejects_bad_nudge_transport() {
+    let (_d, app) = app();
+    let (_, resp) = rpc(
+        &app,
+        "tools/call",
+        json!({
+            "name": "register",
+            "arguments": { "agent": "wrapped", "nudgeTransport": "bogus" }
+        }),
+    )
+    .await;
+    assert_eq!(resp["result"]["isError"], true);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let err: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(err["error"], "invalid_body");
+}
+
+#[tokio::test]
+async fn instructions_mention_mentis_wake() {
+    let (_d, app) = app();
+    let (_, resp) = rpc(
+        &app,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": { "name": "test-harness", "version": "0" }
+        }),
+    )
+    .await;
+    let instructions = resp["result"]["instructions"].as_str().unwrap();
+    assert!(
+        instructions.contains("MENTISCHAT_WAKE_ID"),
+        "ritual must teach wake-session auto-bind via wakeId"
+    );
+}
+
+#[tokio::test]
 async fn send_and_pull_over_mcp_roundtrip() {
     let (_d, app) = app();
     for who in ["grok", "codex"] {
@@ -220,6 +279,37 @@ async fn foreign_origin_gets_403() {
         .header("content-type", "application/json")
         .header("origin", "http://127.0.0.1:9480")
         .body(axum::body::Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+}
+
+#[tokio::test]
+async fn rest_foreign_origin_gets_403() {
+    let (_d, app) = app();
+    let req = http::Request::builder()
+        .method("GET")
+        .uri("/health")
+        .header("origin", "https://evil.example")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status().as_u16(), 403);
+
+    let req = http::Request::builder()
+        .method("GET")
+        .uri("/health")
+        .header("origin", "http://localhost:3000")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    // curl / scripts with no Origin still work.
+    let req = http::Request::builder()
+        .method("GET")
+        .uri("/health")
+        .body(axum::body::Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status().as_u16(), 200);

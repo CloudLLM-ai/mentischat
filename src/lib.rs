@@ -9,21 +9,23 @@
 //! deleted. There is no history API.
 //!
 //! The MCP wire protocol is supplied by the [`mcp`] crate (`cloudllm_mcp`);
-//! this crate owns mailbox semantics: roster, caps, ack/batch delivery, and
-//! blocking pulls.
+//! this crate owns mailbox semantics: roster, caps, ack/batch delivery,
+//! blocking pulls, and the peek endpoint for harness wake.
 
 pub mod bus;
 pub mod errors;
 pub mod names;
+pub mod nudge;
 pub mod rest;
 pub mod store;
 pub mod tools;
+pub mod wake;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Request};
-use axum::http::StatusCode;
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use mcp::http::HttpServerConfig;
@@ -71,6 +73,7 @@ pub fn build_router(bus: Arc<bus::Bus>) -> axum::Router {
     rest::router(bus)
         .nest(MCP_ENDPOINT_PATH, mcp_router)
         .layer(DefaultBodyLimit::max(1024 * 1024))
+        .layer(middleware::from_fn(loopback_origin))
         .layer(middleware::from_fn(loopback_only))
 }
 
@@ -87,4 +90,30 @@ async fn loopback_only(
     } else {
         StatusCode::FORBIDDEN.into_response()
     }
+}
+
+/// Browser CSRF guard for REST (and defense-in-depth beside MCP's Origin
+/// filter). Missing `Origin` is allowed (curl, MCP clients). A present
+/// `Origin` must be a loopback http(s) URL.
+async fn loopback_origin(headers: HeaderMap, request: Request, next: Next) -> Response {
+    match headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        None => next.run(request).await,
+        Some(origin) if origin_is_loopback(origin) => next.run(request).await,
+        Some(_) => StatusCode::FORBIDDEN.into_response(),
+    }
+}
+
+fn origin_is_loopback(origin: &str) -> bool {
+    let without_scheme = match origin {
+        o if o.starts_with("http://") => &o["http://".len()..],
+        o if o.starts_with("https://") => &o["https://".len()..],
+        _ => return false,
+    };
+    let hostport = without_scheme.split('/').next().unwrap_or("");
+    let host = if let Some(rest) = hostport.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        hostport.split(':').next().unwrap_or("")
+    };
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
 }

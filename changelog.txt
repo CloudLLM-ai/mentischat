@@ -1,5 +1,54 @@
 UNRELEASED
 
+  - fix(wake): wrapper bindings are ownership-tokened — POST
+    /agents/{agent}/wrapper returns a wakeId token (or accepts one) and
+    DELETE requires it, so a stale wrapper exiting after a replacement can no
+    longer clear the newer binding; mentischat --agent now awaits its bind
+    task before unbinding. register with nudgeTransport none clears the wake
+    session token. Canceled long-poll waiters (dropped connections) no longer
+    consume the single wake signal per send. Parked unbound /wake/{id}
+    sessions are globally capped (64) and their map entries drain on expiry.
+    The wrapper bind route accepts an empty POST body as {}. Shutdown logs at
+    error level if the mailbox-discard transaction fails instead of silently
+    swallowing it. Migration recreates idx_roster_wake_id on databases that
+    have the column but lost the index.
+
+  - fix(wake): inject pointer text and submit key separately; default submit
+    is CR (Enter) so OpenCode submits instead of treating LF as a newline.
+
+  - feat(cli): `mentischat opencode` / `mentischat grok` launch a harness with
+    idle wake; `mentischat serve` (or bare `mentischat`) starts the daemon.
+    `--harness` is an explicit alias. `mentis-wake` remains as a legacy binary.
+
+  - feat(wake): wake-session auto-bind — `mentischat opencode` sets
+    MENTISCHAT_WAKE_ID on the child; agent passes wakeId on first register to
+    bind wrapper transport. New REST: GET/DELETE /wake/{wake_id}. Legacy
+    `--agent` mode unchanged.
+
+  - remove(nudge): in-daemon AppleScript doorbell removed; idle wake is
+    mentis-wake only. Historical v1 design documented in NUDGE-V1-TERMINAL.md.
+    register no longer accepts windowTitleMatch; nudgeWindow is always null;
+    default nudgeTransport is none; terminal is a deprecated wire alias for none.
+
+  - feat(wake): universal PTY wrapper `mentis-wake` — a thin client-side
+    adapter between Terminal and any harness (OpenCode, Claude Code, Codex,
+    shells). It long-polls the daemon's read-only nudge peek endpoint and
+    injects the pointer constant without focus theft or AppleScript. New REST:
+    GET /nudge/{agent}?wait_ms= (side-effect-free long-poll; no promote, no
+    ack, no lastSeen), POST/DELETE /agents/{agent}/wrapper (bind/clear the
+    wrapper transport). register accepts optional nudgeTransport
+    ('terminal' | 'wrapper' | 'none'); roster gains nudge_transport column.
+    One transport per agent. macOS + Linux v1.
+  - feat(shutdown): graceful SIGTERM/SIGINT now discards the roster and all
+    undelivered mail in one transaction (bulk deregister), so a deliberate
+    restart starts clean. A crash (no shutdown) still preserves the roster and
+    mail for recovery.
+
+  - feat(nudge): doorbell runs inside the mentischat process. register binds
+    a Terminal.app window (optional windowTitleMatch, else unique title /
+    front window) onto the roster row as nudgeWindow; deregister clears it.
+    send notifies an idle recipient; the worker injects the pointer without
+    calling check_inbox. Sidecar nudge.sh / targets.json removed.
   - feat(core): mentischat daemon on the cloudllm_mcp backbone — one loopback
     process serving MCP Streamable HTTP at /mcp plus REST, backed by sqlite
     pending mail (WAL). Five tools: register, deregister, send_message,
@@ -18,6 +67,9 @@ UNRELEASED
   - fix(bus): register lookup uses EXISTS instead of loading the whole roster;
     sqlite errors are traced; deregister deletes inbox+roster in one
     transaction; list_agents/stats fail shutting_down after close.
+  - fix(launchd): plist ProgramArguments exec the release binary directly
+    (no wrapper script) and stale home paths are corrected to the current
+    machine.
   - test(core): 35-test suite green — bus behavior incl. waiter races,
     batch+ack math, queue/global caps, crash-reopen, mutex stress; REST via
     tower oneshot (redelivery, wait_ms wake race, error codes, no-store); MCP
@@ -29,16 +81,16 @@ UNRELEASED
     `make start` runs the daemon in the foreground and `make stop` sends
     SIGTERM to the listener on :9480 (MENTISCHAT_PORT overrides), replacing
     the start_mentischat/stop_mentischat scripts and scripts/run.sh.
-  - fix(launchd): plist ProgramArguments exec the release binary directly
-    (no wrapper script) and stale home paths are corrected to the current
-    machine.
-  - docs(skills): add skills/ folder — rust-engineer (merged MentisDB
-    rust-engineer + DiarioBitcoin rust-backend-engineer house style) and
-    rust-performance-reviewer (Abseil performance-hints review method).
-  - docs(plan): PLAN.md revised from TypeScript to Rust/cloudllm_mcp
-    architecture; router composition over MCPServerBuilder; file layout now
-    documents Makefile and skills/.
   - chore(rename): project renamed llm_chat -> mentischat everywhere
     (crate/binary, MCP server id, env vars MENTISCHAT_DIR/MENTISCHAT_PORT,
     data dir ~/.cloudllm/mentischat, launchd label com.mentischat); GitHub
     repo renamed to mentischat to match the MentisDB naming convention.
+  - docs(plan): PLAN.md is the product/architecture SSOT (mailbox shipped,
+    TUI beta = doorbell nudge that must not park waiters, browser deferred).
+    BRIDGE-PLAN.md removed so the nudge spec is not split across files.
+  - docs(plan): PLAN.md revised from TypeScript to Rust/cloudllm_mcp
+    architecture; router composition over MCPServerBuilder; file layout now
+    documents Makefile and skills/.
+  - docs(skills): add skills/ folder — rust-engineer (merged MentisDB
+    rust-engineer + DiarioBitcoin rust-backend-engineer house style) and
+    rust-performance-reviewer (Abseil performance-hints review method).

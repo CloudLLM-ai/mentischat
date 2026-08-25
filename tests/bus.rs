@@ -408,7 +408,7 @@ async fn graceful_shutdown_discards_roster_and_mail() {
         .await
         .unwrap();
 
-    bus.shutdown().await;
+    bus.shutdown().await.unwrap();
 
     let bus = Bus::new(&data).unwrap();
     assert!(
@@ -473,7 +473,7 @@ async fn shutdown_rejects_waiters() {
     let b = bus.clone();
     let task = tokio::spawn(async move { b.check_inbox(&name("b"), 10_000, vec![]).await });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    bus.shutdown().await;
+    bus.shutdown().await.unwrap();
     let err = task.await.unwrap().unwrap_err();
     assert!(matches!(err, MailboxError::ShuttingDown));
 
@@ -855,8 +855,17 @@ async fn wrapper_replacement_survives_stale_owner_unbind() {
     bus.register(&name("a")).await.unwrap();
 
     let old = bus.bind_wrapper(&name("a"), None).await.unwrap();
-    let new = bus.bind_wrapper(&name("a"), None).await.unwrap();
-    assert_ne!(old, new);
+    // Silent re-mint while bound is forbidden — present the owner token to
+    // refresh, or take over via register_with_wake with a new wakeId.
+    let err = bus.bind_wrapper(&name("a"), None).await.unwrap_err();
+    assert!(matches!(err, MailboxError::Forbidden { .. }));
+    let same = bus.bind_wrapper(&name("a"), Some(&old)).await.unwrap();
+    assert_eq!(same, old);
+
+    let new = uuid::Uuid::new_v4().to_string();
+    bus.register_with_wake(&name("a"), None, Some(&new))
+        .await
+        .unwrap();
 
     // The older wrapper exits after the replacement: its unbind must not
     // clear the newer binding.
@@ -901,4 +910,63 @@ async fn explicit_transport_none_clears_session_token() {
     bus.register(&name("a")).await.unwrap();
     let listed = bus.list_agents().await.unwrap();
     assert_eq!(listed[0].nudge_transport, NudgeTransport::Wrapper);
+}
+
+#[tokio::test]
+async fn roster_honors_max_agents() {
+    let (_d, bus) = fresh_bus("rosterfull");
+    for i in 0..mentischat::bus::MAX_ROSTER {
+        bus.register(&name(&format!("agent_{i}"))).await.unwrap();
+    }
+    let err = bus.register(&name("one_too_many")).await.unwrap_err();
+    assert!(
+        matches!(err, MailboxError::RosterFull { agents } if agents == mentischat::bus::MAX_ROSTER),
+        "got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn bind_wrapper_wakes_unbound_wake_waiters() {
+    let (_d, bus) = fresh_bus("bindwake");
+    bus.register(&name("a")).await.unwrap();
+    let wid = uuid::Uuid::new_v4().to_string();
+
+    let b = bus.clone();
+    let w = wid.clone();
+    let task = tokio::spawn(async move { b.nudge_peek_by_wake(&w, 30_000).await });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let started = std::time::Instant::now();
+    bus.bind_wrapper(&name("a"), Some(&wid)).await.unwrap();
+    let peek = task.await.unwrap().unwrap();
+    assert!(peek.bound);
+    assert_eq!(peek.agent, "a");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "bind did not wake unbound peeker: {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn in_flight_redelivery_reports_remaining_unacked() {
+    let (_d, bus) = fresh_bus("inflightremain");
+    bus.register(&name("a")).await.unwrap();
+    bus.register(&name("b")).await.unwrap();
+    // Three mid-size bodies: first pull takes two (12 KiB), leaves one pending.
+    let body = "x".repeat(6 * 1024);
+    for _ in 0..3 {
+        bus.send(&name("a"), &name("b"), body.clone())
+            .await
+            .unwrap();
+    }
+    let p1 = bus.check_inbox(&name("b"), 0, vec![]).await.unwrap();
+    assert_eq!(p1.messages.len(), 2);
+    assert_eq!(p1.remaining, 1);
+
+    // Redeliver without ack: still two in_flight in the page, one pending left.
+    let p2 = bus.check_inbox(&name("b"), 0, vec![]).await.unwrap();
+    assert_eq!(p2.messages.len(), 2);
+    assert_eq!(p2.remaining, 1);
+    assert_eq!(p1.messages[0].id, p2.messages[0].id);
 }

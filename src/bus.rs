@@ -37,6 +37,8 @@ pub const MAX_NUDGE_WAITERS_PER_AGENT: usize = 2;
 /// Global cap on parked wake-session waiters across all unbound ids, so
 /// arbitrary UUIDs cannot grow `wake_waiters` without bound.
 pub const MAX_WAKE_WAITERS_GLOBAL: usize = 64;
+/// Cap on roster rows — bounds waiter amplification (8 inbox + 2 peek per name).
+pub const MAX_ROSTER: i64 = 256;
 
 /// How an idle session is woken. Stored on the roster row as
 /// `nudge_transport`; one transport per agent.
@@ -158,7 +160,8 @@ pub struct InboxPage {
     pub agent: String,
     /// Delivered messages (at-least-once; ack by id on a later pull).
     pub messages: Vec<Message>,
-    /// Pending rows still waiting after this call; drain while `> 0`.
+    /// Unacked rows not included in this page (leftover `in_flight` +
+    /// still-`pending`); drain while `> 0`.
     pub remaining: i64,
 }
 
@@ -354,6 +357,13 @@ impl Bus {
                 nudge_window: None,
                 nudge_transport,
             });
+        }
+        let agents: i64 = g
+            .conn
+            .query_row("SELECT COUNT(*) FROM roster", [], |r| r.get(0))
+            .map_err(sqlite_storage)?;
+        if agents >= MAX_ROSTER {
+            return Err(MailErr::RosterFull { agents });
         }
         let transport = if wake_id.is_some() {
             NudgeTransport::Wrapper
@@ -665,22 +675,52 @@ impl Bus {
     /// Bind `mentis-wake` as the doorbell for an already-registered name:
     /// sets transport to `wrapper`, clears any Terminal window binding, and
     /// records `wake_id` (generated when absent) as the binding's ownership
-    /// token. Returns the effective token; only its holder may unbind.
+    /// token. Returns the effective token; only its holder may unbind **or
+    /// re-bind**.
+    ///
+    /// When a binding already exists, the request must present that same
+    /// token (idempotent refresh). A silent mint while bound is `forbidden`
+    /// so a peer cannot hijack the doorbell — take over via
+    /// [`register_with_wake`](Self::register_with_wake) with a new `wakeId`,
+    /// or unbind first.
     pub async fn bind_wrapper(
         &self,
         name: &crate::names::AgentName,
         wake_id: Option<&str>,
     ) -> Result<String, MailErr> {
-        let token = match wake_id {
-            Some(w) if !w.trim().is_empty() => crate::nudge::validate_wake_id(w)?,
-            _ => uuid::Uuid::new_v4().to_string(),
+        let requested = match wake_id {
+            Some(w) if !w.trim().is_empty() => Some(crate::nudge::validate_wake_id(w)?),
+            _ => None,
         };
-        let g = self.inner.lock().await;
+        let mut g = self.inner.lock().await;
         if g.closed {
             return Err(MailErr::ShuttingDown);
         }
         ensure_registered(&g, name.as_str())?;
-        ensure_wake_id_free(&g, &token, name.as_str())?;
+        let current: Option<String> = g
+            .conn
+            .query_row(
+                "SELECT wake_id FROM roster WHERE name = ?1",
+                params![name.as_str()],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .map_err(sqlite_storage)?
+            .filter(|s| !s.trim().is_empty());
+
+        let token = match (current.as_deref(), requested.as_deref()) {
+            (Some(cur), Some(req)) if cur == req => cur.to_string(),
+            (Some(_), _) => {
+                return Err(MailErr::Forbidden {
+                    agent: name.to_string(),
+                });
+            }
+            (None, Some(req)) => {
+                ensure_wake_id_free(&g, req, name.as_str())?;
+                req.to_string()
+            }
+            (None, None) => uuid::Uuid::new_v4().to_string(),
+        };
+
         g.conn
             .execute(
                 "UPDATE roster SET nudge_transport = 'wrapper', window_title_match = NULL,
@@ -688,6 +728,7 @@ impl Bus {
                 params![name.as_str(), token],
             )
             .map_err(sqlite_storage)?;
+        wake_wake_waiters(&mut g, &token);
         Ok(token)
     }
 
@@ -838,9 +879,9 @@ impl Bus {
     /// restart starts completely clean (a bulk deregister of everyone).
     /// Committed rows only survive a crash, never a graceful shutdown.
     ///
-    /// Infallible by contract; a failed wipe is rolled back and logged at
-    /// error level because mail then outlives the daemon.
-    pub async fn shutdown(&self) {
+    /// Returns `Err` when the wipe transaction fails (rolled back); the bus
+    /// is still closed either way.
+    pub async fn shutdown(&self) -> Result<(), MailErr> {
         let mut g = self.inner.lock().await;
         g.closed = true;
         g.waiters.clear(); // dropping senders wakes all parked pulls
@@ -857,7 +898,9 @@ impl Bus {
                 "shutdown: failed to discard mailbox transactionally; \
                  roster or messages may persist on disk"
             );
+            return Err(sqlite_storage(e));
         }
+        Ok(())
     }
 }
 
@@ -1043,7 +1086,7 @@ fn empty_page(name: &crate::names::AgentName) -> InboxPage {
 
 fn sqlite_storage(e: rusqlite::Error) -> MailErr {
     tracing::error!(error = %e, "sqlite error");
-    MailErr::StorageFull { pending: -1 }
+    MailErr::StorageError
 }
 
 fn ensure_registered(g: &Inner, name: &str) -> Result<(), MailErr> {
@@ -1101,29 +1144,23 @@ fn touch_last_seen(g: &mut Inner, name: &str) -> Result<(), MailErr> {
 
 /// Deliver per batch+ack rules; `None` means both states are empty.
 ///
-/// Redeliver unacked `in_flight` FIFO; else promote up to `MAX_BATCH`
-/// pending rows within `MAX_RETURN_BYTES` of body bytes (the first message
-/// always rides even when oversized — progress must be possible).
+/// Redeliver unacked `in_flight` FIFO within the same batch caps as a fresh
+/// promote; else promote up to `MAX_BATCH` pending rows within
+/// `MAX_RETURN_BYTES` of body bytes (the first message always rides even when
+/// oversized — progress must be possible).
 fn deliver_locked(g: &mut Inner, name: &str) -> Result<Option<InboxPage>, MailErr> {
     let in_flight = load_rows(g, name, "in_flight", None)?;
     if !in_flight.is_empty() {
-        return page(g, name, in_flight).map(Some);
+        let batch = take_batch(&in_flight);
+        return page(g, name, batch).map(Some);
     }
 
     let candidates = load_rows(g, name, "pending", Some(MAX_BATCH))?;
     if candidates.is_empty() {
         return Ok(None);
     }
-    let mut take = 0usize;
-    let mut bytes = 0usize;
-    for msg in &candidates {
-        if take > 0 && bytes + msg.body.len() > MAX_RETURN_BYTES {
-            break;
-        }
-        bytes += msg.body.len();
-        take += 1;
-    }
-    for msg in &candidates[..take] {
+    let batch = take_batch(&candidates);
+    for msg in &batch {
         g.conn
             .execute(
                 "UPDATE messages SET state = 'in_flight' WHERE id = ?1",
@@ -1131,18 +1168,35 @@ fn deliver_locked(g: &mut Inner, name: &str) -> Result<Option<InboxPage>, MailEr
             )
             .map_err(sqlite_storage)?;
     }
-    page(g, name, candidates[..take].to_vec()).map(Some)
+    page(g, name, batch).map(Some)
+}
+
+/// Select a prefix of `candidates` (already seq-ordered) that fits
+/// [`MAX_BATCH`] and [`MAX_RETURN_BYTES`]. The first message is always kept.
+fn take_batch(candidates: &[Message]) -> Vec<Message> {
+    let mut take = 0usize;
+    let mut bytes = 0usize;
+    for msg in candidates.iter().take(MAX_BATCH as usize) {
+        if take > 0 && bytes + msg.body.len() > MAX_RETURN_BYTES {
+            break;
+        }
+        bytes += msg.body.len();
+        take += 1;
+    }
+    candidates[..take].to_vec()
 }
 
 fn page(g: &mut Inner, name: &str, messages: Vec<Message>) -> Result<InboxPage, MailErr> {
-    let remaining: i64 = g
+    // Unacked rows not in this page (leftover in_flight + still-pending).
+    let total: i64 = g
         .conn
         .query_row(
-            "SELECT COUNT(*) FROM messages WHERE recipient = ?1 AND state = 'pending'",
+            "SELECT COUNT(*) FROM messages WHERE recipient = ?1",
             params![name],
             |r| r.get(0),
         )
         .map_err(sqlite_storage)?;
+    let remaining = (total - messages.len() as i64).max(0);
     touch_last_seen(g, name)?;
     Ok(InboxPage {
         agent: name.to_string(),

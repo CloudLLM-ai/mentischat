@@ -24,8 +24,12 @@ pub enum MailboxError {
     Unregistered { agent: String, known: Vec<String> },
     /// That recipient already holds `MAX_PENDING_PER_AGENT` unacked rows.
     QueueFull { to: String, pending: i64 },
-    /// Global row cap hit or the store failed to persist an insert.
+    /// Global row cap hit.
     StorageFull { pending: i64 },
+    /// Sqlite open/write failure unrelated to capacity (not a full queue).
+    StorageError,
+    /// Roster already holds [`crate::bus::MAX_ROSTER`] agents.
+    RosterFull { agents: i64 },
     /// `MAX_WAITERS_PER_AGENT` pulls are already parked for that name.
     TooManyWaiters { agent: String, waiting: usize },
     /// REST path that is not a known route.
@@ -47,6 +51,8 @@ impl MailboxError {
             Self::Unregistered { .. } => "unregistered",
             Self::QueueFull { .. } => "queue_full",
             Self::StorageFull { .. } => "storage_full",
+            Self::StorageError => "storage_error",
+            Self::RosterFull { .. } => "roster_full",
             Self::TooManyWaiters { .. } => "too_many_waiters",
             Self::NotFound => "not_found",
             Self::Forbidden { .. } => "forbidden",
@@ -63,8 +69,11 @@ impl MailboxError {
             }
             Self::Unregistered { .. } | Self::NotFound => StatusCode::NOT_FOUND,
             Self::Forbidden { .. } => StatusCode::FORBIDDEN,
-            Self::QueueFull { .. } | Self::TooManyWaiters { .. } => StatusCode::CONFLICT,
+            Self::QueueFull { .. } | Self::TooManyWaiters { .. } | Self::RosterFull { .. } => {
+                StatusCode::CONFLICT
+            }
             Self::StorageFull { .. } => StatusCode::INSUFFICIENT_STORAGE,
+            Self::StorageError => StatusCode::INTERNAL_SERVER_ERROR,
             Self::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
@@ -81,6 +90,8 @@ impl MailboxError {
                 json!({ "error": self.code(), "to": to, "pending": pending })
             }
             Self::StorageFull { pending } => json!({ "error": self.code(), "pending": pending }),
+            Self::StorageError => json!({ "error": self.code() }),
+            Self::RosterFull { agents } => json!({ "error": self.code(), "agents": agents }),
             Self::TooManyWaiters { agent, waiting } => {
                 json!({ "error": self.code(), "agent": agent, "waiting": waiting })
             }

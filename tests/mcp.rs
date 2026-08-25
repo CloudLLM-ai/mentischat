@@ -285,6 +285,37 @@ async fn foreign_origin_gets_403() {
 }
 
 #[tokio::test]
+async fn rest_foreign_origin_gets_403() {
+    let (_d, app) = app();
+    let req = http::Request::builder()
+        .method("GET")
+        .uri("/health")
+        .header("origin", "https://evil.example")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status().as_u16(), 403);
+
+    let req = http::Request::builder()
+        .method("GET")
+        .uri("/health")
+        .header("origin", "http://localhost:3000")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    // curl / scripts with no Origin still work.
+    let req = http::Request::builder()
+        .method("GET")
+        .uri("/health")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+}
+
+#[tokio::test]
 async fn merged_unknown_rest_path_is_not_found_not_mcp_405() {
     let (_d, app) = app();
     let req = http::Request::builder()

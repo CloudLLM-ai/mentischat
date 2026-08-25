@@ -3,12 +3,16 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use clap::Parser;
 use mentischat::bus::Bus;
 use mentischat::wake::WakeConfig;
 use mentischat::BIND_ADDR;
+
+/// Set when graceful shutdown could not wipe the mailbox on disk.
+static SHUTDOWN_WIPE_FAILED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Parser)]
 #[command(
@@ -157,6 +161,10 @@ async fn run_daemon() -> ExitCode {
         eprintln!("mentischat: server error: {e}");
         return ExitCode::FAILURE;
     }
+    if SHUTDOWN_WIPE_FAILED.load(Ordering::SeqCst) {
+        eprintln!("mentischat: shutdown could not discard mailbox on disk");
+        return ExitCode::FAILURE;
+    }
     ExitCode::SUCCESS
 }
 
@@ -182,5 +190,8 @@ async fn shutdown_signal(bus: Arc<Bus>) {
         let _ = tokio::signal::ctrl_c().await;
     }
     tracing::info!("shutting down");
-    bus.shutdown().await;
+    if let Err(e) = bus.shutdown().await {
+        tracing::error!(error = %e, "mailbox wipe failed during shutdown");
+        SHUTDOWN_WIPE_FAILED.store(true, Ordering::SeqCst);
+    }
 }

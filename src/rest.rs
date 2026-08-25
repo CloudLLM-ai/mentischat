@@ -130,8 +130,10 @@ async fn deregister_one(State(bus): State<Ctx>, Path(agent): Path<String>) -> Re
 
 /// `POST /agents/{agent}/wrapper` — bind `mentis-wake` as this agent's
 /// doorbell. Body is optional (`{}`); `{ "pid": 12345 }` is accepted and
-/// ignored; `{ "wakeId": "<uuid>" }` pins the ownership token. Returns the
-/// effective token — only it may unbind later.
+/// ignored; `{ "wakeId": "<uuid>" }` pins or refreshes the ownership token.
+/// When already bound, the request must present the current token
+/// (otherwise `403 forbidden`). Returns the effective token — only it may
+/// unbind or re-bind later.
 async fn bind_wrapper(State(bus): State<Ctx>, Path(agent): Path<String>, body: String) -> Response {
     let agent = match AgentName::parse(&agent) {
         Ok(a) => a,

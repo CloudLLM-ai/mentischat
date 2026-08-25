@@ -52,10 +52,11 @@ Five tools, one `ToolProtocol`. REST mirrors them. Do not add a sixth tool.
 | `deregister` | `DELETE /agents/{agent}` | Leave; discard that inbox |
 
 Caps (source of truth: `src/bus.rs`): body 64 KiB; 1024 unacked / name;
-8192 global rows; batch 8 msgs / 16 KiB; `wait_ms` 0..=30000; 8 waiters /
-name. At-least-once: unacked `in_flight` redelivers until someone acks.
-Two pulls under one name share that inbox. `send` wakes the oldest waiter
-only. Timeout of a blocking pull is an empty success.
+8192 global rows; 256 roster agents; batch 8 msgs / 16 KiB; `wait_ms` 0..=30000;
+8 waiters / name; 2 peeks / name; 64 unbound wake sessions. At-least-once:
+unacked `in_flight` redelivers until someone acks (same batch caps). Two pulls
+under one name share that inbox. `send` wakes the oldest live waiter only.
+Timeout of a blocking pull is an empty success.
 
 Stack: Rust, `cloudllm_mcp = "=0.3.6"`, axum 0.8, rusqlite, data in
 `~/.cloudllm/mentischat/` (override `MENTISCHAT_DIR`). Tests under `tests/`.
@@ -94,10 +95,11 @@ uses its own MCP tools. The mailbox stays the only content path.
 
 ### One process, one peek contract
 
-The daemon owns the mailbox, roster, five MCP tools, and a side-effect-free
-peek/long-poll endpoint (`GET /nudge/{agent}`). It never pulls or acks mail
-and has no knowledge of how any particular TUI wants to be woken beyond the
-`nudge_transport` column. Waking is a transport decision on the roster row:
+The daemon owns the mailbox, roster, five MCP tools, and side-effect-free
+peek/long-poll endpoints (`GET /wake/{wakeId}` for session auto-bind;
+`GET /nudge/{agent}` for legacy `--agent` wrappers). They never pull or ack
+mail and have no knowledge of how any particular TUI wants to be woken beyond
+the `nudge_transport` column. Waking is a transport decision on the roster row:
 
 | Transport | Who wakes | Notes |
 |---|---|---|
@@ -105,11 +107,13 @@ and has no knowledge of how any particular TUI wants to be woken beyond the
 | `none` | No one until wrapper binds | Default for new registrations |
 
 The `wrapper` value is set by `POST /agents/{agent}/wrapper`, which returns an
-ownership token (`wakeId`) that the matching `DELETE` must present — bindings
-are owner-scoped, so a stale wrapper exiting late cannot clear its
-replacement. Registering with `nudgeTransport: "none"` clears any session
-token along with the transport; omitting the field on a new name is the normal
-path under `mentis-wake`.
+ownership token (`wakeId`) that the matching `DELETE` **and any re-bind** must
+present — bindings are owner-scoped, so a stale wrapper exiting late cannot
+clear its replacement, and a peer cannot hijack bind with an empty POST.
+`register({ wakeId })` remains the agent-owned path that may replace a token.
+Registering with `nudgeTransport: "none"` clears any session token along with
+the transport; omitting the field on a new name is the normal path under
+`mentis-wake` / `mentischat <harness>`.
 
 | Tool | Wake |
 |---|---|
@@ -123,18 +127,19 @@ session cannot be woken idle until `mentis-wake` binds wrapper transport.
 
 ### The universal adapter (`mentis-wake`)
 
-`mentis-wake` is a separate binary in the same crate: a PTY wrapper that sits
-between Terminal and any harness. It long-polls `GET /nudge/{agent}?wait_ms=`
-(read-only — never promotes, acks, or touches `lastSeen`) and injects the
-single pointer constant plus a newline when mail is pending. It registers as
-the doorbell (`POST /agents/{agent}/wrapper`, transport → `wrapper`) and
-clears it on clean exit (`DELETE`, transport → `none`).
+`mentis-wake` (also `mentischat <harness>`) is a PTY wrapper in the same crate
+that sits between Terminal and any harness. The default path sets
+`MENTISCHAT_WAKE_ID` and long-polls `GET /wake/{wakeId}?wait_ms=` (read-only —
+never promotes, acks, or touches `lastSeen`); legacy `--agent` mode long-polls
+`GET /nudge/{agent}` and binds via `POST /agents/{agent}/wrapper`. On a pending
+peek it injects the single pointer constant plus a submit key. Clean exit
+clears the binding (`DELETE`, transport → `none`).
 
-Forwarding is byte-transparent with a 60s id-set debounce mirrored from the
-daemon. SIGWINCH propagates the terminal size to the PTY; Ctrl-C is forwarded
-to the child (the wrapper does not die unless the child dies). macOS + Linux
-v1. The server never implements PTY logic — the wrapper is the only
-client-side adapter and stays thin (no sqlite, no MCP).
+Forwarding is byte-transparent with a 60s id-set debounce. SIGWINCH propagates
+the terminal size to the PTY; raw-mode stdin forwards bytes (including Ctrl-C)
+to the child. A process-level SIGINT/SIGTERM on the wrapper kills the child and
+exits. macOS + Linux v1. The server never implements PTY logic — the wrapper is
+the only client-side adapter and stays thin (no sqlite, no MCP).
 
 No tmux, iTerm, Playwright, CDP, or Node.
 
@@ -188,6 +193,6 @@ endpoint so the server never grows transport-specific code.
 ## Remaining work
 
 1. Persist each harness's MCP URL in that harness's real config (README).
-2. Accessibility grant for a launchd-started binary (not just Terminal).
-3. Launchd notes for `mentis-wake` (wrapper is per-user, not a daemon).
-4. Soak test: two wrapped harnesses 24h; wrapper restart mid-mail; child crash.
+2. Launchd notes for `mentis-wake` / `mentischat <harness>` (wrapper is
+   per-user, not a daemon).
+3. Soak test: two wrapped harnesses 24h; wrapper restart mid-mail; child crash.

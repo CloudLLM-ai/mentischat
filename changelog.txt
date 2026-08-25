@@ -1,5 +1,15 @@
 UNRELEASED
 
+  - fix(security): REST/MCP Origin guard rejects non-loopback Origin (curl
+    with no Origin still works); wrapper bind is ownership-safe on re-bind
+    (silent mint while bound is 403); wrapper injects POINTER_TEXT only
+    (ignores response JSON pointer); roster capped at 256 agents
+    (roster_full); in_flight redelivery uses the same batch byte/count caps
+    and remaining counts leftover unacked; bind_wrapper wakes unbound
+    /wake waiters; sqlite failures map to storage_error (500) instead of
+    storage_full pending:-1; graceful shutdown exits non-zero if the mailbox
+    wipe fails.
+
   - fix(wake): wrapper bindings are ownership-tokened — POST
     /agents/{agent}/wrapper returns a wakeId token (or accepts one) and
     DELETE requires it, so a stale wrapper exiting after a replacement can no

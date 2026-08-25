@@ -349,20 +349,24 @@ async fn wrapper_bind_unbind_roundtrip() {
     let (_d, mut app) = app();
     send(&mut app, post("/agents", r#"{"agent":"a"}"#)).await;
 
-    // Re-bind replaces the token; every bind returns a fresh one.
-    let mut tokens = Vec::new();
-    for _ in 0..2 {
-        let (s, v) = send(&mut app, post("/agents/a/wrapper", r#"{"pid":1234}"#)).await;
-        assert_eq!(s, 200);
-        assert_eq!(v["nudgeTransport"], "wrapper");
-        tokens.push(
-            v["wakeId"]
-                .as_str()
-                .expect("bind returns wakeId")
-                .to_string(),
-        );
-    }
-    assert_ne!(tokens[0], tokens[1], "each bind mints a new token");
+    let (s, v) = send(&mut app, post("/agents/a/wrapper", r#"{"pid":1234}"#)).await;
+    assert_eq!(s, 200);
+    assert_eq!(v["nudgeTransport"], "wrapper");
+    let token = v["wakeId"]
+        .as_str()
+        .expect("bind returns wakeId")
+        .to_string();
+
+    // Re-bind without the owner token is forbidden.
+    let (s, v) = send(&mut app, post("/agents/a/wrapper", r#"{"pid":9999}"#)).await;
+    assert_eq!(s, 403);
+    assert_eq!(v["error"], "forbidden");
+
+    // Presenting the owner token is an idempotent refresh.
+    let body = format!(r#"{{"wakeId":"{token}"}}"#);
+    let (s, v) = send(&mut app, post("/agents/a/wrapper", &body)).await;
+    assert_eq!(s, 200);
+    assert_eq!(v["wakeId"], token);
 
     let (_, v) = send(&mut app, req("GET", "/agents")).await;
     assert_eq!(v["agents"][0]["nudgeTransport"], "wrapper");
@@ -371,13 +375,12 @@ async fn wrapper_bind_unbind_roundtrip() {
         "wrapper clears the window"
     );
 
-    // A stale wrapper cannot unbind its replacement.
-    let stale = format!(r#"{{"wakeId":"{}"}}"#, tokens[0]);
+    let stale = format!(r#"{{"wakeId":"{}"}}"#, uuid::Uuid::new_v4());
     let (s, v) = send(&mut app, del("/agents/a/wrapper", &stale)).await;
     assert_eq!(s, 403);
     assert_eq!(v["error"], "forbidden");
 
-    let current = format!(r#"{{"wakeId":"{}"}}"#, tokens[1]);
+    let current = format!(r#"{{"wakeId":"{token}"}}"#);
     let (s, v) = send(&mut app, del("/agents/a/wrapper", &current)).await;
     assert_eq!(s, 200);
     assert_eq!(v["nudgeTransport"], "none");

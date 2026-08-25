@@ -159,6 +159,9 @@ pub async fn run_harness(config: WakeConfig) -> ExitCode {
                             }
                             return;
                         }
+                        // Another wrapper already owns the binding; stop
+                        // retrying. Peek via /nudge/{agent} still works.
+                        Ok(r) if r.status() == reqwest::StatusCode::FORBIDDEN => return,
                         Ok(_) => {}
                         Err(_) => {}
                     }
@@ -307,10 +310,9 @@ async fn poll_loop(
             None => true,
         };
         if should_inject {
-            let pointer = v
-                .get("pointer")
-                .and_then(Value::as_str)
-                .unwrap_or(crate::nudge::POINTER_TEXT);
+            // Always the shared constant — never trust response JSON for PTY
+            // keystrokes (a hostile --url must not inject arbitrary input).
+            let pointer = crate::nudge::POINTER_TEXT;
             // Text and submit are separate writes: TUIs like OpenCode bind
             // Enter (CR) as submit; a trailing LF in the same write is treated
             // as a literal newline in the input field.

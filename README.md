@@ -97,14 +97,17 @@ Every tool maps to a route, for scripts:
 | `deregister` | `/agents/{agent}` | `DELETE` |
 | wrapper bind | `/agents/{agent}/wrapper` | `POST` |
 | wrapper unbind | `/agents/{agent}/wrapper` | `DELETE` |
+| agent nudge peek | `/nudge/{agent}?wait_ms=` | `GET` |
 | wake-session peek | `/wake/{wakeId}?wait_ms=` | `GET` |
 | wake-session clear | `/wake/{wakeId}` | `DELETE` |
 | health | `/health` | `GET` |
 
 Semantics: success is always `200` + JSON (no 201/204); failures are typed
 JSON errors via HTTP status (`invalid_body`, `unregistered`, `queue_full`,
-`too_many_waiters`, `forbidden`, …); inbox responses answer with
-`Cache-Control: no-store`; bodies cap at 1 MiB.
+`roster_full`, `too_many_waiters`, `forbidden`, …); inbox responses answer with
+`Cache-Control: no-store`; bodies cap at 1 MiB. A present `Origin` header must
+be loopback (`http://127.0.0.1`, `localhost`, `::1`); missing `Origin` (curl)
+is allowed.
 
 ```bash
 curl -s -X POST http://127.0.0.1:9480/agents \
@@ -178,15 +181,19 @@ Exit code is the child's exit code. macOS + Linux (Unix PTYs).
 ### Ownership tokens
 
 Every binding has exactly one owner. Bind endpoints mint (or accept) a token;
-clear endpoints must present it:
+clear endpoints must present it; **re-bind while already bound must present the
+same token** (silent mint while bound is `403 forbidden`):
 
-- `register({ wakeId })` binds that session — transport becomes `wrapper`.
-- `POST /agents/{agent}/wrapper` → returns `{"wakeId": ...}` for that agent.
+- `register({ wakeId })` binds that session — transport becomes `wrapper`
+  (replacing any prior token; the agent-owned takeover path).
+- `POST /agents/{agent}/wrapper` → returns `{"wakeId": ...}` when unbound, or
+  refreshes when the body carries the current token.
 - `DELETE /agents/{agent}/wrapper {"wakeId": ...}` unbinds only the owner;
   wrong token is `403 forbidden`, missing token is `400 invalid_body`,
   double-unbind is an idempotent `200`.
 
-So a stale wrapper exiting late can never detach its replacement's doorbell.
+So a stale wrapper exiting late can never detach its replacement's doorbell,
+and a peer cannot hijack bind with an empty POST.
 
 ### Legacy mode
 
@@ -224,6 +231,7 @@ Source of truth: `src/bus.rs`.
 | Message body | 64 KiB |
 | Unacked rows per name | 1024 |
 | Global rows | 8192 |
+| Roster agents | 256 |
 | Batch per pull | 8 msgs / 16 KiB total body bytes |
 | Blocking pull (`wait_ms`) | 0–30000 ms |
 | Parked pulls per name | 8 |
@@ -256,9 +264,10 @@ make clippy         # cargo fmt + clippy --all-targets --all-features -- -D warn
 
 Localhost-only by design: any local process may send as any registered name,
 and there is no auth. That is acceptable for a single-user machine and is why
-the daemon rejects non-loopback peers at both bind and middleware layers.
-Remote hosting would require bearer auth (supported upstream), TLS, and real
-identity — deliberately out of scope for v1.
+the daemon rejects non-loopback peers at both bind and middleware layers, and
+rejects non-loopback `Origin` headers (browser CSRF). Remote hosting would
+require bearer auth (supported upstream), TLS, and real identity — deliberately
+out of scope for v1.
 
 Also out of scope: history, rooms, broadcast, auto-register, MentisDB
 dual-write, stdio transport, a sixth MCP tool, tmux/CDP/Playwright adapters,
@@ -270,7 +279,6 @@ MIT. See [LICENSE](LICENSE).
 
 ## References
 
-Product and architecture: [PLAN.md](PLAN.md). Audit findings that shaped this
-branch: [AUDIT.md](AUDIT.md). Wire contracts, waiter algorithm, caps, and
-error tables: `src/bus.rs`, `src/errors.rs`, `tests/`. Release notes:
+Product and architecture: [PLAN.md](PLAN.md). Wire contracts, waiter algorithm,
+caps, and error tables: `src/bus.rs`, `src/errors.rs`, `tests/`. Release notes:
 [changelog.txt](changelog.txt).

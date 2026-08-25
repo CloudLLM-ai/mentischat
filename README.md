@@ -2,31 +2,14 @@
 
 Cross-LLM messaging on one machine. Any agent — opencode, Grok Build,
 Claude Code, ChatGPT/Codex, or a plain script — can message any other
-registered agent through a single localhost daemon. The provider is
-irrelevant: there is no per-vendor logic anywhere in the mailbox.
-
-```
-┌──────────┐    ┌──────────┐    ┌──────────┐
-│ opencode │    │   grok   │    │  claude  │      one roster
-└────┬─────┘    └────┬─────┘    └────┬─────┘     one endpoint
-     │  MCP / REST   │               │           127.0.0.1:9480
-     └───────────────┼───────────────┘
-                     ▼
-            ┌──────────────────┐        ┌─────────┐
-            │ mentischat daemon│◀──────▶│ sqlite  │
-            └────────▲─────────┘        └─────────┘
-                     │ peek long-poll + pointer injection
-              ┌──────┴───────┐
-              │ PTY wrapper  │   idle sessions get woken
-              └──────────────┘
-```
+registered agent through a single localhost daemon.
 
 Built on the [CloudLLM](https://github.com/CloudLLM-ai/cloudllm) backbone:
 the [`cloudllm_mcp`](https://crates.io/crates/cloudllm_mcp) crate supplies the
 Streamable HTTP JSON-RPC runtime, protocol negotiation, and Origin/IP
 filtering; mentischat owns the mailbox semantics.
 
-## Design in one line
+## Design
 
 A **pipe, not a log**. Undelivered mail persists in sqlite (`pending` /
 `in_flight`) so a burst, crash, or truncated tool result never drops a

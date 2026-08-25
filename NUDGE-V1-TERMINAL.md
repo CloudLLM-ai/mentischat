@@ -25,7 +25,7 @@ bodies, never called `check_inbox`, and never acked mail.
 One string, shared by all transports:
 
 ```
-[mentischat] New message waiting -- call check_inbox.
+[mentischat] Mail waiting. Call check_inbox now.
 ```
 
 Defined in Rust as `POINTER_TEXT` in `src/nudge.rs` (still present for

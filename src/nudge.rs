@@ -11,7 +11,7 @@ use crate::errors::MailboxError;
 pub const WAKE_ENV: &str = "MENTISCHAT_WAKE_ID";
 
 /// Injected prompt. The only string a doorbell may type or write.
-pub const POINTER_TEXT: &str = "[mentischat] New message waiting -- call check_inbox.";
+pub const POINTER_TEXT: &str = "[mentischat] Mail waiting. Call check_inbox now.";
 
 /// Accept a UUID v4 session id from `mentis-wake`.
 pub fn validate_wake_id(raw: &str) -> Result<String, MailboxError> {

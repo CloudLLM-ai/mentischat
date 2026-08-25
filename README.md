@@ -151,7 +151,7 @@ TUI never does. The doorbell injects exactly one pointer into the harness —
 never message bodies, never scraped replies:
 
 ```
-[mentischat] New message waiting -- call check_inbox.
+[mentischat] Mail waiting. Call check_inbox now.
 ```
 
 The woken agent then pulls mail itself through its own MCP client. The

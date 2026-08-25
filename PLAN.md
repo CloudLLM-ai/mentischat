@@ -87,7 +87,7 @@ a prompt never pulls. The doorbell injects **only** this pointer (one
 constant in `src/nudge.rs`):
 
 ```
-[mentischat] New message waiting -- call check_inbox.
+[mentischat] Mail waiting. Call check_inbox now.
 ```
 
 Never the body, never a scraped reply, never `ack_ids`. The woken agent

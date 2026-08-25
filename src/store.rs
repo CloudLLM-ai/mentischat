@@ -59,7 +59,36 @@ pub fn open(data_dir: &Path) -> Result<Connection, StoreError> {
     )
     .map_err(StoreError::Sqlite)?;
 
+    migrate_roster(&conn).map_err(StoreError::Sqlite)?;
     Ok(conn)
+}
+
+fn migrate_roster(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let mut stmt = conn.prepare("PRAGMA table_info(roster)")?;
+    let cols: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !cols.iter().any(|c| c == "window_title_match") {
+        conn.execute("ALTER TABLE roster ADD COLUMN window_title_match TEXT", [])?;
+    }
+    if !cols.iter().any(|c| c == "nudge_transport") {
+        conn.execute(
+            "ALTER TABLE roster ADD COLUMN nudge_transport TEXT NOT NULL DEFAULT 'none'",
+            [],
+        )?;
+    }
+    if !cols.iter().any(|c| c == "wake_id") {
+        conn.execute("ALTER TABLE roster ADD COLUMN wake_id TEXT", [])?;
+    }
+    // Unconditional: a database created by an older implementation, or one
+    // interrupted between the column and index steps, can hold `wake_id`
+    // without its unique index.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_roster_wake_id ON roster (wake_id)
+         WHERE wake_id IS NOT NULL AND length(trim(wake_id)) > 0",
+        [],
+    )?;
+    Ok(())
 }
 
 /// Failure modes of opening/migrating the store.

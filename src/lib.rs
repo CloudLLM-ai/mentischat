@@ -9,15 +9,17 @@
 //! deleted. There is no history API.
 //!
 //! The MCP wire protocol is supplied by the [`mcp`] crate (`cloudllm_mcp`);
-//! this crate owns mailbox semantics: roster, caps, ack/batch delivery, and
-//! blocking pulls.
+//! this crate owns mailbox semantics: roster, caps, ack/batch delivery,
+//! blocking pulls, and the peek endpoint for harness wake.
 
 pub mod bus;
 pub mod errors;
 pub mod names;
+pub mod nudge;
 pub mod rest;
 pub mod store;
 pub mod tools;
+pub mod wake;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;

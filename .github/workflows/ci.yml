@@ -48,6 +48,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: rustup toolchain install 1.82 --profile minimal
+      - run: rustup toolchain install 1.88 --profile minimal
       - uses: Swatinem/rust-cache@v2
-      - run: cargo +1.82 check --all-targets --all-features --locked
+      - run: cargo +1.88 check --all-targets --all-features --locked

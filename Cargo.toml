@@ -12,7 +12,7 @@ keywords = ["mcp", "mailbox", "agents", "daemon", "tui"]
 categories = ["command-line-utilities", "development-tools", "network-programming"]
 # Unix only: the harness needs a PTY, termios and process groups. See the
 # compile_error! in src/lib.rs.
-rust-version = "1.82"
+rust-version = "1.88"
 exclude = ["/target", "/.github", "/launchd"]
 
 [[bin]]

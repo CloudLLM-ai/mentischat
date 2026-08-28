@@ -1,5 +1,16 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Regenerate this file for another checkout with `launchd/install.sh`; the
+  absolute path below is the one per-machine value launchd cannot expand
+  itself.
+
+  KeepAlive is a dict on purpose. `<true/>` restarts the daemon after *any*
+  exit, which turns two predictable cases into respawn loops: the port already
+  being owned by another instance (the daemon exits 1 by design) and a
+  deliberate `make stop` (SIGTERM, exit 0). Restarting only on a crash keeps
+  supervision without fighting the operator.
+-->
 <plist version="1.0">
 <dict>
     <key>Label</key>
@@ -7,7 +18,14 @@
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>

@@ -224,24 +224,34 @@ Source of truth: `src/bus.rs`.
 ## launchd (optional)
 
 ```bash
-cargo build --release
-mkdir -p ~/Library/LaunchAgents
-cp launchd/com.mentischat.plist ~/Library/LaunchAgents/
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.mentischat.plist
+make install                 # puts mentischat in ~/.cargo/bin
+launchd/install.sh           # writes the plist for THIS checkout and loads it
 
 # to unload:
 launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.mentischat.plist
 ```
 
+`launchd/install.sh` rewrites the plist's one per-machine value (the absolute
+path to `run.sh`) so the committed copy does not have to match your checkout.
 `launchd/run.sh` expands `$HOME` at run time (launchd does not expand plist
-variables) and logs to `~/Library/Logs/`.
+variables), prefers the installed binary over `target/release` so `make clean`
+cannot break the service, and logs to `~/Library/Logs/`.
+
+`KeepAlive` is restricted to `Crashed`. Restarting on *any* exit turns two
+normal cases into respawn loops: another instance already owning the port (the
+daemon exits non-zero on purpose) and a deliberate `make stop`.
 
 ## Tests
 
 ```bash
 cargo test          # bus behavior, store migrations, REST surface, MCP wire protocol
-make clippy         # cargo fmt + clippy --all-targets --all-features -- -D warnings
+make clippy         # clippy --all-targets --all-features -- -D warnings
+make ci             # what CI runs: fmt --check, check, clippy, test, doc
 ```
+
+`make build` and `make clippy` no longer rewrite your sources; `make fmt` and
+`make release` still do. GitHub Actions runs `make ci`'s steps on Linux and
+macOS, plus an MSRV check against the `rust-version` in `Cargo.toml`.
 
 ## Trust model & scope
 

@@ -489,3 +489,28 @@ async fn register_with_wake_id_binds_wrapper() {
     assert_eq!(peek["bound"], true);
     assert_eq!(peek["agent"], "muse");
 }
+
+#[tokio::test]
+async fn oversized_ack_id_array_is_rejected() {
+    let (_d, mut app) = app();
+    register_two(&mut app).await;
+
+    let body = ack_body_with(mentischat::bus::MAX_ACK_IDS + 1);
+    let (s, v) = send(&mut app, post("/inboxes/b/ack", &body)).await;
+    assert_eq!(s, 400, "no inbox can hold that many unacked rows");
+    assert_eq!(v["error"], "invalid_body");
+
+    // The cap itself is still accepted.
+    let body = ack_body_with(mentischat::bus::MAX_ACK_IDS);
+    let (s, v) = send(&mut app, post("/inboxes/b/ack", &body)).await;
+    assert_eq!(s, 200);
+    assert_eq!(v["acked"], 0, "none of those ids exist");
+}
+
+fn ack_body_with(count: usize) -> String {
+    let ids = (0..count)
+        .map(|_| format!(r#""{}""#, uuid::Uuid::new_v4()))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(r#"{{"ids":[{ids}]}}"#)
+}

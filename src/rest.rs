@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -37,7 +37,6 @@ pub fn router(bus: Ctx) -> Router {
         .route("/wake/{wake_id}", get(wake_peek).delete(unbind_wake))
         .route("/health", get(health))
         .fallback(not_found)
-        .layer(DefaultBodyLimit::max(1024 * 1024))
         .with_state(bus)
 }
 
@@ -49,8 +48,20 @@ fn ok_response(value: Value) -> Response {
     (StatusCode::OK, Json(value)).into_response()
 }
 
+/// Serialise a pull/peek result with `Cache-Control: no-store` — these
+/// endpoints mutate or observe live state and must never be cached.
+fn no_store_response<T: serde::Serialize>(value: &T) -> Response {
+    let mut resp = Json(serde_json::to_value(value).unwrap_or(Value::Null)).into_response();
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    resp
+}
+
 /// Parse a JSON request body; any extractor rejection is a client error.
-async fn json_body(body: Result<Json<Value>, JsonRejection>) -> Result<Value, Response> {
+#[allow(clippy::result_large_err)]
+fn json_body(body: Result<Json<Value>, JsonRejection>) -> Result<Value, Response> {
     match body {
         Ok(Json(v)) => Ok(v),
         Err(_) => Err(err_response(MailboxError::InvalidBody)),
@@ -77,7 +88,7 @@ fn optional_wake_id(v: &Value) -> Result<Option<String>, MailboxError> {
 
 /// `POST /agents` `{ "agent", "wakeId"?, "nudgeTransport"? }` — same as register.
 async fn register(State(bus): State<Ctx>, body: Result<Json<Value>, JsonRejection>) -> Response {
-    let v = match json_body(body).await {
+    let v = match json_body(body) {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -207,14 +218,7 @@ async fn nudge_peek(
         Err(e) => return err_response(e),
     };
     match bus.nudge_peek(&agent, wait_ms).await {
-        Ok(peek) => {
-            let mut resp = Json(serde_json::to_value(peek).unwrap_or(Value::Null)).into_response();
-            resp.headers_mut().insert(
-                header::CACHE_CONTROL,
-                header::HeaderValue::from_static("no-store"),
-            );
-            resp
-        }
+        Ok(peek) => no_store_response(&peek),
         Err(e) => err_response(e),
     }
 }
@@ -235,14 +239,7 @@ async fn wake_peek(
         Err(e) => return err_response(e),
     };
     match bus.nudge_peek_by_wake(&wake_id, wait_ms).await {
-        Ok(peek) => {
-            let mut resp = Json(serde_json::to_value(peek).unwrap_or(Value::Null)).into_response();
-            resp.headers_mut().insert(
-                header::CACHE_CONTROL,
-                header::HeaderValue::from_static("no-store"),
-            );
-            resp
-        }
+        Ok(peek) => no_store_response(&peek),
         Err(e) => err_response(e),
     }
 }
@@ -261,7 +258,7 @@ async fn unbind_wake(State(bus): State<Ctx>, Path(wake_id): Path<String>) -> Res
 
 /// `POST /messages` `{ "from", "to", "body" }` — same as send_message.
 async fn send_msg(State(bus): State<Ctx>, body: Result<Json<Value>, JsonRejection>) -> Response {
-    let v = match json_body(body).await {
+    let v = match json_body(body) {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -301,14 +298,7 @@ async fn pull(
         Err(e) => return err_response(e),
     };
     match bus.check_inbox(&agent, wait_ms, Vec::new()).await {
-        Ok(page) => {
-            let mut resp = Json(serde_json::to_value(page).unwrap_or(Value::Null)).into_response();
-            resp.headers_mut().insert(
-                header::CACHE_CONTROL,
-                header::HeaderValue::from_static("no-store"),
-            );
-            resp
-        }
+        Ok(page) => no_store_response(&page),
         Err(e) => err_response(e),
     }
 }
@@ -323,7 +313,7 @@ async fn ack(
         Ok(a) => a,
         Err(e) => return err_response(e),
     };
-    let v = match json_body(body).await {
+    let v = match json_body(body) {
         Ok(v) => v,
         Err(resp) => return resp,
     };

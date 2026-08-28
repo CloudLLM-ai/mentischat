@@ -970,3 +970,102 @@ async fn in_flight_redelivery_reports_remaining_unacked() {
     assert_eq!(p2.remaining, 1);
     assert_eq!(p1.messages[0].id, p2.messages[0].id);
 }
+
+#[tokio::test]
+async fn nudge_peek_ids_are_capped() {
+    let (_d, bus) = fresh_bus("peekcap");
+    bus.register(&name("a")).await.unwrap();
+    bus.register(&name("b")).await.unwrap();
+    let over = mentischat::bus::MAX_PEEK_IDS as usize + 10;
+    for _ in 0..over {
+        bus.send(&name("a"), &name("b"), "x".into()).await.unwrap();
+    }
+
+    let peek = bus.nudge_peek(&name("b"), 0).await.unwrap();
+    assert!(peek.pending, "a full queue is still pending");
+    assert_eq!(
+        peek.ids.len(),
+        mentischat::bus::MAX_PEEK_IDS as usize,
+        "peek must not echo the whole backlog on every poll"
+    );
+}
+
+#[tokio::test]
+async fn deregister_releases_a_parked_wake_poller() {
+    let (_d, bus) = fresh_bus("deregwake");
+    bus.register(&name("b")).await.unwrap();
+    let wid = uuid::Uuid::new_v4().to_string();
+    bus.register_with_wake(&name("b"), None, Some(&wid))
+        .await
+        .unwrap();
+
+    let b = bus.clone();
+    let w = wid.clone();
+    let parked = tokio::spawn(async move { b.nudge_peek_by_wake(&w, 30_000).await });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let started = std::time::Instant::now();
+    bus.deregister(&name("b")).await.unwrap();
+    let peek = parked.await.expect("task joins").expect("peek succeeds");
+
+    assert!(!peek.bound, "the session lost its agent");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "poller slept {:?} instead of being released",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn unbind_wake_releases_a_parked_wake_poller() {
+    let (_d, bus) = fresh_bus("unbindwake");
+    bus.register(&name("b")).await.unwrap();
+    let wid = uuid::Uuid::new_v4().to_string();
+    bus.register_with_wake(&name("b"), None, Some(&wid))
+        .await
+        .unwrap();
+
+    let b = bus.clone();
+    let w = wid.clone();
+    let parked = tokio::spawn(async move { b.nudge_peek_by_wake(&w, 30_000).await });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let started = std::time::Instant::now();
+    bus.unbind_wake(&wid).await.unwrap();
+    let peek = parked.await.expect("task joins").expect("peek succeeds");
+
+    assert!(!peek.bound, "the binding was cleared");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "poller slept {:?} instead of being released",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn ack_deletes_only_in_flight_rows_owned_by_the_caller() {
+    let (_d, bus) = fresh_bus("acktx");
+    bus.register(&name("a")).await.unwrap();
+    bus.register(&name("b")).await.unwrap();
+    bus.send(&name("a"), &name("b"), "one".into())
+        .await
+        .unwrap();
+    bus.send(&name("a"), &name("b"), "two".into())
+        .await
+        .unwrap();
+
+    let page = bus.check_inbox(&name("b"), 0, vec![]).await.unwrap();
+    assert_eq!(page.messages.len(), 2);
+    let ids: Vec<String> = page.messages.iter().map(|m| m.id.clone()).collect();
+
+    // Unknown ids and a foreign owner are ignored; the batch still commits.
+    let mut mixed = ids.clone();
+    mixed.push("not-a-real-id".into());
+    assert_eq!(bus.ack(&name("a"), ids.clone()).await.unwrap(), 0);
+    assert_eq!(bus.ack(&name("b"), mixed).await.unwrap(), 2);
+    assert_eq!(bus.ack(&name("b"), ids).await.unwrap(), 0, "idempotent");
+
+    let after = bus.check_inbox(&name("b"), 0, vec![]).await.unwrap();
+    assert!(after.messages.is_empty());
+    assert_eq!(after.remaining, 0);
+}

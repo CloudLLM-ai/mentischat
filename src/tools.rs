@@ -137,7 +137,15 @@ impl ToolProtocol for MailboxProtocol {
     async fn list_tools(
         &self,
     ) -> Result<Vec<ToolMetadata>, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(TOOL_NAMES.iter().filter_map(|n| metadata_for(n)).collect())
+        // A name without metadata is a bug in this file, not a tool to hide.
+        let mut tools = Vec::with_capacity(TOOL_NAMES.len());
+        for name in TOOL_NAMES {
+            match metadata_for(name) {
+                Some(meta) => tools.push(meta),
+                None => return Err(format!("missing metadata for tool: {name}").into()),
+            }
+        }
+        Ok(tools)
     }
 
     async fn get_tool_metadata(
@@ -256,10 +264,16 @@ pub fn parse_wait_ms(v: Option<&Value>) -> Result<u32, MailboxError> {
 }
 
 /// Contract ack_ids semantics: absent/null -> empty; array of strings ->
-/// ids; anything else -> `invalid_body`.
+/// ids; anything else -> `invalid_body`. Arrays longer than
+/// [`crate::bus::MAX_ACK_IDS`] are rejected: no inbox can hold more than that
+/// many unacked rows, so a longer list is junk that would otherwise run as
+/// that many statements while holding the bus lock.
 pub fn parse_ack_ids(v: Option<&Value>) -> Result<Vec<String>, MailboxError> {
     match v {
         None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) if items.len() > crate::bus::MAX_ACK_IDS => {
+            Err(MailboxError::InvalidBody)
+        }
         Some(Value::Array(items)) => items
             .iter()
             .map(|item| {

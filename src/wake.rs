@@ -20,6 +20,11 @@ const COOLDOWN: Duration = Duration::from_secs(60);
 const POLL_WAIT_MS: u32 = 30_000;
 /// Retry gap for transient daemon/registration failures.
 const RETRY: Duration = Duration::from_secs(2);
+/// Slack added to the long-poll wait before the client gives up on a request.
+const POLL_SLACK_MS: u64 = 5_000;
+/// Floor between two peeks that returned nothing to act on, so a daemon that
+/// answers immediately cannot spin this loop.
+const IDLE_GAP: Duration = Duration::from_millis(250);
 
 /// Options for [`run_harness`].
 pub struct WakeConfig {
@@ -154,7 +159,9 @@ pub async fn run_harness(config: WakeConfig) -> ExitCode {
                             // token; only its holder may unbind later.
                             if let Ok(v) = r.json::<Value>().await {
                                 if let Some(tok) = v.get("wakeId").and_then(Value::as_str) {
-                                    *bind_token.lock().unwrap() = Some(tok.to_string());
+                                    if let Ok(mut slot) = bind_token.lock() {
+                                        *slot = Some(tok.to_string());
+                                    }
                                 }
                             }
                             return;
@@ -179,14 +186,26 @@ pub async fn run_harness(config: WakeConfig) -> ExitCode {
         tokio::spawn(async move { poll_loop(&url, target, &writer, &submit).await });
     }
 
-    let mut sigterm = signal(SignalKind::terminate()).unwrap_or_else(|e| {
-        eprintln!("{program}: signal setup failed: {e}");
-        std::process::exit(1);
-    });
-    let mut sigint = signal(SignalKind::interrupt()).unwrap_or_else(|e| {
-        eprintln!("{program}: signal setup failed: {e}");
-        std::process::exit(1);
-    });
+    // Never `process::exit` past this point: stdin is in raw mode and only
+    // `restore_raw` gives the user a usable shell back.
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{program}: signal setup failed: {e}");
+            let _ = child.kill();
+            restore_raw(saved_termios);
+            return ExitCode::from(1);
+        }
+    };
+    let mut sigint = match signal(SignalKind::interrupt()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{program}: signal setup failed: {e}");
+            let _ = child.kill();
+            restore_raw(saved_termios);
+            return ExitCode::from(1);
+        }
+    };
     let mut winch = signal(SignalKind::window_change()).ok();
 
     let exit_code: u8 = 'main: loop {
@@ -230,7 +249,7 @@ pub async fn run_harness(config: WakeConfig) -> ExitCode {
             task.abort();
             let _ = task.await;
         }
-        let token = bind_token.lock().unwrap().take();
+        let token = bind_token.lock().ok().and_then(|mut slot| slot.take());
         if let Some(token) = token {
             let _ = client
                 .delete(format!("{url}/agents/{agent_name}/wrapper"))
@@ -240,8 +259,16 @@ pub async fn run_harness(config: WakeConfig) -> ExitCode {
         }
     }
     if let Some(pid) = child.process_id() {
+        let pid = pid as i32;
+        // portable-pty does not guarantee the child is a session/group leader
+        // on every platform. Signalling -pid when it is not would land on an
+        // unrelated group (possibly our own), so check before widening.
         unsafe {
-            libc::kill(-(pid as i32), libc::SIGTERM);
+            if libc::getpgid(pid) == pid {
+                libc::kill(-pid, libc::SIGTERM);
+            } else {
+                libc::kill(pid, libc::SIGTERM);
+            }
         }
     }
     let _ = child.kill();
@@ -265,7 +292,9 @@ async fn poll_loop(
         };
         let resp = match client
             .get(&peek_url)
-            .timeout(Duration::from_secs(POLL_WAIT_MS as u64 + 5))
+            .timeout(Duration::from_millis(
+                u64::from(POLL_WAIT_MS) + POLL_SLACK_MS,
+            ))
             .send()
             .await
         {
@@ -289,9 +318,11 @@ async fn poll_loop(
         if matches!(&target, PollTarget::Wake(_))
             && v.get("bound").and_then(Value::as_bool) != Some(true)
         {
+            tokio::time::sleep(IDLE_GAP).await;
             continue;
         }
         if v.get("pending").and_then(Value::as_bool) != Some(true) {
+            tokio::time::sleep(IDLE_GAP).await;
             continue;
         }
         let ids: Vec<String> = v

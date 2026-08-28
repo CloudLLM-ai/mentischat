@@ -1,5 +1,45 @@
 UNRELEASED
 
+  - fix(wake): the nudge long-poll client timeout was
+    Duration::from_secs(POLL_WAIT_MS + 5) on a value already in
+    milliseconds — ~8h20m instead of 35s, so a daemon that accepted a
+    connection and then stopped answering wedged the doorbell for hours
+    instead of retrying after 2s. Signal-setup failure now restores the
+    terminal instead of process::exit'ing out of raw mode; a poisoned bind
+    -token mutex no longer panics during shutdown; the group SIGTERM on exit
+    only widens to -pid when the child actually leads that group; and the
+    two "nothing to do" branches of the poll loop keep a 250ms floor.
+
+  - fix(bus): a failed message INSERT reported queue_full to the sender
+    regardless of cause (disk full, constraint violation, locked db); it now
+    maps to storage_error like every other sqlite failure. deregister,
+    unbind_wake and unbind_wrapper release parked /wake/{id} pollers instead
+    of leaving them until their wait expires. ack and ack_ids apply in one
+    transaction with one prepared statement rather than N autocommit deletes
+    under the bus lock; ack_ids arrays longer than MAX_ACK_IDS (1024, the
+    per-agent unacked cap) are invalid_body. Nudge peeks echo at most
+    MAX_PEEK_IDS (64) ids, so a stalled agent with a full queue no longer
+    returns a 1024-uuid body on every 1 Hz poll.
+
+  - refactor: retire the dead v1 window_title_match column (dropped on open;
+    the nudgeWindow wire field stays null); drop check_inbox's duplicate
+    waiter-cap check, which also inserted an empty queue as a side effect;
+    one no-store response helper instead of three copies in rest.rs; the
+    request body limit lives only on the composed router; list_tools fails
+    loudly on a tool name without metadata instead of silently omitting it;
+    build_router panics if the loopback IP allowlist is rejected rather than
+    shipping a filter that does not say what it claims.
+
+  - chore: the crate declares itself Unix-only (compile_error! rather than a
+    wall of unresolved symbols); harness-only flags in daemon mode exit 2
+    instead of being ignored; launchd KeepAlive is Crashed-only (KeepAlive
+    true respawn-looped on port-in-use and fought `make stop`), run.sh
+    prefers the installed binary and fails loudly, launchd/install.sh
+    generates the plist for the local checkout; Makefile build/clippy no
+    longer rewrite sources, `make ci` verifies formatting, doc denies broken
+    links; GitHub Actions CI on Linux + macOS with an MSRV job; Cargo.toml
+    carries the crates.io metadata it was missing.
+
   - fix(security): REST/MCP Origin guard rejects non-loopback Origin (curl
     with no Origin still works); wrapper bind is ownership-safe on re-bind
     (silent mint while bound is 403); wrapper injects POINTER_TEXT only

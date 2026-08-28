@@ -63,7 +63,17 @@ struct Cli {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
-    if let Some(command) = harness_command(&cli) {
+    // Harness-only flags in daemon mode are a misconfiguration, not a no-op:
+    // say so rather than starting a daemon that ignores half its arguments.
+    let command = harness_command(&cli);
+    if command.is_none() && (cli.agent.is_some() || cli.no_register) {
+        eprintln!(
+            "mentischat: --agent and --no-register apply to harness mode only \
+             (e.g. `mentischat opencode`); refusing to start the daemon with them"
+        );
+        return ExitCode::from(2);
+    }
+    if let Some(command) = command {
         return mentischat::wake::run_harness(WakeConfig {
             program: "mentischat",
             agent: cli.agent,
@@ -169,25 +179,18 @@ async fn run_daemon() -> ExitCode {
 }
 
 async fn shutdown_signal(bus: Arc<Bus>) {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let terminate = async {
-            match signal(SignalKind::terminate()) {
-                Ok(mut sig) => {
-                    sig.recv().await;
-                }
-                Err(_) => std::future::pending::<()>().await,
+    use tokio::signal::unix::{signal, SignalKind};
+    let terminate = async {
+        match signal(SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
             }
-        };
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = terminate => {}
+            Err(_) => std::future::pending::<()>().await,
         }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = terminate => {}
     }
     tracing::info!("shutting down");
     if let Err(e) = bus.shutdown().await {

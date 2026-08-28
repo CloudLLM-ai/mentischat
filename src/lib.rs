@@ -12,6 +12,15 @@
 //! this crate owns mailbox semantics: roster, caps, ack/batch delivery,
 //! blocking pulls, and the peek endpoint for harness wake.
 
+// The daemon is loopback-only by design, but the harness half of this crate
+// (PTY, termios, process groups, SIGWINCH) has no Windows equivalent, so say
+// so at compile time instead of failing with a wall of unresolved symbols.
+#[cfg(not(unix))]
+compile_error!(
+    "mentischat targets Unix (macOS and Linux): the PTY harness, raw-mode \
+     terminal handling and signal plumbing have no Windows implementation."
+);
+
 pub mod bus;
 pub mod errors;
 pub mod names;
@@ -47,6 +56,9 @@ pub const BIND_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 
 /// `/{*rest}` that would otherwise answer unknown REST paths with 405
 /// instead of the contract `not_found` body.
 ///
+/// This is also where the request body limit lives, so it covers REST and
+/// `/mcp` alike; `rest::router` deliberately carries none of its own.
+///
 /// The caller is responsible for binding the listener and serving the router
 /// with `into_make_service_with_connect_info::<SocketAddr>()`, which both
 /// the loopback middleware and the upstream MCP handlers need for IP checks.
@@ -55,9 +67,15 @@ pub fn build_router(bus: Arc<bus::Bus>) -> axum::Router {
         .with_endpoint_path("/")
         .with_instructions(tools::INSTRUCTIONS);
 
+    // These two entries are the whole allowlist. Swallowing a rejection here
+    // would silently ship a filter that does not say what we think it says,
+    // so treat it as the build-time bug it would be.
     let mut ip_filter = mcp::IpFilter::new();
-    let _ = ip_filter.allow("127.0.0.1");
-    let _ = ip_filter.allow("::1");
+    for loopback in ["127.0.0.1", "::1"] {
+        ip_filter
+            .allow(loopback)
+            .unwrap_or_else(|e| panic!("mentischat: IP filter rejected {loopback}: {e}"));
+    }
 
     let http_config = HttpServerConfig {
         addr: BIND_ADDR,

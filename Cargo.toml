@@ -7,6 +7,13 @@ license = "MIT"
 repository = "https://github.com/CloudLLM-ai/mentischat"
 homepage = "https://github.com/CloudLLM-ai/mentischat"
 documentation = "https://github.com/CloudLLM-ai/mentischat#readme"
+readme = "README.md"
+keywords = ["mcp", "mailbox", "agents", "daemon", "tui"]
+categories = ["command-line-utilities", "development-tools", "network-programming"]
+# Unix only: the harness needs a PTY, termios and process groups. See the
+# compile_error! in src/lib.rs.
+rust-version = "1.82"
+exclude = ["/target", "/.github", "/launchd"]
 
 [[bin]]
 name = "mentis-wake"
@@ -16,6 +23,8 @@ path = "src/bin/mentis-wake.rs"
 async-trait = "0.1.92"
 axum = "0.8"
 clap = { version = "4", features = ["derive"] }
+# Pinned exactly: this crate builds against upstream's ToolProtocol and
+# streamable_http_router surface, which is not yet stable across minors.
 cloudllm_mcp = { version = "=0.3.6", features = ["server"] }
 libc = "0.2"
 portable-pty = "0.8"

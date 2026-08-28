@@ -68,8 +68,12 @@ fn migrate_roster(conn: &Connection) -> Result<(), rusqlite::Error> {
     let cols: Vec<String> = stmt
         .query_map([], |r| r.get::<_, String>(1))?
         .collect::<Result<Vec<_>, _>>()?;
-    if !cols.iter().any(|c| c == "window_title_match") {
-        conn.execute("ALTER TABLE roster ADD COLUMN window_title_match TEXT", [])?;
+    // v1 stored an AppleScript window title here. That doorbell is gone and
+    // the column has been written as NULL ever since, so retire it. (SQLite
+    // >= 3.35; the bundled build is well past that, and the column carries no
+    // index or constraint.)
+    if cols.iter().any(|c| c == "window_title_match") {
+        conn.execute("ALTER TABLE roster DROP COLUMN window_title_match", [])?;
     }
     if !cols.iter().any(|c| c == "nudge_transport") {
         conn.execute(

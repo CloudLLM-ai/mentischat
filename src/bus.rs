@@ -39,6 +39,12 @@ pub const MAX_NUDGE_WAITERS_PER_AGENT: usize = 2;
 pub const MAX_WAKE_WAITERS_GLOBAL: usize = 64;
 /// Cap on roster rows — bounds waiter amplification (8 inbox + 2 peek per name).
 pub const MAX_ROSTER: i64 = 256;
+/// Cap on unacked ids echoed by one nudge peek. The wrapper uses them only to
+/// build a debounce key, so a stalled agent holding a full queue must not turn
+/// every 1 Hz poll into a 1024-uuid response.
+pub const MAX_PEEK_IDS: i64 = 64;
+/// Cap on ids accepted in one `ack_ids` array.
+pub const MAX_ACK_IDS: usize = MAX_PENDING_PER_AGENT as usize;
 
 /// How an idle session is woken. Stored on the roster row as
 /// `nudge_transport`; one transport per agent.
@@ -312,8 +318,8 @@ impl Bus {
             if let Some(wid) = wake_id.as_deref() {
                 g.conn
                     .execute(
-                        "UPDATE roster SET last_seen = ?2, window_title_match = NULL,
-                         nudge_transport = 'wrapper', wake_id = ?3 WHERE name = ?1",
+                        "UPDATE roster SET last_seen = ?2, nudge_transport = 'wrapper',
+                         wake_id = ?3 WHERE name = ?1",
                         params![name.as_str(), now, wid],
                     )
                     .map_err(sqlite_storage)?;
@@ -323,16 +329,16 @@ impl Bus {
                     // so a stale /wake/{id} poller cannot stay attached.
                     g.conn
                         .execute(
-                            "UPDATE roster SET last_seen = ?2, window_title_match = NULL,
-                             nudge_transport = ?3, wake_id = NULL WHERE name = ?1",
+                            "UPDATE roster SET last_seen = ?2, nudge_transport = ?3,
+                             wake_id = NULL WHERE name = ?1",
                             params![name.as_str(), now, t.as_str()],
                         )
                         .map_err(sqlite_storage)?;
                 } else {
                     g.conn
                         .execute(
-                            "UPDATE roster SET last_seen = ?2, window_title_match = NULL,
-                             nudge_transport = ?3 WHERE name = ?1",
+                            "UPDATE roster SET last_seen = ?2, nudge_transport = ?3
+                             WHERE name = ?1",
                             params![name.as_str(), now, t.as_str()],
                         )
                         .map_err(sqlite_storage)?;
@@ -372,8 +378,8 @@ impl Bus {
         };
         g.conn
             .execute(
-                "INSERT INTO roster (name, last_seen, window_title_match, nudge_transport, wake_id)
-                 VALUES (?1, ?2, NULL, ?3, ?4)",
+                "INSERT INTO roster (name, last_seen, nudge_transport, wake_id)
+                 VALUES (?1, ?2, ?3, ?4)",
                 params![name.as_str(), now, transport.as_str(), wake_id],
             )
             .map_err(sqlite_storage)?;
@@ -411,6 +417,15 @@ impl Bus {
             return Err(MailErr::ShuttingDown);
         }
         ensure_registered(&g, name.as_str())?;
+        let wake_id: Option<String> = g
+            .conn
+            .query_row(
+                "SELECT wake_id FROM roster WHERE name = ?1",
+                params![name.as_str()],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .map_err(sqlite_storage)?
+            .filter(|s| !s.trim().is_empty());
         let discarded: i64 = g
             .conn
             .query_row(
@@ -434,6 +449,11 @@ impl Bus {
         // gone, and fail unregistered.
         g.waiters.remove(name.as_str());
         g.nudge_waiters.remove(name.as_str());
+        // A wrapper long-polling /wake/{id} for this name would otherwise sit
+        // until its wait expires; wake it so it re-reads and sees `unbound`.
+        if let Some(wid) = wake_id.as_deref() {
+            wake_wake_waiters(&mut g, wid);
+        }
         Ok(DiscardOutcome {
             agent: name.to_string(),
             discarded,
@@ -448,10 +468,7 @@ impl Bus {
         }
         let mut stmt = g
             .conn
-            .prepare(
-                "SELECT name, last_seen, window_title_match, nudge_transport
-                 FROM roster ORDER BY name ASC",
-            )
+            .prepare("SELECT name, last_seen, nudge_transport FROM roster ORDER BY name ASC")
             .map_err(sqlite_storage)?;
         let rows = stmt
             .query_map([], |r| {
@@ -459,7 +476,7 @@ impl Bus {
                     name: r.get(0)?,
                     last_seen: r.get(1)?,
                     nudge_window: None,
-                    nudge_transport: NudgeTransport::from_db(r.get(3)?),
+                    nudge_transport: NudgeTransport::from_db(r.get(2)?),
                 })
             })
             .map_err(sqlite_storage)?
@@ -522,7 +539,7 @@ impl Bus {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending')",
                 params![id, from.as_str(), to.as_str(), body, created_at, seq],
             )
-            .map_err(|_| MailErr::StorageFull { pending: n_all })?;
+            .map_err(sqlite_storage)?;
 
         if let Some(q) = g.waiters.get_mut(to.as_str()) {
             wake_one(q);
@@ -659,16 +676,25 @@ impl Bus {
     /// Clear a wake session on `mentis-wake` exit (transport → `none`).
     pub async fn unbind_wake(&self, wake_id: &str) -> Result<(), MailErr> {
         let wake_id = crate::nudge::validate_wake_id(wake_id)?;
-        let g = self.inner.lock().await;
+        let mut g = self.inner.lock().await;
         if g.closed {
             return Err(MailErr::ShuttingDown);
         }
+        let agent = agent_by_wake_id(&g, &wake_id)?;
         g.conn
             .execute(
                 "UPDATE roster SET nudge_transport = 'none', wake_id = NULL WHERE wake_id = ?1",
                 params![wake_id],
             )
             .map_err(sqlite_storage)?;
+        if let Some(a) = agent.as_deref() {
+            if let Some(q) = g.nudge_waiters.remove(a) {
+                for w in q {
+                    let _ = w.tx.send(());
+                }
+            }
+        }
+        wake_wake_waiters(&mut g, &wake_id);
         Ok(())
     }
 
@@ -723,8 +749,8 @@ impl Bus {
 
         g.conn
             .execute(
-                "UPDATE roster SET nudge_transport = 'wrapper', window_title_match = NULL,
-                 wake_id = ?2 WHERE name = ?1",
+                "UPDATE roster SET nudge_transport = 'wrapper', wake_id = ?2
+                 WHERE name = ?1",
                 params![name.as_str(), token],
             )
             .map_err(sqlite_storage)?;
@@ -742,7 +768,7 @@ impl Bus {
         wake_id: &str,
     ) -> Result<(), MailErr> {
         let token = crate::nudge::validate_wake_id(wake_id)?;
-        let g = self.inner.lock().await;
+        let mut g = self.inner.lock().await;
         if g.closed {
             return Err(MailErr::ShuttingDown);
         }
@@ -763,6 +789,12 @@ impl Bus {
                         params![name.as_str()],
                     )
                     .map_err(sqlite_storage)?;
+                if let Some(q) = g.nudge_waiters.remove(name.as_str()) {
+                    for w in q {
+                        let _ = w.tx.send(());
+                    }
+                }
+                wake_wake_waiters(&mut g, &token);
                 Ok(())
             }
             // Nothing bound: a second clean exit is a no-op.
@@ -804,14 +836,6 @@ impl Bus {
             return Ok(empty_page(name));
         }
 
-        let parked_len = g.waiters.entry(name.to_string()).or_default().len();
-        if parked_len >= MAX_WAITERS_PER_AGENT {
-            return Err(MailErr::TooManyWaiters {
-                agent: name.to_string(),
-                waiting: parked_len,
-            });
-        }
-
         // Park under the mutex: register the waiter before releasing so a
         // concurrent send cannot land between "inbox empty" and "waiting".
         let (waiter_id, rx) = try_park(&mut g, WaiterKind::Inbox(name.as_str()))?;
@@ -837,21 +861,30 @@ impl Bus {
         name: &crate::names::AgentName,
         ack_ids: Vec<String>,
     ) -> Result<i64, MailErr> {
-        let g = self.inner.lock().await;
+        let mut g = self.inner.lock().await;
         if g.closed {
             return Err(MailErr::ShuttingDown);
         }
         ensure_registered(&g, name.as_str())?;
-        let mut acked = 0i64;
-        for id in &ack_ids {
-            acked += g
-                .conn
-                .execute(
-                    "DELETE FROM messages WHERE id = ?1 AND recipient = ?2 AND state = 'in_flight'",
-                    params![id, name.as_str()],
-                )
-                .map_err(sqlite_storage)? as i64;
+        if ack_ids.is_empty() {
+            return Ok(0);
         }
+        let mut acked = 0i64;
+        let tx = g.conn.transaction().map_err(sqlite_storage)?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "DELETE FROM messages
+                     WHERE id = ?1 AND recipient = ?2 AND state = 'in_flight'",
+                )
+                .map_err(sqlite_storage)?;
+            for id in &ack_ids {
+                acked += stmt
+                    .execute(params![id, name.as_str()])
+                    .map_err(sqlite_storage)? as i64;
+            }
+        }
+        tx.commit().map_err(sqlite_storage)?;
         Ok(acked)
     }
 
@@ -1062,10 +1095,10 @@ fn unpark(g: &mut Inner, kind: WaiterKind<'_>, id: u64) {
 fn unacked_ids(g: &Inner, name: &str) -> Result<Option<Vec<String>>, MailErr> {
     let mut stmt = g
         .conn
-        .prepare("SELECT id FROM messages WHERE recipient = ?1 ORDER BY seq ASC")
+        .prepare("SELECT id FROM messages WHERE recipient = ?1 ORDER BY seq ASC LIMIT ?2")
         .map_err(sqlite_storage)?;
     let ids: Vec<String> = stmt
-        .query_map(params![name], |r| r.get(0))
+        .query_map(params![name, MAX_PEEK_IDS], |r| r.get(0))
         .map_err(sqlite_storage)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(sqlite_storage)?;
@@ -1121,13 +1154,20 @@ fn roster_sorted(g: &Inner) -> Result<Vec<String>, MailErr> {
 }
 
 fn apply_acks(g: &mut Inner, name: &str, ack_ids: &[String]) -> Result<(), MailErr> {
-    for id in ack_ids {
-        g.conn
-            .execute(
-                "DELETE FROM messages WHERE id = ?1 AND recipient = ?2 AND state = 'in_flight'",
-                params![id, name],
-            )
-            .map_err(sqlite_storage)?;
+    if !ack_ids.is_empty() {
+        let tx = g.conn.transaction().map_err(sqlite_storage)?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "DELETE FROM messages
+                     WHERE id = ?1 AND recipient = ?2 AND state = 'in_flight'",
+                )
+                .map_err(sqlite_storage)?;
+            for id in ack_ids {
+                stmt.execute(params![id, name]).map_err(sqlite_storage)?;
+            }
+        }
+        tx.commit().map_err(sqlite_storage)?;
     }
     touch_last_seen(g, name)
 }

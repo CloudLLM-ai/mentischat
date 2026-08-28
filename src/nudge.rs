@@ -1,9 +1,9 @@
 //! Shared nudge constants for wake transports.
 //!
-//! The in-daemon AppleScript doorbell (v1) was removed; see
-//! [`NUDGE-V1-TERMINAL.md`](../NUDGE-V1-TERMINAL.md) at the repo root.
-//! [`mentis-wake`](crate) long-polls the daemon and injects this pointer into
-//! the harness PTY.
+//! The in-daemon AppleScript doorbell (v1) was removed. `mentis-wake`
+//! long-polls the daemon and injects this pointer into the harness PTY;
+//! `nudgeTransport: terminal` survives only as a deprecated alias for
+//! `none`.
 
 use crate::errors::MailboxError;
 

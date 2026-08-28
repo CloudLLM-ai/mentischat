@@ -1,5 +1,5 @@
 # Makefile
-.PHONY: build release clean fmt check test doc help tasks clippy publish publish-dry-run install start stop
+.PHONY: build release clean fmt fmt-check check test doc help tasks clippy publish publish-dry-run install start stop ci
 
 default: help
 CARGO_CMD=/usr/bin/env cargo
@@ -9,34 +9,39 @@ MENTISCHAT_PORT?=9480
 # Targets
 # ----------------------------------------------------------------------------------------------------------------------
 
-# Default target (ensures formatting before building)
-build: fmt ## Build the crate in release mode (runs fmt first)
+# Build the crate. Does not reformat: build targets should not rewrite sources.
+build: ## Build the crate in release mode
 	${CARGO_CMD} build --release
 
 # Full release process (ensures everything runs in the correct order)
 release: fmt check clippy build test doc ## Perform a full release (fmt, check, clippy, build, test, doc)
 
+# What CI runs: verifies formatting instead of rewriting it
+ci: fmt-check check clippy test doc ## Verification-only pipeline (no source rewrites)
+
 # Format the code
 fmt: ## Format the code using cargo fmt
 	${CARGO_CMD} fmt
 
-# Check for errors without building
+# Verify formatting without rewriting (for CI / pre-push)
+fmt-check: ## Fail if anything is unformatted
+	${CARGO_CMD} fmt --check
+
+# Check for errors without building. --all-targets covers bins, tests and benches.
 check: ## Run cargo check to analyze the code without compiling
-	${CARGO_CMD} check
-	${CARGO_CMD} check --bin mentischat
+	${CARGO_CMD} check --all-targets --all-features
 
 # Strict linter, fails on warnings and suggests fixes
 clippy: ## Run clippy and fail on warnings
-	${CARGO_CMD} fmt
 	${CARGO_CMD} clippy --all-targets --all-features -- -D warnings
 
 # Run tests
 test: ## Run all tests using cargo test
-	${CARGO_CMD} test
+	${CARGO_CMD} test --all-features
 
-# Generate documentation
+# Generate documentation. Broken intra-doc links fail the build.
 doc: ## Generate project documentation using cargo doc
-	${CARGO_CMD} doc --all-features
+	RUSTDOCFLAGS="-D warnings" ${CARGO_CMD} doc --all-features --no-deps
 
 # Publish to crates.io
 publish: ## Publish mentischat to crates.io

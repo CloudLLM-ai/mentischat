@@ -34,7 +34,10 @@ pub fn open(data_dir: &Path) -> Result<Connection, StoreError> {
         .map_err(StoreError::Sqlite)?;
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(StoreError::Sqlite)?;
-    conn.pragma_update(None, "synchronous", "NORMAL")
+    // FULL syncs the WAL on every commit, so an accepted send survives an OS
+    // crash or power loss (NORMAL can roll back the last commits). Traffic is
+    // a few local agents, so the extra fsync is not felt.
+    conn.pragma_update(None, "synchronous", "FULL")
         .map_err(StoreError::Sqlite)?;
 
     conn.execute_batch(

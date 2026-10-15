@@ -812,3 +812,101 @@ async fn abandoned_blocking_pulls_do_not_fill_the_waiter_cap() {
     let page = pull.await.unwrap().expect("not too_many_waiters");
     assert_eq!(page.messages.len(), 1);
 }
+
+// current_thread runtime: after `send` returns, the woken pull has not run
+// yet, so aborting it reproduces "woken, then the client went away".
+#[tokio::test]
+async fn a_cancelled_pull_hands_its_wake_to_the_next_waiter() {
+    let (_d, bus) = fresh_bus("handoff");
+    bus.register(&name("a")).await.unwrap();
+    bus.register(&name("b")).await.unwrap();
+
+    let b = bus.clone();
+    let first = tokio::spawn(async move { b.check_inbox(&name("b"), 10_000, vec![]).await });
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let b = bus.clone();
+    let second = tokio::spawn(async move { b.check_inbox(&name("b"), 10_000, vec![]).await });
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+    bus.send(&name("a"), &name("b"), "for whoever is left".into())
+        .await
+        .unwrap(); // wakes `first`, the oldest waiter
+    first.abort();
+
+    let started = std::time::Instant::now();
+    let page = tokio::time::timeout(std::time::Duration::from_secs(2), second)
+        .await
+        .expect("second waiter was woken, not left to its 10 s timeout")
+        .unwrap()
+        .unwrap();
+    assert_eq!(page.messages.len(), 1);
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+}
+
+#[tokio::test]
+async fn a_wake_with_nothing_left_keeps_waiting_until_the_deadline() {
+    let (_d, bus) = fresh_bus("respark");
+    bus.register(&name("a")).await.unwrap();
+    bus.register(&name("b")).await.unwrap();
+
+    let b = bus.clone();
+    let started = std::time::Instant::now();
+    let parked = tokio::spawn(async move { b.check_inbox(&name("b"), 400, vec![]).await });
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+    // The send wakes the parked pull, but another pull under the same name
+    // takes and acks the message before the woken one gets the lock.
+    bus.send(&name("a"), &name("b"), "taken".into())
+        .await
+        .unwrap();
+    let page = bus.check_inbox(&name("b"), 0, vec![]).await.unwrap();
+    let ids: Vec<String> = page.messages.iter().map(|m| m.id.clone()).collect();
+    assert_eq!(bus.ack(&name("b"), ids).await.unwrap(), 1);
+
+    let page = parked.await.unwrap().unwrap();
+    assert!(page.messages.is_empty());
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(350),
+        "returned empty after {:?}, before its wait_ms",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn batch_size_counts_escaped_json_not_raw_body_bytes() {
+    let (_d, bus) = fresh_bus("escaped");
+    bus.register(&name("a")).await.unwrap();
+    bus.register(&name("b")).await.unwrap();
+    // 6000 raw bytes each, but every control character serializes as \u0001
+    // (6 bytes): two raw bodies fit in 16 KiB, two escaped ones do not.
+    let body = format!("x{}", "\u{1}".repeat(5999));
+    for _ in 0..2 {
+        bus.send(&name("a"), &name("b"), body.clone())
+            .await
+            .unwrap();
+    }
+    let page = bus.check_inbox(&name("b"), 0, vec![]).await.unwrap();
+    assert_eq!(page.messages.len(), 1);
+    assert_eq!(page.remaining, 1);
+}
+
+#[tokio::test]
+async fn delivery_order_survives_a_crash_and_acked_tail_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("seq");
+    let bus = Bus::new(&data).unwrap();
+    bus.register(&name("a")).await.unwrap();
+    bus.register(&name("b")).await.unwrap();
+    bus.send(&name("a"), &name("b"), "first".into())
+        .await
+        .unwrap();
+    drop(bus); // crash: no shutdown wipe
+
+    let bus = Bus::new(&data).unwrap();
+    bus.send(&name("a"), &name("b"), "second".into())
+        .await
+        .unwrap();
+    let page = bus.check_inbox(&name("b"), 0, vec![]).await.unwrap();
+    let bodies: Vec<&str> = page.messages.iter().map(|m| m.body.as_str()).collect();
+    assert_eq!(bodies, ["first", "second"]);
+}

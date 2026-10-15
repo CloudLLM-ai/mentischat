@@ -52,7 +52,7 @@ pub(super) fn touch_last_seen(g: &mut Inner, name: &str) -> Result<(), MailErr> 
 ///
 /// Redeliver unacked `in_flight` FIFO within the same batch caps as a fresh
 /// promote; else promote up to `MAX_BATCH` pending rows within
-/// `MAX_RETURN_BYTES` of body bytes (the first message always rides even when
+/// `MAX_RETURN_BYTES` of serialized message JSON (the first message always rides even when
 /// oversized — progress must be possible).
 pub(super) fn deliver_locked(g: &mut Inner, name: &str) -> Result<Option<InboxPage>, MailErr> {
     let in_flight = load_rows(g, name, "in_flight", None)?;
@@ -81,17 +81,29 @@ pub(super) fn deliver_locked(g: &mut Inner, name: &str) -> Result<Option<InboxPa
 
 /// Select a prefix of `candidates` (already seq-ordered) that fits
 /// [`MAX_BATCH`] and [`MAX_RETURN_BYTES`]. The first message is always kept.
+///
+/// Size is each message's serialized JSON, not its raw body: escaping can
+/// make a body several times longer on the wire (a control character becomes
+/// six bytes), and the wire size is what has to stay under client truncation
+/// limits.
 fn take_batch(candidates: &[Message]) -> Vec<Message> {
     let mut take = 0usize;
     let mut bytes = 0usize;
     for msg in candidates.iter().take(MAX_BATCH as usize) {
-        if take > 0 && bytes + msg.body.len() > MAX_RETURN_BYTES {
+        let size = wire_len(msg);
+        if take > 0 && bytes + size > MAX_RETURN_BYTES {
             break;
         }
-        bytes += msg.body.len();
+        bytes += size;
         take += 1;
     }
     candidates[..take].to_vec()
+}
+
+fn wire_len(msg: &Message) -> usize {
+    // Serializing plain strings cannot fail; fall back to the body length
+    // rather than panic if it ever did.
+    serde_json::to_vec(msg).map_or(msg.body.len(), |v| v.len())
 }
 
 fn page(g: &Inner, name: &str, messages: Vec<Message>) -> Result<InboxPage, MailErr> {

@@ -7,6 +7,8 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
 use rusqlite::params;
 use tokio::sync::{Mutex, MutexGuard};
@@ -26,7 +28,7 @@ pub use model::{
 };
 
 use delivery::{delete_acked, deliver_locked, empty_page, touch_last_seen};
-use waiters::{try_park, unpark, wake_one, WaiterMap};
+use waiters::{try_park, unpark, wake_one, ParkGuard, WaiterMap};
 
 type MailErr = crate::errors::MailboxError;
 
@@ -34,13 +36,17 @@ struct Inner {
     conn: rusqlite::Connection,
     waiters: WaiterMap,
     next_waiter_id: u64,
+    /// Delivery order for the next message; strictly increasing for the life
+    /// of the process, seeded past every row already on disk.
+    next_seq: i64,
     messages_sent: u64,
     closed: bool,
 }
 
 /// Shared mailbox handle; wrap in [`std::sync::Arc`] to share across HTTP/MCP layers.
 pub struct Bus {
-    inner: Mutex<Inner>,
+    // Arc so a parked pull dropped mid-wait can settle its waiter from Drop.
+    inner: Arc<Mutex<Inner>>,
 }
 
 impl Bus {
@@ -56,14 +62,21 @@ impl Bus {
     /// # }
     /// ```
     pub fn new(data_dir: &Path) -> Result<Self, StoreError> {
+        let conn = crate::store::open(data_dir)?;
+        let next_seq: i64 = conn
+            .query_row("SELECT COALESCE(MAX(seq), 0) + 1 FROM messages", [], |r| {
+                r.get(0)
+            })
+            .map_err(StoreError::Sqlite)?;
         Ok(Self {
-            inner: Mutex::new(Inner {
-                conn: crate::store::open(data_dir)?,
+            inner: Arc::new(Mutex::new(Inner {
+                conn,
                 waiters: HashMap::new(),
                 next_waiter_id: 0,
+                next_seq,
                 messages_sent: 0,
                 closed: false,
-            }),
+            })),
         })
     }
 
@@ -251,12 +264,13 @@ impl Bus {
         ensure_registered(&g, from.as_str())?;
         ensure_registered(&g, to.as_str())?;
 
-        let n_to: i64 = g
+        // Both caps from one scan of the (small, capped) table.
+        let (n_to, n_all): (i64, i64) = g
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM messages WHERE recipient = ?1",
+                "SELECT COALESCE(SUM(recipient = ?1), 0), COUNT(*) FROM messages",
                 params![to.as_str()],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .map_err(sqlite_storage)?;
         if n_to >= MAX_PENDING_PER_AGENT {
@@ -265,21 +279,12 @@ impl Bus {
                 pending: n_to,
             });
         }
-        let n_all: i64 = g
-            .conn
-            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
-            .map_err(sqlite_storage)?;
         if n_all >= MAX_TOTAL_MESSAGES {
             return Err(MailErr::StorageFull { pending: n_all });
         }
 
         let id = uuid::Uuid::new_v4().to_string();
-        let seq: i64 = g
-            .conn
-            .query_row("SELECT COALESCE(MAX(seq), 0) + 1 FROM messages", [], |r| {
-                r.get(0)
-            })
-            .map_err(sqlite_storage)?;
+        let seq = g.next_seq;
         g.conn
             .execute(
                 "INSERT INTO messages (id, sender, recipient, body, created_at, seq, state)
@@ -288,6 +293,7 @@ impl Bus {
             )
             .map_err(sqlite_storage)?;
 
+        g.next_seq += 1;
         g.messages_sent += 1;
         if let Some(q) = g.waiters.get_mut(to.as_str()) {
             wake_one(q);
@@ -327,23 +333,36 @@ impl Bus {
             return Ok(empty_page(name));
         }
 
-        // Park under the mutex: register the waiter before releasing so a
-        // concurrent send cannot land between "inbox empty" and "waiting".
-        let (waiter_id, rx) = try_park(&mut g, name.as_str())?;
-        drop(g);
+        // Park until mail arrives or the deadline passes. A wake can find
+        // nothing to deliver (another pull under the same name took it, or a
+        // cancelled waiter handed its wake on); that waiter parks again for
+        // the time left instead of returning empty early.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(u64::from(wait_ms));
+        loop {
+            // Park under the mutex: register the waiter before releasing so a
+            // concurrent send cannot land between "inbox empty" and "waiting".
+            let (waiter_id, rx) = try_park(&mut g, name.as_str())?;
+            drop(g);
 
-        let _ =
-            tokio::time::timeout(std::time::Duration::from_millis(u64::from(wait_ms)), rx).await;
+            let mut guard = ParkGuard::new(self.inner.clone(), name.as_str(), waiter_id, rx);
+            guard.wait_until(deadline).await;
 
-        let mut g = self.inner.lock().await;
-        unpark(&mut g, name.as_str(), waiter_id);
-        if g.closed {
-            return Err(MailErr::ShuttingDown);
+            g = self.inner.lock().await;
+            guard.settle();
+            unpark(&mut g, name.as_str(), waiter_id);
+            if g.closed {
+                return Err(MailErr::ShuttingDown);
+            }
+            ensure_registered(&g, name.as_str())?;
+            // The agent was waiting all along; record when the pull ended.
+            touch_last_seen(&mut g, name.as_str())?;
+            if let Some(page) = deliver_locked(&mut g, name.as_str())? {
+                return Ok(page);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(empty_page(name));
+            }
         }
-        ensure_registered(&g, name.as_str())?;
-        // The agent was waiting all along; record when the pull ended.
-        touch_last_seen(&mut g, name.as_str())?;
-        Ok(deliver_locked(&mut g, name.as_str())?.unwrap_or_else(|| empty_page(name)))
     }
 
     /// Acknowledge-and-delete only (REST `POST /inboxes/{agent}/ack`).

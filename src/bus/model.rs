@@ -11,7 +11,8 @@ pub const MAX_PENDING_PER_AGENT: i64 = 1024;
 pub const MAX_TOTAL_MESSAGES: i64 = 8192;
 /// Max messages returned by one `check_inbox`.
 pub const MAX_BATCH: i64 = 8;
-/// Max summed body bytes returned by one `check_inbox` (first message always included).
+/// Max summed serialized-JSON bytes of the messages returned by one
+/// `check_inbox` (first message always included).
 pub const MAX_RETURN_BYTES: usize = 16 * 1024;
 /// Upper bound of `wait_ms`.
 pub const MAX_WAIT_MS: u32 = 30_000;

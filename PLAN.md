@@ -31,14 +31,14 @@ traffic.
 One process, `127.0.0.1:9480`. MCP Streamable HTTP at `/mcp` plus REST on
 the same listener. Bind is the single-instance lock (`EADDRINUSE` → exit).
 Loopback only; no auth. Closing a TUI does not deregister. `lastSeen` is
-updated on `register` and `check_inbox` — a hint, not a live socket.
+updated on `register`, `send_message` and `check_inbox` — a hint, not a live socket.
 
 Lifetime: state lives for one server run. Unread mail expires after
 `MENTISCHAT_MESSAGE_TTL` (1 h); agents idle past `MENTISCHAT_AGENT_TTL` (24 h)
 leave the roster with their unread mail; a sweep runs every minute. A graceful
 shutdown (SIGTERM/SIGINT) and every startup wipe the roster and all mail, so a
 crash leaves nothing behind for long either (`MENTISCHAT_PERSIST=1` opts out).
-Deleted text is scrubbed: `secure_delete`, WAL truncated after reads, sweeps
+Deleted text is scrubbed: `secure_delete`, WAL truncated after reads, deregisters, sweeps
 and wipes, VACUUM on wipe.
 
 Operator view: started from a terminal the daemon paints a read-only ratatui

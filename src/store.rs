@@ -34,10 +34,10 @@ pub fn open(data_dir: &Path) -> Result<Connection, StoreError> {
         .map_err(StoreError::Sqlite)?;
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(StoreError::Sqlite)?;
-    // FULL syncs the WAL on every commit, so an accepted send survives an OS
-    // crash or power loss (NORMAL can roll back the last commits). Traffic is
-    // a few local agents, so the extra fsync is not felt.
-    conn.pragma_update(None, "synchronous", "FULL")
+    // NORMAL: WAL keeps the file consistent through a crash; at worst the
+    // last commits roll back on power loss. Stronger durability buys nothing
+    // here, since startup wipes the mailbox unless MENTISCHAT_PERSIST=1.
+    conn.pragma_update(None, "synchronous", "NORMAL")
         .map_err(StoreError::Sqlite)?;
     // Overwrite deleted content with zeros instead of leaving it in free
     // pages: read and expired messages must not be recoverable from the file.

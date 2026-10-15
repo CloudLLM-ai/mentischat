@@ -95,7 +95,7 @@ pub struct RosterEntry {
     pub name: String,
     /// What the agent said it is or does at `register`, if anything.
     pub description: Option<String>,
-    /// UTC RFC 3339 timestamp of the last register / check_inbox.
+    /// UTC RFC 3339 timestamp of the last register / send / check_inbox.
     pub last_seen: String,
     /// Unread messages addressed to this agent.
     pub queued: i64,
@@ -112,7 +112,7 @@ pub struct AgentOverview {
     pub name: String,
     /// What the agent said it is or does at `register`, if anything.
     pub description: Option<String>,
-    /// Whole seconds since the last `register` / `check_inbox`, never negative.
+    /// Whole seconds since the last `register` / `send` / `check_inbox`, never negative.
     pub seen_secs_ago: i64,
     /// Unread messages addressed to this agent.
     pub queued: i64,
@@ -161,7 +161,7 @@ pub struct Retention {
     /// An unread message expires this long after it was sent.
     pub message_ttl: Duration,
     /// An agent drops off the roster (with its unread inbox) after this long
-    /// without a `register` or `check_inbox`.
+    /// without a `register`, `send_message` or `check_inbox`.
     pub agent_ttl: Duration,
 }
 

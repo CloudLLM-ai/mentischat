@@ -31,7 +31,7 @@ Call deregister only when the user says they are done.";
 /// the units the operator configured.
 pub fn instructions(retention: &Retention) -> String {
     format!(
-        "{INSTRUCTIONS}\nUnread messages expire {} after they are sent. An agent that has not called register or check_inbox for {} is dropped from the roster with its unread mail; if a call fails unregistered, register again.",
+        "{INSTRUCTIONS}\nUnread messages expire {} after they are sent. An agent that has not called register, send_message or check_inbox for {} is dropped from the roster with its unread mail; if a call fails unregistered, register again.",
         human(retention.message_ttl),
         human(retention.agent_ttl),
     )
@@ -188,7 +188,7 @@ impl MailboxProtocol {
     async fn deregister(&self, params: &Value) -> Result<Value, MailboxError> {
         let agent = required_name(params, "agent")?;
         let out = self.bus.deregister(&agent).await?;
-        Ok(json!({ "agent": out.agent, "discarded": out.discarded }))
+        Ok(serde_json::to_value(out).expect("DiscardOutcome is always serializable"))
     }
 
     async fn send_message(&self, params: &Value) -> Result<Value, MailboxError> {
@@ -201,7 +201,7 @@ impl MailboxProtocol {
             .ok_or(MailboxError::InvalidBody)?
             .to_string();
         let out = self.bus.send(&from, &to, body).await?;
-        Ok(json!({ "id": out.id, "from": out.from, "to": out.to, "createdAt": out.created_at }))
+        Ok(serde_json::to_value(out).expect("SendReceipt is always serializable"))
     }
 
     async fn check_inbox(&self, params: &Value) -> Result<Value, MailboxError> {

@@ -11,14 +11,15 @@ UNRELEASED
   - feat(bus): short-lived mail. Unread messages expire after
     MENTISCHAT_MESSAGE_TTL (default 1h) and agents idle past
     MENTISCHAT_AGENT_TTL (default 24h) leave the roster with their unread mail
-    (never while a pull is parked); the daemon sweeps every minute. Values are
+    (never while a pull is parked); register, send_message and check_inbox
+    all count as activity. The daemon sweeps every minute. Values are
     seconds or a number with s/m/h/d. The MCP instructions tell agents both
     lifetimes.
 
   - feat(store): nothing persists. The roster and all mail are wiped at
     startup (clearing whatever a crashed run left) as well as on a clean stop;
     MENTISCHAT_PERSIST=1 keeps them. Deleted text is overwritten
-    (secure_delete), the WAL is truncated after every read, sweep and wipe,
+    (secure_delete), the WAL is truncated after every read, deregister, sweep and wipe,
     and a wipe compacts the file (VACUUM).
 
   - fix(bus): a blocking pull that took a send's wake-up and was then
@@ -33,9 +34,6 @@ UNRELEASED
     truncation limits. send takes delivery order from an in-memory counter
     seeded at open instead of a MAX(seq) scan, and checks both queue caps in
     one query.
-
-  - fix(store): synchronous=FULL, so an accepted send survives an OS crash or
-    power loss (NORMAL could roll back the last commits).
 
   - fix(http): a REST path or query axum cannot decode (/inboxes/%FF,
     ?wait_ms=%FF) answered axum's plain-text 400; it now returns the typed

@@ -205,6 +205,9 @@ impl Bus {
             tx.commit().map_err(sqlite_storage)?;
             discarded as i64
         };
+        if discarded > 0 {
+            truncate_wal(&g.conn);
+        }
         // Dropping senders wakes those pulls; they re-lock, see the name is
         // gone, and fail unregistered.
         g.waiters.remove(name.as_str());
@@ -262,8 +265,9 @@ impl Bus {
     }
 
     /// Queue `body` for registered `to`. Validates body size/content and both
-    /// roster entries (`from` first). Wakes the oldest parked pull only, and
-    /// counts toward [`Overview::messages_sent`].
+    /// roster entries (`from` first). Refreshes the sender's `last_seen`,
+    /// wakes the oldest parked pull only, and counts toward
+    /// [`Overview::messages_sent`].
     pub async fn send(
         &self,
         from: &crate::names::AgentName,
@@ -308,6 +312,9 @@ impl Bus {
             )
             .map_err(sqlite_storage)?;
 
+        // Sending is activity too: an agent that only sends must not age off
+        // the roster.
+        touch_last_seen(&mut g, from.as_str())?;
         g.next_seq += 1;
         g.messages_sent += 1;
         if let Some(q) = g.waiters.get_mut(to.as_str()) {
@@ -379,8 +386,8 @@ impl Bus {
     }
 
     /// Expire unread mail older than [`Retention::message_ttl`] and drop
-    /// agents not seen within [`Retention::agent_ttl`] (with their unread
-    /// inbox), as of now. The daemon runs this on a timer; see
+    /// agents with no `register`, `send` or `check_inbox` within
+    /// [`Retention::agent_ttl`] (with their unread inbox), as of now. The daemon runs this on a timer; see
     /// [`sweep_at`](Self::sweep_at).
     pub async fn sweep(&self) -> Result<SweepOutcome, MailErr> {
         self.sweep_at(SystemTime::now()).await
@@ -450,15 +457,13 @@ impl Bus {
     /// anything or touch `last_seen`.
     pub async fn stats(&self) -> Result<(i64, i64), MailErr> {
         let g = self.lock_open().await?;
-        let agents: i64 = g
-            .conn
-            .query_row("SELECT COUNT(*) FROM roster", [], |r| r.get(0))
-            .map_err(sqlite_storage)?;
-        let pending: i64 = g
-            .conn
-            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
-            .map_err(sqlite_storage)?;
-        Ok((agents, pending))
+        g.conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM roster), (SELECT COUNT(*) FROM messages)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(sqlite_storage)
     }
 
     /// Delete every agent and message, then compact the database file and

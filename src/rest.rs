@@ -112,7 +112,7 @@ async fn deregister_one(
         Err(resp) => return resp,
     };
     match bus.deregister(&agent).await {
-        Ok(out) => ok_response(json!({ "agent": out.agent, "discarded": out.discarded })),
+        Ok(out) => ok_response(serde_json::to_value(out).unwrap_or(Value::Null)),
         Err(e) => err_response(e),
     }
 }
@@ -137,9 +137,7 @@ async fn send_msg(State(bus): State<Ctx>, body: Result<Json<Value>, JsonRejectio
         None => return err_response(MailboxError::InvalidBody),
     };
     match bus.send(&from, &to, text).await {
-        Ok(out) => ok_response(
-            json!({ "id": out.id, "from": out.from, "to": out.to, "createdAt": out.created_at }),
-        ),
+        Ok(out) => ok_response(serde_json::to_value(out).unwrap_or(Value::Null)),
         Err(e) => err_response(e),
     }
 }

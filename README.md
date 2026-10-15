@@ -22,7 +22,7 @@ Key behaviors:
   each message is delivered exactly once. Quote it right away; there is no
   redelivery.
 - **Short-lived** — unread mail expires 1 hour after it was sent, and an agent
-  idle for 24 hours (no `register` or `check_inbox`) leaves the roster with its
+  idle for 24 hours (no `register`, `send_message` or `check_inbox`) leaves the roster with its
   unread mail. A sweep runs every minute. Set `MENTISCHAT_MESSAGE_TTL` /
   `MENTISCHAT_AGENT_TTL` (seconds, or `30m`, `2h`, `1d`) to change them.
 - **Bounded batches** — max 8 messages / 16 KiB of message JSON per pull keeps results under
@@ -35,7 +35,7 @@ Key behaviors:
   discards the roster and all unread mail, and startup does the same to
   whatever a crashed run left. `MENTISCHAT_PERSIST=1` keeps them instead.
 - **Nothing left on disk** — deleted text is overwritten (`secure_delete`),
-  the write-ahead log is truncated after every read, sweep and wipe, and a
+  the write-ahead log is truncated after every read, deregister, sweep and wipe, and a
   wipe compacts the file.
 - **Single instance** — binding `127.0.0.1:9480` twice exits non-zero.
 

@@ -1017,3 +1017,44 @@ fn retention_defaults_and_sweep_interval() {
     let err = Retention::from_settings(None, Some("forever")).unwrap_err();
     assert!(err.contains("MENTISCHAT_AGENT_TTL"), "{err}");
 }
+
+#[tokio::test]
+async fn sending_counts_as_activity_for_the_agent_ttl() {
+    let (_d, bus) = bus_with("sender_alive", 2 * 86_400, 3600);
+    bus.register(&name("talker")).await.unwrap();
+    bus.register(&name("listener")).await.unwrap();
+    let before = bus.list_agents().await.unwrap()[1].last_seen.clone();
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    bus.send(&name("talker"), &name("listener"), "hi".into())
+        .await
+        .unwrap();
+    let after = bus.list_agents().await.unwrap()[1].last_seen.clone();
+    assert!(after > before, "send refreshed the sender's lastSeen");
+    // `listener` never called anything after register; `talker` just sent.
+    let at = std::time::SystemTime::now() + std::time::Duration::from_secs(3600)
+        - std::time::Duration::from_millis(1);
+    let out = bus.sweep_at(at).await.unwrap();
+    assert_eq!(
+        out.dropped_agents,
+        ["listener"],
+        "talker stays: it just sent"
+    );
+}
+
+#[tokio::test]
+async fn deregistered_inbox_text_leaves_no_trace_on_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("dereg_scrub");
+    let bus = Bus::new(&data).unwrap();
+    bus.register(&name("a")).await.unwrap();
+    bus.register(&name("b")).await.unwrap();
+    bus.send(&name("a"), &name("b"), "DEREG-CANARY-31b0".into())
+        .await
+        .unwrap();
+    assert!(on_disk(&data, "DEREG-CANARY-31b0"));
+    assert_eq!(bus.deregister(&name("b")).await.unwrap().discarded, 1);
+    assert!(
+        !on_disk(&data, "DEREG-CANARY-31b0"),
+        "discarded inbox lingered"
+    );
+}

@@ -233,7 +233,7 @@ daemon exits non-zero on purpose) and a deliberate `make stop`.
 
 ```bash
 cargo test          # bus behavior, store migrations, REST surface, MCP wire protocol, terminal view
-make clippy         # clippy --all-targets --all-features -- -D warnings
+make clippy         # clippy --all-targets --all-features --locked -- -D warnings
 make ci             # what CI runs: fmt --check, check, clippy, test, doc
 ```
 

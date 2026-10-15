@@ -1,5 +1,29 @@
 UNRELEASED
 
+  - fix(security): requests whose Host header names a non-loopback host get
+    403, closing DNS rebinding: a rebound page reaches 127.0.0.1 under its own
+    hostname and its same-origin GETs (GET /inboxes/{agent}, GET /agents)
+    carry no Origin, so the Origin guard alone let it read mail. A missing
+    Host is still allowed.
+
+  - fix(bus): blocking pulls whose client disconnected stayed parked forever
+    and counted toward the 8-waiter cap, so after eight dropped connections
+    every blocking pull for that name failed too_many_waiters. Closed waiters
+    are now pruned before parking. Promoting a batch to in_flight runs in one
+    transaction; a pull writes last_seen once (and again when a park ends)
+    instead of twice; lastSeen and createdAt are stamped under the bus lock
+    so they cannot go backwards; deregister counts discarded rows from the
+    DELETE instead of a separate COUNT. The bus, not the transports, now
+    validates descriptions, so the library API enforces the same caps.
+
+  - fix(main): bind the port before opening the data directory, so a second
+    instance exits on the single-instance lock before it touches (or
+    migrates) the live instance's database.
+
+  - chore(ci): CI ran on pushes to main, but the default branch is master;
+    it now runs there, with a read-only token. make check/clippy/test/doc
+    pass --locked like CI.
+
   - feat(roster): register takes an optional description (max 256 bytes,
     trimmed, no control characters; omitted keeps the stored one, "" clears
     it) and an optional exclusive flag. An exclusive register of a name that

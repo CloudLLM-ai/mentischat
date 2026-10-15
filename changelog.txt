@@ -114,6 +114,11 @@ UNRELEASED
     five pattern-free schemas, shared-bus proof across REST/MCP, isError
     mapping, GET/DELETE 405, foreign Origin 403).
 
+  - docs(readme): the curl example is now a complete register / send / pull /
+    ack round trip (it sent to an unregistered agent and pulled the sender's
+    inbox), the prerequisite is Rust 1.88+ rather than "stable", and a file
+    layout table and the --help / --version note were added.
+
   - docs(plan): PLAN.md is the product/architecture SSOT (mailbox shipped).
     BRIDGE-PLAN.md removed so the spec is not split across
     files.

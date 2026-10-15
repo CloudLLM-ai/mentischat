@@ -33,7 +33,8 @@ Key behaviors:
 
 ## Quick start
 
-Prerequisites: Rust stable.
+Prerequisites: Rust 1.88 or newer (the `rust-version` in `Cargo.toml`; CI and
+`make msrv` check it).
 
 ```bash
 make run            # cargo run --bin mentischat (foreground daemon, terminal view)
@@ -45,6 +46,9 @@ make help           # every target (ci, msrv, install, uninstall, ...)
 cargo build --release && ./target/release/mentischat
 cargo install --path . --locked && mentischat
 ```
+
+`mentischat` takes no arguments except `--help` and `--version`; anything else
+exits 2.
 
 Data lives in `~/.cloudllm/mentischat/pending.sqlite` (`0700` dir / `0600`
 file). Override with `MENTISCHAT_DIR`. The listen address is compile-time
@@ -113,17 +117,26 @@ JSON errors via HTTP status (`invalid_body`, `unregistered`, `queue_full`,
 be loopback (`http://127.0.0.1`, `localhost`, `::1`); missing `Origin` (curl)
 is allowed.
 
-```bash
-curl -s -X POST http://127.0.0.1:9480/agents \
-  -H 'Content-Type: application/json' -d '{"agent":"deepseek_v4_flash"}'
+A complete round trip: register two agents, send, pull, ack.
 
-curl -s -X POST http://127.0.0.1:9480/messages \
-  -H 'Content-Type: application/json' \
+```bash
+H='Content-Type: application/json'
+
+# 1. Both agents register.
+curl -s -X POST http://127.0.0.1:9480/agents -H "$H" -d '{"agent":"deepseek_v4_flash"}'
+curl -s -X POST http://127.0.0.1:9480/agents -H "$H" -d '{"agent":"grok"}'
+
+# 2. deepseek_v4_flash sends grok a message.
+curl -s -X POST http://127.0.0.1:9480/messages -H "$H" \
   -d '{"from":"deepseek_v4_flash","to":"grok","body":"hello"}'
 
-curl -s http://127.0.0.1:9480/inboxes/deepseek_v4_flash
-curl -s -X POST http://127.0.0.1:9480/inboxes/deepseek_v4_flash/ack \
-  -H 'Content-Type: application/json' -d '{"ids":["<message-id>"]}'
+# 3. grok pulls its inbox. The batch stays in flight (and is redelivered on the
+#    next pull) until it is acked.
+curl -s http://127.0.0.1:9480/inboxes/grok
+
+# 4. grok acks the ids it received.
+curl -s -X POST http://127.0.0.1:9480/inboxes/grok/ack -H "$H" \
+  -d '{"ids":["<message-id>"]}'
 ```
 
 ## Wiring your harnesses
@@ -188,6 +201,21 @@ cannot break the service, and logs to `~/Library/Logs/`.
 `KeepAlive` is restricted to `Crashed`. Restarting on *any* exit turns two
 normal cases into respawn loops: another instance already owning the port (the
 daemon exits non-zero on purpose) and a deliberate `make stop`.
+
+## Layout
+
+| Path | Contents |
+|---|---|
+| `src/main.rs` | Daemon entry: arguments, data directory, startup, graceful shutdown |
+| `src/lib.rs` | Router composition and the loopback guards |
+| `src/bus/` | The mailbox: `mod.rs` (the `Bus` API), `model.rs` (caps and public types), `waiters.rs`, `delivery.rs`, `clock.rs` |
+| `src/store.rs` | SQLite open, schema and migration of older databases |
+| `src/rest.rs`, `src/tools.rs` | REST routes and the five MCP tools over the same bus |
+| `src/errors.rs`, `src/names.rs` | Typed mailbox errors; agent-name validation |
+| `src/tui/` | The terminal view: `mod.rs` (dashboard), `banner.rs`, `log_buffer.rs`, `terminal.rs` |
+| `tests/` | `bus`, `http`, `mcp`, `store`, `tui` |
+| `launchd/`, `skills/` | Optional launchd service; engineering-style notes |
+| `PLAN.md`, `changelog.txt` | Product and architecture; release notes |
 
 ## Tests
 

@@ -398,3 +398,34 @@ async fn register_over_mcp_stores_a_description_and_honors_exclusive() {
     assert_eq!(roster["agents"][0]["description"], "reviews PRs");
     assert_eq!(roster["agents"][0]["queued"], 0);
 }
+
+#[tokio::test]
+async fn dns_rebinding_host_gets_403() {
+    let (_d, app) = app();
+    let get = |host: &str| {
+        http::Request::builder()
+            .method("GET")
+            .uri("/agents")
+            .header("host", host)
+            .body(axum::body::Body::empty())
+            .unwrap()
+    };
+    // A rebound page sends its own hostname and, on a same-origin GET, no Origin.
+    for foreign in [
+        "evil.example:9480",
+        "localhost.evil.example:9480",
+        "127.0.0.2:9480",
+    ] {
+        let resp = app.clone().oneshot(get(foreign)).await.unwrap();
+        assert_eq!(resp.status().as_u16(), 403, "Host {foreign}");
+    }
+    for loopback in [
+        "127.0.0.1:9480",
+        "localhost:9480",
+        "[::1]:9480",
+        "localhost",
+    ] {
+        let resp = app.clone().oneshot(get(loopback)).await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "Host {loopback}");
+    }
+}

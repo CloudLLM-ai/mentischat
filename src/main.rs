@@ -81,14 +81,8 @@ async fn run_daemon() -> ExitCode {
         },
     };
 
-    let bus = Arc::new(match Bus::new(&data_dir) {
-        Ok(bus) => bus,
-        Err(e) => {
-            eprintln!("mentischat: failed to open {}: {e}", data_dir.display());
-            return ExitCode::FAILURE;
-        }
-    });
-
+    // Bind first: the port is the single-instance lock, so a second instance
+    // exits here before it opens (or migrates) the live instance's database.
     let listener = match tokio::net::TcpListener::bind(BIND_ADDR).await {
         Ok(l) => l,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
@@ -103,6 +97,14 @@ async fn run_daemon() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    let bus = Arc::new(match Bus::new(&data_dir) {
+        Ok(bus) => bus,
+        Err(e) => {
+            eprintln!("mentischat: failed to open {}: {e}", data_dir.display());
+            return ExitCode::FAILURE;
+        }
+    });
 
     let app = mentischat::build_router(bus.clone());
     let shutdown_bus = bus.clone();

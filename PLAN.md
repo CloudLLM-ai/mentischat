@@ -38,7 +38,7 @@ roster and every pending/in_flight row in one transaction, so a deliberate
 restart starts clean — a bulk deregister of everyone.
 
 Operator view: started from a terminal the daemon paints a read-only ratatui
-dashboard (`src/tui.rs`) fed by `Bus::overview`; otherwise it logs plain lines
+dashboard (`src/tui/`) fed by `Bus::overview`; otherwise it logs plain lines
 (`MENTISCHAT_PLAIN=1` forces that). It is not a tool, adds no route, and quitting
 it is the same graceful shutdown as SIGTERM.
 
@@ -52,7 +52,7 @@ Five tools, one `ToolProtocol`. REST mirrors them. Do not add a sixth tool.
 | `check_inbox` | `GET /inboxes/{agent}` | Pull batch; optional `wait_ms`; optional `ack_ids` |
 | `deregister` | `DELETE /agents/{agent}` | Leave; discard that inbox |
 
-Caps (source of truth: `src/bus.rs`): body 64 KiB; 1024 unacked / name;
+Caps (source of truth: `src/bus/model.rs`): body 64 KiB; 1024 unacked / name;
 8192 global rows; 256 roster agents; batch 8 msgs / 16 KiB; `wait_ms` 0..=30000;
 8 waiters / name. At-least-once:
 unacked `in_flight` redelivers until someone acks (same batch caps). Two pulls

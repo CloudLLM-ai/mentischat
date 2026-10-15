@@ -1,43 +1,34 @@
 UNRELEASED
 
-  - fix(wake): the nudge long-poll client timeout was
-    Duration::from_secs(POLL_WAIT_MS + 5) on a value already in
-    milliseconds — ~8h20m instead of 35s, so a daemon that accepted a
-    connection and then stopped answering wedged the doorbell for hours
-    instead of retrying after 2s. Signal-setup failure now restores the
-    terminal instead of process::exit'ing out of raw mode; a poisoned bind
-    -token mutex no longer panics during shutdown; the group SIGTERM on exit
-    only widens to -pid when the child actually leads that group; and the
-    two "nothing to do" branches of the poll loop keep a 250ms floor.
+  - fix(security): REST/MCP Origin guard rejects non-loopback Origin (curl
+    with no Origin still works); roster capped at 256 agents (roster_full);
+    in_flight redelivery uses the same batch byte/count caps and remaining
+    counts leftover unacked; sqlite failures map to storage_error (500)
+    instead of storage_full pending:-1; graceful shutdown exits non-zero if
+    the mailbox wipe fails, and logs at error level instead of silently
+    swallowing the failed discard transaction.
 
   - fix(bus): a failed message INSERT reported queue_full to the sender
     regardless of cause (disk full, constraint violation, locked db); it now
-    maps to storage_error like every other sqlite failure. deregister,
-    unbind_wake and unbind_wrapper release parked /wake/{id} pollers instead
-    of leaving them until their wait expires. ack and ack_ids apply in one
-    transaction with one prepared statement rather than N autocommit deletes
-    under the bus lock; ack_ids arrays longer than MAX_ACK_IDS (1024, the
-    per-agent unacked cap) are invalid_body. Nudge peeks echo at most
-    MAX_PEEK_IDS (64) ids, so a stalled agent with a full queue no longer
-    returns a 1024-uuid body on every 1 Hz poll.
+    maps to storage_error like every other sqlite failure. ack and ack_ids
+    apply in one transaction with one prepared statement rather than N
+    autocommit deletes under the bus lock; ack_ids arrays longer than
+    MAX_ACK_IDS (1024, the per-agent unacked cap) are invalid_body. Canceled
+    pulls (dropped connections) no longer consume the single wake-up that a
+    send delivers to the oldest parked pull.
 
-  - refactor(wake)!: remove the whole nudge / idle-wake layer; mentischat is
-    now a plain mailbox that agents pull from, like agent_chat. Deleted: the
-    mentis-wake binary and the `mentischat <harness>` PTY wrapper (and its
-    flags), the /nudge/{agent} and /wake/{id} long-polls, the
-    /agents/{agent}/wrapper bind/unbind routes, ownership tokens, the
-    NudgeTransport type, the `forbidden` error, and the clap, libc,
-    portable-pty and reqwest dependencies. Wire changes: register no longer
-    takes wakeId or nudgeTransport (extra fields from older clients are
-    ignored, not rejected), and register / list_agents responses no longer
-    carry nudgeTransport or nudgeWindow. Existing databases are migrated on
-    open: the nudge_transport and wake_id columns and idx_roster_wake_id are
-    dropped, keeping every roster row and queued message. The MCP
-    instructions and tool descriptions no longer promise a doorbell: they say
-    nothing wakes an idle agent and to use check_inbox wait_ms only for a
-    reply within the same turn. check_inbox, acks, at-least-once redelivery
-    and wait_ms blocking pulls are unchanged. `mentischat` takes no
-    arguments besides --help and --version; anything else exits 2.
+  - fix(http): nest the MCP router under /mcp so its catch-all cannot steal
+    REST 404s (unknown paths now return not_found, not 405); apply a 1 MiB
+    body limit to the composed app; reject non-loopback peers on both MCP and
+    REST (IpFilter allow-list 127.0.0.1/::1 plus ConnectInfo middleware).
+
+  - fix(bus): register lookup uses EXISTS instead of loading the whole roster;
+    sqlite errors are traced; deregister deletes inbox+roster in one
+    transaction; list_agents/stats fail shutting_down after close.
+
+  - fix(launchd): plist ProgramArguments exec the release binary directly
+    (no wrapper script) and stale home paths are corrected to the current
+    machine.
 
   - feat(tui): the daemon paints a live terminal view when started from a
     terminal: the MENTIS CHAT banner, tiles for where it is listening,
@@ -46,7 +37,7 @@ UNRELEASED
     Ctrl-C quit through the same graceful shutdown as SIGTERM, so the mailbox
     is wiped exactly as before; Tab switches pane and the arrow and page keys
     scroll. Without a terminal (launchd, a pipe) or with MENTISCHAT_PLAIN=1
-    the daemon logs plain lines as before. Read-only: the view uses the new
+    the daemon logs plain lines as before. Read-only: the view uses
     Bus::overview (roster, queue depth, age, and an in-memory sent counter)
     and never touches last_seen, acks or mail, and never shows message
     bodies. Adds the ratatui dependency.
@@ -55,84 +46,6 @@ UNRELEASED
     bold yellow focused border, a yellow table header and overflow scrollbars.
     The footer key guide stays plain: white keys, gray descriptions.
 
-  - refactor: retire the dead v1 window_title_match column (dropped on open;
-    the nudgeWindow wire field stays null); drop check_inbox's duplicate
-    waiter-cap check, which also inserted an empty queue as a side effect;
-    one no-store response helper instead of three copies in rest.rs; the
-    request body limit lives only on the composed router; list_tools fails
-    loudly on a tool name without metadata instead of silently omitting it;
-    build_router panics if the loopback IP allowlist is rejected rather than
-    shipping a filter that does not say what it claims.
-
-  - chore: the crate declares itself Unix-only (compile_error! rather than a
-    wall of unresolved symbols); harness-only flags in daemon mode exit 2
-    instead of being ignored; launchd KeepAlive is Crashed-only (KeepAlive
-    true respawn-looped on port-in-use and fought `make stop`), run.sh
-    prefers the installed binary and fails loudly, launchd/install.sh
-    generates the plist for the local checkout; Makefile build/clippy no
-    longer rewrite sources, `make ci` verifies formatting, doc denies broken
-    links; GitHub Actions CI on Linux + macOS with an MSRV job; Cargo.toml
-    carries the crates.io metadata it was missing.
-
-  - fix(security): REST/MCP Origin guard rejects non-loopback Origin (curl
-    with no Origin still works); wrapper bind is ownership-safe on re-bind
-    (silent mint while bound is 403); wrapper injects POINTER_TEXT only
-    (ignores response JSON pointer); roster capped at 256 agents
-    (roster_full); in_flight redelivery uses the same batch byte/count caps
-    and remaining counts leftover unacked; bind_wrapper wakes unbound
-    /wake waiters; sqlite failures map to storage_error (500) instead of
-    storage_full pending:-1; graceful shutdown exits non-zero if the mailbox
-    wipe fails.
-
-  - fix(wake): wrapper bindings are ownership-tokened — POST
-    /agents/{agent}/wrapper returns a wakeId token (or accepts one) and
-    DELETE requires it, so a stale wrapper exiting after a replacement can no
-    longer clear the newer binding; mentischat --agent now awaits its bind
-    task before unbinding. register with nudgeTransport none clears the wake
-    session token. Canceled long-poll waiters (dropped connections) no longer
-    consume the single wake signal per send. Parked unbound /wake/{id}
-    sessions are globally capped (64) and their map entries drain on expiry.
-    The wrapper bind route accepts an empty POST body as {}. Shutdown logs at
-    error level if the mailbox-discard transaction fails instead of silently
-    swallowing it. Migration recreates idx_roster_wake_id on databases that
-    have the column but lost the index.
-
-  - fix(wake): inject pointer text and submit key separately; default submit
-    is CR (Enter) so OpenCode submits instead of treating LF as a newline.
-
-  - feat(cli): `mentischat opencode` / `mentischat grok` launch a harness with
-    idle wake; `mentischat serve` (or bare `mentischat`) starts the daemon.
-    `--harness` is an explicit alias. `mentis-wake` remains as a legacy binary.
-
-  - feat(wake): wake-session auto-bind — `mentischat opencode` sets
-    MENTISCHAT_WAKE_ID on the child; agent passes wakeId on first register to
-    bind wrapper transport. New REST: GET/DELETE /wake/{wake_id}. Legacy
-    `--agent` mode unchanged.
-
-  - remove(nudge): in-daemon AppleScript doorbell removed; idle wake is
-    mentis-wake only. Historical v1 design documented in NUDGE-V1-TERMINAL.md.
-    register no longer accepts windowTitleMatch; nudgeWindow is always null;
-    default nudgeTransport is none; terminal is a deprecated wire alias for none.
-
-  - feat(wake): universal PTY wrapper `mentis-wake` — a thin client-side
-    adapter between Terminal and any harness (OpenCode, Claude Code, Codex,
-    shells). It long-polls the daemon's read-only nudge peek endpoint and
-    injects the pointer constant without focus theft or AppleScript. New REST:
-    GET /nudge/{agent}?wait_ms= (side-effect-free long-poll; no promote, no
-    ack, no lastSeen), POST/DELETE /agents/{agent}/wrapper (bind/clear the
-    wrapper transport). register accepts optional nudgeTransport
-    ('terminal' | 'wrapper' | 'none'); roster gains nudge_transport column.
-    One transport per agent. macOS + Linux v1.
-  - feat(shutdown): graceful SIGTERM/SIGINT now discards the roster and all
-    undelivered mail in one transaction (bulk deregister), so a deliberate
-    restart starts clean. A crash (no shutdown) still preserves the roster and
-    mail for recovery.
-
-  - feat(nudge): doorbell runs inside the mentischat process. register binds
-    a Terminal.app window (optional windowTitleMatch, else unique title /
-    front window) onto the roster row as nudgeWindow; deregister clears it.
-    send notifies an idle recipient; the worker injects the pointer without
-    calling check_inbox. Sidecar nudge.sh / targets.json removed.
   - feat(core): mentischat daemon on the cloudllm_mcp backbone — one loopback
     process serving MCP Streamable HTTP at /mcp plus REST, backed by sqlite
     pending mail (WAL). Five tools: register, deregister, send_message,
@@ -143,38 +56,72 @@ UNRELEASED
     undelivered mail survive crash/restart; parked waiters do not. Domain
     errors map to isError:true content blocks carrying contract JSON; REST
     mirrors every tool with frozen 200-success semantics and typed error
-    codes.
-  - fix(http): nest the MCP router under /mcp so its catch-all cannot steal
-    REST 404s (unknown paths now return not_found, not 405); apply a 1 MiB
-    body limit to the composed app; reject non-loopback peers on both MCP and
-    REST (IpFilter allow-list 127.0.0.1/::1 plus ConnectInfo middleware).
-  - fix(bus): register lookup uses EXISTS instead of loading the whole roster;
-    sqlite errors are traced; deregister deletes inbox+roster in one
-    transaction; list_agents/stats fail shutting_down after close.
-  - fix(launchd): plist ProgramArguments exec the release binary directly
-    (no wrapper script) and stale home paths are corrected to the current
-    machine.
+    codes. Nothing wakes an idle agent: mail is read when its recipient
+    calls check_inbox, and the MCP instructions say so.
+
+  - feat(shutdown): graceful SIGTERM/SIGINT now discards the roster and all
+    undelivered mail in one transaction (bulk deregister), so a deliberate
+    restart starts clean. A crash (no shutdown) still preserves the roster and
+    mail for recovery.
+
+  - refactor: split src/bus.rs into src/bus/ (model: caps and public types;
+    waiters; delivery; clock; mod: the Bus API) and src/tui.rs into src/tui/
+    (log_buffer, banner, terminal; mod: the dashboard); public paths are
+    unchanged. Bus::ack and check_inbox share one ack implementation, and the
+    methods that refuse work on a closed bus share one lock helper. Bus::
+    overview stays separate from list_agents: that one is the wire contract.
+    Also: drop check_inbox's duplicate waiter-cap check, which inserted an
+    empty queue as a side effect; one no-store response helper instead of
+    three copies in rest.rs; the request body limit lives only on the
+    composed router; list_tools fails loudly on a tool name without metadata
+    instead of silently omitting it; build_router panics if the loopback IP
+    allowlist is rejected rather than shipping a filter that does not say what
+    it claims.
+
+  - chore(compat): roster columns written by earlier development builds
+    (including the v1 window_title_match) are dropped on open, keeping every
+    roster row and queued message; extra input fields on register are ignored
+    rather than rejected.
+
+  - chore: the crate declares itself Unix-only (compile_error! rather than a
+    wall of unresolved symbols); `mentischat` takes no arguments besides
+    --help and --version and exits 2 on anything else; launchd KeepAlive is
+    Crashed-only (KeepAlive true respawn-looped on port-in-use and fought
+    `make stop`), run.sh prefers the installed binary and fails loudly,
+    launchd/install.sh generates the plist for the local checkout; Makefile
+    build/clippy no longer rewrite sources, `make ci` verifies formatting, doc
+    denies broken links; GitHub Actions CI on Linux + macOS with an MSRV job;
+    Cargo.toml carries the crates.io metadata it was missing.
+
+  - chore(build): single Makefile is now the cargo tool handler (build,
+    release, fmt, check, clippy, test, doc, publish, install, clean);
+    `make run` runs the daemon in the foreground (`make run-plain` with plain
+    log lines) and `make stop` sends SIGTERM to the listener on :9480
+    (MENTISCHAT_PORT overrides), replacing the start_mentischat/
+    stop_mentischat scripts and scripts/run.sh. `make msrv` type-checks on the
+    rust-version in Cargo.toml and `make uninstall` removes the installed
+    binary.
+
+  - chore(rename): project renamed llm_chat -> mentischat everywhere
+    (crate/binary, MCP server id, env vars MENTISCHAT_DIR/MENTISCHAT_PORT,
+    data dir ~/.cloudllm/mentischat, launchd label com.mentischat); GitHub
+    repo renamed to mentischat to match the MentisDB naming convention.
+
   - test(core): 35-test suite green — bus behavior incl. waiter races,
     batch+ack math, queue/global caps, crash-reopen, mutex stress; REST via
     tower oneshot (redelivery, wait_ms wake race, error codes, no-store); MCP
     wire via composed router (initialize + instructions, notifications 202,
     five pattern-free schemas, shared-bus proof across REST/MCP, isError
     mapping, GET/DELETE 405, foreign Origin 403).
-  - chore(build): single Makefile is now the cargo tool handler (build,
-    release, fmt, check, clippy, test, doc, publish, install, clean);
-    `make run` runs the daemon in the foreground and `make stop` sends
-    SIGTERM to the listener on :9480 (MENTISCHAT_PORT overrides), replacing
-    the start_mentischat/stop_mentischat scripts and scripts/run.sh.
-  - chore(rename): project renamed llm_chat -> mentischat everywhere
-    (crate/binary, MCP server id, env vars MENTISCHAT_DIR/MENTISCHAT_PORT,
-    data dir ~/.cloudllm/mentischat, launchd label com.mentischat); GitHub
-    repo renamed to mentischat to match the MentisDB naming convention.
-  - docs(plan): PLAN.md is the product/architecture SSOT (mailbox shipped,
-    TUI beta = doorbell nudge that must not park waiters, browser deferred).
-    BRIDGE-PLAN.md removed so the nudge spec is not split across files.
+
+  - docs(plan): PLAN.md is the product/architecture SSOT (mailbox shipped).
+    BRIDGE-PLAN.md removed so the spec is not split across
+    files.
+
   - docs(plan): PLAN.md revised from TypeScript to Rust/cloudllm_mcp
     architecture; router composition over MCPServerBuilder; file layout now
     documents Makefile and skills/.
+
   - docs(skills): add skills/ folder — rust-engineer (merged MentisDB
     rust-engineer + DiarioBitcoin rust-backend-engineer house style) and
     rust-performance-reviewer (Abseil performance-hints review method).

@@ -157,7 +157,7 @@ acked) however long the agent takes.
 
 ## Caps
 
-Source of truth: `src/bus.rs`.
+Source of truth: `src/bus/model.rs`.
 
 | Limit | Value |
 |---|---|
@@ -221,5 +221,5 @@ MIT. See [LICENSE](LICENSE).
 ## References
 
 Product and architecture: [PLAN.md](PLAN.md). Wire contracts, waiter algorithm,
-caps, and error tables: `src/bus.rs`, `src/errors.rs`, `tests/`. Release notes:
+caps, and error tables: `src/bus/`, `src/errors.rs`, `tests/`. Release notes:
 [changelog.txt](changelog.txt).

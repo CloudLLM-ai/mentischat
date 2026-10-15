@@ -144,62 +144,53 @@ async fn domain_error_is_iserror_true_content_block() {
 }
 
 #[tokio::test]
-async fn register_accepts_nudge_transport_none() {
+async fn register_tool_takes_only_an_agent_name() {
     let (_d, app) = app();
-    let (_, resp) = rpc(
+    let (_, resp) = rpc(&app, "tools/list", json!({})).await;
+    let tools = resp["result"]["tools"].as_array().unwrap();
+    let register = tools.iter().find(|t| t["name"] == "register").unwrap();
+    let props = register["inputSchema"]["properties"].as_object().unwrap();
+    let names: Vec<&str> = props.keys().map(String::as_str).collect();
+    assert_eq!(names, ["agent"], "no wakeId or nudgeTransport parameter");
+
+    let (_, reg) = rpc(
         &app,
         "tools/call",
-        json!({
-            "name": "register",
-            "arguments": { "agent": "wrapped", "nudgeTransport": "none" }
-        }),
+        json!({"name": "register", "arguments": {"agent": "grok", "wakeId": "ignored"}}),
     )
     .await;
-    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-    let out: Value = serde_json::from_str(text).unwrap();
-    assert_eq!(out["nudgeTransport"], "none");
-    assert!(
-        out["nudgeWindow"].is_null(),
-        "none transport must not bind a window"
-    );
+    assert_eq!(reg["result"]["isError"], false, "{reg}");
+    let text = reg["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(!text.contains("nudge"), "{text}");
 }
 
 #[tokio::test]
-async fn register_rejects_bad_nudge_transport() {
+async fn nothing_agents_read_promises_a_wake() {
     let (_d, app) = app();
-    let (_, resp) = rpc(
-        &app,
-        "tools/call",
-        json!({
-            "name": "register",
-            "arguments": { "agent": "wrapped", "nudgeTransport": "bogus" }
-        }),
-    )
-    .await;
-    assert_eq!(resp["result"]["isError"], true);
-    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-    let err: Value = serde_json::from_str(text).unwrap();
-    assert_eq!(err["error"], "invalid_body");
-}
-
-#[tokio::test]
-async fn instructions_mention_mentis_wake() {
-    let (_d, app) = app();
-    let (_, resp) = rpc(
+    let (_, init) = rpc(
         &app,
         "initialize",
-        json!({
-            "protocolVersion": "2025-06-18",
-            "capabilities": {},
-            "clientInfo": { "name": "test-harness", "version": "0" }
-        }),
+        json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}),
     )
     .await;
-    let instructions = resp["result"]["instructions"].as_str().unwrap();
+    let instructions = init["result"]["instructions"].as_str().unwrap();
     assert!(
-        instructions.contains("MENTISCHAT_WAKE_ID"),
-        "ritual must teach wake-session auto-bind via wakeId"
+        instructions.contains("Nothing wakes an idle agent"),
+        "{instructions}"
     );
+    assert!(instructions.contains("check_inbox"));
+
+    let (_, list) = rpc(&app, "tools/list", json!({})).await;
+    let everything = format!("{instructions}\n{list}").to_lowercase();
+    for stale in [
+        "mentis-wake",
+        "mentischat_wake_id",
+        "doorbell",
+        "nudge",
+        "wakeid",
+    ] {
+        assert!(!everything.contains(stale), "{stale:?} still advertised");
+    }
 }
 
 #[tokio::test]

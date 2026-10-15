@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use mentischat::bus::{Bus, NudgeTransport};
+use mentischat::bus::Bus;
 use mentischat::errors::MailboxError;
 use mentischat::names::AgentName;
 
@@ -481,233 +481,6 @@ async fn shutdown_rejects_waiters() {
     assert!(matches!(err, MailboxError::ShuttingDown));
 }
 
-#[tokio::test]
-async fn register_preserves_transport_on_reregister() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let data = dir.path().join("regtransport");
-    let bus = Bus::new(&data).expect("open");
-    bus.register_with_transport(&name("ox-alpha-one"), Some(NudgeTransport::None))
-        .await
-        .unwrap();
-    let _token = bus.bind_wrapper(&name("ox-alpha-one"), None).await.unwrap();
-
-    let listed = bus.list_agents().await.unwrap();
-    assert_eq!(listed[0].nudge_transport, NudgeTransport::Wrapper);
-    assert!(listed[0].nudge_window.is_none());
-
-    drop(bus);
-    let bus = Bus::new(&data).expect("reopen");
-    bus.register(&name("ox-alpha-one")).await.unwrap();
-    let listed = bus.list_agents().await.unwrap();
-    assert_eq!(
-        listed[0].nudge_transport,
-        NudgeTransport::Wrapper,
-        "re-register without transport keeps wrapper binding"
-    );
-
-    bus.deregister(&name("ox-alpha-one")).await.unwrap();
-    assert!(bus.list_agents().await.unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn nudge_peek_reports_pending_without_acking_or_promoting() {
-    let (_d, bus) = fresh_bus("peekpending");
-    bus.register(&name("a")).await.unwrap();
-    bus.register(&name("b")).await.unwrap();
-    bus.send(&name("a"), &name("b"), "hi".into()).await.unwrap();
-
-    let peek = bus.nudge_peek(&name("b"), 0).await.unwrap();
-    assert!(peek.pending);
-    assert_eq!(peek.ids.len(), 1);
-    assert_eq!(
-        peek.pointer,
-        mentischat::nudge::POINTER_TEXT,
-        "peek carries the shared pointer constant"
-    );
-
-    // Repeating the peek keeps returning the same unacked id (no ack).
-    let again = bus.nudge_peek(&name("b"), 0).await.unwrap();
-    assert_eq!(again.ids, peek.ids);
-
-    // The message is still deliverable through the normal path, which also
-    // proves peek never promoted it into the redeliver-on-in_flight shape.
-    let page = bus.check_inbox(&name("b"), 0, vec![]).await.unwrap();
-    assert_eq!(page.messages.len(), 1);
-    assert_eq!(page.messages[0].body, "hi");
-}
-
-#[tokio::test]
-async fn nudge_peek_timeout_is_pending_false() {
-    let (_d, bus) = fresh_bus("peektimeout");
-    bus.register(&name("b")).await.unwrap();
-    let peek = bus.nudge_peek(&name("b"), 100).await.unwrap();
-    assert!(!peek.pending);
-    assert!(peek.ids.is_empty());
-}
-
-#[tokio::test]
-async fn nudge_peek_wakes_on_send() {
-    let (_d, bus) = fresh_bus("peekwake");
-    bus.register(&name("a")).await.unwrap();
-    bus.register(&name("b")).await.unwrap();
-
-    let peek_task = bus.clone();
-    let task = tokio::spawn(async move { peek_task.nudge_peek(&name("b"), 15_000).await.unwrap() });
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    bus.send(&name("a"), &name("b"), "wake".into())
-        .await
-        .unwrap();
-
-    let peek = task.await.unwrap();
-    assert!(peek.pending);
-    assert_eq!(peek.ids.len(), 1);
-}
-
-#[tokio::test]
-async fn nudge_peek_does_not_touch_last_seen() {
-    let (_d, bus) = fresh_bus("peeklseen");
-    bus.register(&name("b")).await.unwrap();
-    let before = bus.list_agents().await.unwrap()[0].last_seen.clone();
-
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    let _ = bus.nudge_peek(&name("b"), 50).await.unwrap();
-
-    let after = bus.list_agents().await.unwrap()[0].last_seen.clone();
-    assert_eq!(before, after, "peek must not refresh lastSeen");
-}
-
-#[tokio::test]
-async fn ninth_nudge_peek_waiter_fails_too_many_waiters() {
-    let (_d, bus) = fresh_bus("peekcap");
-    bus.register(&name("b")).await.unwrap();
-
-    let mut tasks = Vec::new();
-    for _ in 0..2 {
-        let b = bus.clone();
-        tasks.push(tokio::spawn(async move {
-            b.nudge_peek(&name("b"), 1_000).await
-        }));
-    }
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    match bus.nudge_peek(&name("b"), 1_000).await {
-        Err(MailboxError::TooManyWaiters { agent, waiting }) => {
-            assert_eq!(agent, "b");
-            assert_eq!(waiting, 2);
-        }
-        other => panic!("expected too_many_waiters, got {other:?}"),
-    }
-
-    for t in tasks {
-        assert!(!t.await.unwrap().unwrap().pending);
-    }
-}
-
-#[tokio::test]
-async fn wrapper_bind_toggles_transport() {
-    let (_d, bus) = fresh_bus("wrappertransport");
-    bus.register(&name("a")).await.unwrap();
-    bus.register(&name("b")).await.unwrap();
-
-    let t1 = bus.bind_wrapper(&name("a"), None).await.unwrap();
-    let listed = bus.list_agents().await.unwrap();
-    assert_eq!(listed[0].nudge_transport, NudgeTransport::Wrapper);
-    assert_eq!(listed[0].nudge_window, None);
-
-    bus.unbind_wrapper(&name("a"), &t1).await.unwrap();
-    let listed = bus.list_agents().await.unwrap();
-    assert_eq!(listed[0].nudge_transport, NudgeTransport::None);
-}
-
-#[tokio::test]
-async fn wrapper_bind_requires_registered_agent() {
-    let (_d, bus) = fresh_bus("wrapperunreg");
-    let err = bus.bind_wrapper(&name("ghost"), None).await.unwrap_err();
-    assert!(matches!(err, MailboxError::Unregistered { .. }));
-
-    let err = bus
-        .unbind_wrapper(&name("ghost"), &uuid::Uuid::new_v4().to_string())
-        .await
-        .unwrap_err();
-    assert!(matches!(err, MailboxError::Unregistered { .. }));
-}
-
-#[tokio::test]
-async fn reregister_none_after_wrapper_unbind_restores_transport() {
-    let (_d, bus) = fresh_bus("reregnone");
-    bus.register(&name("a")).await.unwrap();
-    let t = bus.bind_wrapper(&name("a"), None).await.unwrap();
-    bus.unbind_wrapper(&name("a"), &t).await.unwrap();
-
-    let listed = bus.list_agents().await.unwrap();
-    assert_eq!(listed[0].nudge_transport, NudgeTransport::None);
-
-    bus.register_with_transport(&name("a"), Some(NudgeTransport::None))
-        .await
-        .unwrap();
-    let listed = bus.list_agents().await.unwrap();
-    assert_eq!(listed[0].nudge_transport, NudgeTransport::None);
-    assert!(listed[0].nudge_window.is_none());
-}
-
-#[tokio::test]
-async fn register_transport_none_on_reregister() {
-    let (_d, bus) = fresh_bus("regnone");
-    bus.register(&name("a")).await.unwrap();
-    let _t = bus.bind_wrapper(&name("a"), None).await.unwrap();
-    bus.register(&name("b")).await.unwrap();
-
-    bus.register_with_transport(&name("a"), Some(NudgeTransport::None))
-        .await
-        .unwrap();
-    let listed = bus.list_agents().await.unwrap();
-    assert_eq!(listed[0].nudge_transport, NudgeTransport::None);
-    assert!(listed[0].nudge_window.is_none());
-}
-
-#[tokio::test]
-async fn wake_session_unbound_then_register_then_peek() {
-    let (_d, bus) = fresh_bus("wakesession");
-    let wake_id = uuid::Uuid::new_v4().to_string();
-
-    let unbound = bus.nudge_peek_by_wake(&wake_id, 0).await.unwrap();
-    assert!(!unbound.bound);
-    assert!(!unbound.pending);
-    assert!(unbound.agent.is_empty());
-
-    bus.register_with_wake(&name("muse"), None, Some(&wake_id))
-        .await
-        .unwrap();
-
-    let bound = bus.nudge_peek_by_wake(&wake_id, 0).await.unwrap();
-    assert!(bound.bound);
-    assert_eq!(bound.agent, "muse");
-    assert!(!bound.pending);
-
-    bus.register(&name("peer")).await.unwrap();
-    bus.send(&name("peer"), &name("muse"), "hello".into())
-        .await
-        .unwrap();
-
-    let pending = bus.nudge_peek_by_wake(&wake_id, 0).await.unwrap();
-    assert!(pending.pending);
-    assert_eq!(pending.agent, "muse");
-    assert_eq!(pending.ids.len(), 1);
-}
-
-#[tokio::test]
-async fn wake_session_unbind_clears_transport() {
-    let (_d, bus) = fresh_bus("wakeunbind");
-    let wake_id = uuid::Uuid::new_v4().to_string();
-    bus.register_with_wake(&name("a"), None, Some(&wake_id))
-        .await
-        .unwrap();
-
-    bus.unbind_wake(&wake_id).await.unwrap();
-    let listed = bus.list_agents().await.unwrap();
-    assert_eq!(listed[0].nudge_transport, NudgeTransport::None);
-}
-
 // ---------------------------------------------------------------------------
 // Canceled waiters must not consume wake signals
 // ---------------------------------------------------------------------------
@@ -741,176 +514,9 @@ async fn aborted_inbox_waiter_does_not_starve_the_next_one() {
     );
 }
 
-#[tokio::test]
-async fn aborted_nudge_waiter_does_not_starve_the_next_one() {
-    let (_d, bus) = fresh_bus("abortnudge");
-    bus.register(&name("a")).await.unwrap();
-    bus.register(&name("b")).await.unwrap();
-
-    let b = bus.clone();
-    let first = tokio::spawn(async move { b.nudge_peek(&name("b"), 30_000).await });
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    first.abort();
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    bus.send(&name("a"), &name("b"), "wake".into())
-        .await
-        .unwrap();
-
-    let started = std::time::Instant::now();
-    let peek = bus.nudge_peek(&name("b"), 30_000).await.unwrap();
-    assert!(peek.pending);
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(5),
-        "second peeker slept {:?}; the canceled one ate the signal",
-        started.elapsed()
-    );
-}
-
-#[tokio::test]
-async fn aborted_wake_waiter_does_not_starve_the_next_one() {
-    let (_d, bus) = fresh_bus("abortwake");
-    bus.register(&name("a")).await.unwrap();
-    bus.register(&name("b")).await.unwrap();
-    let wid = uuid::Uuid::new_v4().to_string();
-    bus.register_with_wake(&name("b"), None, Some(&wid))
-        .await
-        .unwrap();
-
-    let b = bus.clone();
-    let w = wid.clone();
-    let first = tokio::spawn(async move { b.nudge_peek_by_wake(&w, 30_000).await });
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    first.abort();
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    bus.send(&name("a"), &name("b"), "wake".into())
-        .await
-        .unwrap();
-
-    let started = std::time::Instant::now();
-    let peek = bus.nudge_peek_by_wake(&wid, 30_000).await.unwrap();
-    assert!(peek.pending);
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(5),
-        "second session slept {:?}; the canceled one ate the signal",
-        started.elapsed()
-    );
-}
-
 // ---------------------------------------------------------------------------
-// Wake-session resource bounds
+// Roster and delivery bounds
 // ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn unbound_wake_sessions_honor_global_cap() {
-    let (_d, bus) = fresh_bus("wakecap");
-    let mut tasks = Vec::new();
-    for _ in 0..mentischat::bus::MAX_WAKE_WAITERS_GLOBAL {
-        let b = bus.clone();
-        let id = uuid::Uuid::new_v4().to_string();
-        tasks.push(tokio::spawn(async move {
-            b.nudge_peek_by_wake(&id, /* wait */ 30_000).await
-        }));
-    }
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-
-    // One more unbound long-poll exceeds the global budget.
-    match bus
-        .nudge_peek_by_wake(&uuid::Uuid::new_v4().to_string(), 30_000)
-        .await
-    {
-        Err(MailboxError::TooManyWaiters { .. }) => {}
-        other => panic!("expected global too_many_waiters, got {other:?}"),
-    }
-
-    for t in tasks {
-        t.abort();
-    }
-}
-
-#[tokio::test]
-async fn expired_wake_sessions_release_budget_and_entries() {
-    let (_d, bus) = fresh_bus("wakebudget");
-    // Many distinct ids whose parks expire quickly; entries and budget must
-    // drain so a fresh long park still succeeds.
-    for _ in 0..(mentischat::bus::MAX_WAKE_WAITERS_GLOBAL * 3) {
-        let id = uuid::Uuid::new_v4().to_string();
-        let peek = bus.nudge_peek_by_wake(&id, 1).await.unwrap();
-        assert!(!peek.bound);
-    }
-    let peek = bus
-        .nudge_peek_by_wake(&uuid::Uuid::new_v4().to_string(), 1)
-        .await;
-    assert!(peek.is_ok(), "budget leaked after expiries: {peek:?}");
-}
-
-// ---------------------------------------------------------------------------
-// Ownership tokens on wrapper bindings
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn wrapper_replacement_survives_stale_owner_unbind() {
-    let (_d, bus) = fresh_bus("ownertoken");
-    bus.register(&name("a")).await.unwrap();
-
-    let old = bus.bind_wrapper(&name("a"), None).await.unwrap();
-    // Silent re-mint while bound is forbidden — present the owner token to
-    // refresh, or take over via register_with_wake with a new wakeId.
-    let err = bus.bind_wrapper(&name("a"), None).await.unwrap_err();
-    assert!(matches!(err, MailboxError::Forbidden { .. }));
-    let same = bus.bind_wrapper(&name("a"), Some(&old)).await.unwrap();
-    assert_eq!(same, old);
-
-    let new = uuid::Uuid::new_v4().to_string();
-    bus.register_with_wake(&name("a"), None, Some(&new))
-        .await
-        .unwrap();
-
-    // The older wrapper exits after the replacement: its unbind must not
-    // clear the newer binding.
-    let err = bus.unbind_wrapper(&name("a"), &old).await.unwrap_err();
-    assert!(matches!(err, MailboxError::Forbidden { .. }));
-    let listed = bus.list_agents().await.unwrap();
-    assert_eq!(listed[0].nudge_transport, NudgeTransport::Wrapper);
-
-    // The owner can still unbind.
-    bus.unbind_wrapper(&name("a"), &new).await.unwrap();
-    assert_eq!(
-        bus.list_agents().await.unwrap()[0].nudge_transport,
-        NudgeTransport::None
-    );
-}
-
-#[tokio::test]
-async fn explicit_transport_none_clears_session_token() {
-    let (_d, bus) = fresh_bus("clearwake");
-    bus.register(&name("a")).await.unwrap();
-    let wid = uuid::Uuid::new_v4().to_string();
-    bus.register_with_wake(&name("a"), None, Some(&wid))
-        .await
-        .unwrap();
-
-    bus.register_with_transport(&name("a"), Some(NudgeTransport::None))
-        .await
-        .unwrap();
-
-    // The old /wake/{id} poller no longer resolves to this agent.
-    let peek = bus.nudge_peek_by_wake(&wid, 0).await.unwrap();
-    assert!(!peek.bound, "stale session stayed attached after disable");
-    assert_eq!(
-        bus.list_agents().await.unwrap()[0].nudge_transport,
-        NudgeTransport::None
-    );
-
-    // A plain re-register keeps a live binding.
-    bus.register_with_wake(&name("a"), None, Some(&uuid::Uuid::new_v4().to_string()))
-        .await
-        .unwrap();
-    bus.register(&name("a")).await.unwrap();
-    let listed = bus.list_agents().await.unwrap();
-    assert_eq!(listed[0].nudge_transport, NudgeTransport::Wrapper);
-}
 
 #[tokio::test]
 async fn roster_honors_max_agents() {
@@ -922,29 +528,6 @@ async fn roster_honors_max_agents() {
     assert!(
         matches!(err, MailboxError::RosterFull { agents } if agents == mentischat::bus::MAX_ROSTER),
         "got {err:?}"
-    );
-}
-
-#[tokio::test]
-async fn bind_wrapper_wakes_unbound_wake_waiters() {
-    let (_d, bus) = fresh_bus("bindwake");
-    bus.register(&name("a")).await.unwrap();
-    let wid = uuid::Uuid::new_v4().to_string();
-
-    let b = bus.clone();
-    let w = wid.clone();
-    let task = tokio::spawn(async move { b.nudge_peek_by_wake(&w, 30_000).await });
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    let started = std::time::Instant::now();
-    bus.bind_wrapper(&name("a"), Some(&wid)).await.unwrap();
-    let peek = task.await.unwrap().unwrap();
-    assert!(peek.bound);
-    assert_eq!(peek.agent, "a");
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(5),
-        "bind did not wake unbound peeker: {:?}",
-        started.elapsed()
     );
 }
 
@@ -969,77 +552,6 @@ async fn in_flight_redelivery_reports_remaining_unacked() {
     assert_eq!(p2.messages.len(), 2);
     assert_eq!(p2.remaining, 1);
     assert_eq!(p1.messages[0].id, p2.messages[0].id);
-}
-
-#[tokio::test]
-async fn nudge_peek_ids_are_capped() {
-    let (_d, bus) = fresh_bus("peekcap");
-    bus.register(&name("a")).await.unwrap();
-    bus.register(&name("b")).await.unwrap();
-    let over = mentischat::bus::MAX_PEEK_IDS as usize + 10;
-    for _ in 0..over {
-        bus.send(&name("a"), &name("b"), "x".into()).await.unwrap();
-    }
-
-    let peek = bus.nudge_peek(&name("b"), 0).await.unwrap();
-    assert!(peek.pending, "a full queue is still pending");
-    assert_eq!(
-        peek.ids.len(),
-        mentischat::bus::MAX_PEEK_IDS as usize,
-        "peek must not echo the whole backlog on every poll"
-    );
-}
-
-#[tokio::test]
-async fn deregister_releases_a_parked_wake_poller() {
-    let (_d, bus) = fresh_bus("deregwake");
-    bus.register(&name("b")).await.unwrap();
-    let wid = uuid::Uuid::new_v4().to_string();
-    bus.register_with_wake(&name("b"), None, Some(&wid))
-        .await
-        .unwrap();
-
-    let b = bus.clone();
-    let w = wid.clone();
-    let parked = tokio::spawn(async move { b.nudge_peek_by_wake(&w, 30_000).await });
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    let started = std::time::Instant::now();
-    bus.deregister(&name("b")).await.unwrap();
-    let peek = parked.await.expect("task joins").expect("peek succeeds");
-
-    assert!(!peek.bound, "the session lost its agent");
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(5),
-        "poller slept {:?} instead of being released",
-        started.elapsed()
-    );
-}
-
-#[tokio::test]
-async fn unbind_wake_releases_a_parked_wake_poller() {
-    let (_d, bus) = fresh_bus("unbindwake");
-    bus.register(&name("b")).await.unwrap();
-    let wid = uuid::Uuid::new_v4().to_string();
-    bus.register_with_wake(&name("b"), None, Some(&wid))
-        .await
-        .unwrap();
-
-    let b = bus.clone();
-    let w = wid.clone();
-    let parked = tokio::spawn(async move { b.nudge_peek_by_wake(&w, 30_000).await });
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    let started = std::time::Instant::now();
-    bus.unbind_wake(&wid).await.unwrap();
-    let peek = parked.await.expect("task joins").expect("peek succeeds");
-
-    assert!(!peek.bound, "the binding was cleared");
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(5),
-        "poller slept {:?} instead of being released",
-        started.elapsed()
-    );
 }
 
 #[tokio::test]
@@ -1068,4 +580,98 @@ async fn ack_deletes_only_in_flight_rows_owned_by_the_caller() {
     let after = bus.check_inbox(&name("b"), 0, vec![]).await.unwrap();
     assert!(after.messages.is_empty());
     assert_eq!(after.remaining, 0);
+}
+
+#[tokio::test]
+async fn overview_reports_queue_depth_and_age_sorted_by_name() {
+    let (_d, bus) = fresh_bus("overview");
+    bus.register(&name("opencode")).await.unwrap();
+    bus.register(&name("grok")).await.unwrap();
+    bus.send(&name("grok"), &name("opencode"), "one".into())
+        .await
+        .unwrap();
+    bus.send(&name("grok"), &name("opencode"), "two".into())
+        .await
+        .unwrap();
+
+    let overview = bus.overview().await.unwrap();
+    let names: Vec<&str> = overview.agents.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, ["grok", "opencode"], "sorted by name");
+    assert_eq!(overview.agents[0].queued, 0);
+    assert_eq!(overview.agents[1].queued, 2);
+    assert!(overview
+        .agents
+        .iter()
+        .all(|r| (0..5).contains(&r.seen_secs_ago)));
+}
+
+#[tokio::test]
+async fn overview_counts_messages_sent_even_after_they_are_acked_or_discarded() {
+    let (_d, bus) = fresh_bus("overview_sent");
+    bus.register(&name("a")).await.unwrap();
+    bus.register(&name("b")).await.unwrap();
+    assert_eq!(bus.overview().await.unwrap().messages_sent, 0);
+
+    bus.send(&name("a"), &name("b"), "one".into())
+        .await
+        .unwrap();
+    bus.send(&name("a"), &name("b"), "two".into())
+        .await
+        .unwrap();
+    let page = bus.check_inbox(&name("b"), 0, vec![]).await.unwrap();
+    let ids = page.messages.iter().map(|m| m.id.clone()).collect();
+    bus.check_inbox(&name("b"), 0, ids).await.unwrap();
+    assert_eq!(bus.overview().await.unwrap().agents[1].queued, 0, "acked");
+
+    bus.send(&name("a"), &name("b"), "three".into())
+        .await
+        .unwrap();
+    bus.deregister(&name("b")).await.unwrap();
+    assert_eq!(
+        bus.overview().await.unwrap().messages_sent,
+        3,
+        "acked and discarded mail still counts as sent"
+    );
+}
+
+#[tokio::test]
+async fn overview_does_not_count_rejected_sends_or_reregistration() {
+    let (_d, bus) = fresh_bus("overview_rejected");
+    bus.register(&name("a")).await.unwrap();
+    bus.register(&name("a")).await.unwrap();
+    assert!(bus
+        .send(&name("a"), &name("ghost"), "x".into())
+        .await
+        .is_err());
+    assert!(bus.send(&name("a"), &name("a"), "  ".into()).await.is_err());
+    assert_eq!(bus.overview().await.unwrap().messages_sent, 0);
+}
+
+#[tokio::test]
+async fn overview_counts_in_flight_mail_and_never_consumes_it() {
+    let (_d, bus) = fresh_bus("overview_inflight");
+    bus.register(&name("a")).await.unwrap();
+    bus.register(&name("b")).await.unwrap();
+    bus.send(&name("a"), &name("b"), "hi".into()).await.unwrap();
+    let page = bus.check_inbox(&name("b"), 0, vec![]).await.unwrap();
+    assert_eq!(page.messages.len(), 1, "now in_flight, not yet acked");
+
+    let before = bus.overview().await.unwrap();
+    let again = bus.overview().await.unwrap();
+    assert_eq!(before, again, "overview is read-only");
+    assert_eq!(before.agents[1].queued, 1, "unacked in_flight still counts");
+
+    let redelivered = bus.check_inbox(&name("b"), 0, vec![]).await.unwrap();
+    assert_eq!(redelivered.messages.len(), 1);
+}
+
+#[tokio::test]
+async fn overview_fails_once_the_bus_is_closed() {
+    let (_d, bus) = fresh_bus("overview_closed");
+    bus.register(&name("a")).await.unwrap();
+    bus.shutdown().await.unwrap();
+    assert!(matches!(
+        bus.overview().await,
+        Err(MailboxError::ShuttingDown)
+    ));
 }

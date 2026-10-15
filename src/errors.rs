@@ -34,9 +34,6 @@ pub enum MailboxError {
     TooManyWaiters { agent: String, waiting: usize },
     /// REST path that is not a known route.
     NotFound,
-    /// A wrapper unbind presented a binding token that does not own this
-    /// agent's current binding.
-    Forbidden { agent: String },
     /// Waiter aborted because the process is closing.
     ShuttingDown,
 }
@@ -55,7 +52,6 @@ impl MailboxError {
             Self::RosterFull { .. } => "roster_full",
             Self::TooManyWaiters { .. } => "too_many_waiters",
             Self::NotFound => "not_found",
-            Self::Forbidden { .. } => "forbidden",
             Self::ShuttingDown => "shutting_down",
         }
     }
@@ -68,7 +64,6 @@ impl MailboxError {
                 StatusCode::BAD_REQUEST
             }
             Self::Unregistered { .. } | Self::NotFound => StatusCode::NOT_FOUND,
-            Self::Forbidden { .. } => StatusCode::FORBIDDEN,
             Self::QueueFull { .. } | Self::TooManyWaiters { .. } | Self::RosterFull { .. } => {
                 StatusCode::CONFLICT
             }
@@ -96,7 +91,6 @@ impl MailboxError {
                 json!({ "error": self.code(), "agent": agent, "waiting": waiting })
             }
             Self::NotFound => json!({ "error": self.code() }),
-            Self::Forbidden { agent } => json!({ "error": self.code(), "agent": agent }),
             Self::ShuttingDown => json!({ "error": self.code() }),
         }
     }

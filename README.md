@@ -21,10 +21,10 @@ Key behaviors:
 - **At-least-once delivery** — unacked `in_flight` rows redeliver until acked.
 - **Bounded batches** — max 8 messages / 16 KiB per pull keeps results under
   TUI truncation limits; `remaining` drives the drain loop.
-- **Nudge-first waiting** — after sending, end the turn and let the doorbell
-  wake you when a reply lands (no token burn while waiting). `check_inbox`
-  with `wait_ms` parks up to 30 s only for a peer answering within the same
-  turn; timeout is an empty success, never an error.
+- **Pull only** — nothing wakes an idle agent. Mail is read when its recipient
+  calls `check_inbox`, usually because you told it to check its messages.
+  `check_inbox` with `wait_ms` parks up to 30 s for a peer answering within
+  the same turn; timeout is an empty success, never an error.
 - **Crash-safe** — roster and undelivered mail survive a crash; agents
   re-register after an unexpected daemon death.
 - **Clean shutdown** — SIGTERM/SIGINT discards the roster and all undelivered
@@ -36,8 +36,10 @@ Key behaviors:
 Prerequisites: Rust stable.
 
 ```bash
-make start          # cargo run --bin mentischat (foreground daemon)
+make run            # cargo run --bin mentischat (foreground daemon, terminal view)
+make run-plain      # same, with plain log lines (MENTISCHAT_PLAIN=1)
 make stop           # from another terminal: SIGTERM whatever owns :9480
+make help           # every target (ci, msrv, install, uninstall, ...)
 
 # release build, or install to PATH:
 cargo build --release && ./target/release/mentischat
@@ -48,12 +50,35 @@ Data lives in `~/.cloudllm/mentischat/pending.sqlite` (`0700` dir / `0600`
 file). Override with `MENTISCHAT_DIR`. The listen address is compile-time
 fixed to `127.0.0.1:9480`; `MENTISCHAT_PORT` only affects `make stop`.
 
+## Terminal view
+
+Started from a terminal, the daemon paints a live view: the **MENTIS CHAT**
+banner (a one-line title on short terminals), four tiles — where it is
+**listening**, **messages sent** since the daemon started, **agents**
+registered, and **uptime** — a **Logs** pane (MCP tool calls, never message
+bodies), and a **Registered agents** table with each agent's last seen and
+queued mail.
+
+It is painted like the MentisDB console: the terminal's own 8-color palette (so
+it reads on light and dark themes), a green **MENTIS** and cyan **CHAT** block
+banner, dark-gray rounded panels whose border turns bold yellow on the focused
+pane, a yellow table header with a reverse-video selected row, and ↑/↓
+scrollbars when a pane overflows. The key guide along the bottom is plain: white
+keys, gray descriptions, no bar behind them.
+
+`q`, `Esc` or `Ctrl-C` quit through the same graceful shutdown as `SIGTERM`
+(the mailbox is discarded as usual); `Tab` switches pane; `↑`/`↓`/`PgUp`/`PgDn`
+scroll; `End` follows the log tail. Without a terminal (launchd, a pipe) or with
+`MENTISCHAT_PLAIN=1`, it logs plain lines instead. The view is read-only and
+does not change `lastSeen` or touch any mail. The sent count is kept in memory,
+so it restarts at 0 with the daemon.
+
 ## The five MCP tools
 
 | Tool | Purpose |
 |---|---|
-| `register` | Claim this agent name on the roster (idempotent); optional wake transport and `wakeId` |
-| `list_agents` | Who is registered, `lastSeen`, `nudgeTransport` |
+| `register` | Claim this agent name on the roster (idempotent) |
+| `list_agents` | Who is registered and `lastSeen` |
 | `send_message` | Queue a message for a registered name |
 | `check_inbox` | Pull the next batch; optional `wait_ms`, `ack_ids` |
 | `deregister` | Leave and discard undelivered inbox |
@@ -63,7 +88,8 @@ if taken, append the lowest free numeric suffix (`_1`, `_2`, …). Names are
 1–63 chars: `[a-zA-Z0-9]` then `[a-zA-Z0-9._-]`.
 
 Agent etiquette: `list_agents` before sending; after `send_message`, end
-the turn; quote bodies verbatim; ack ids on your next pull and drain while
+the turn unless a peer is answering within it (then `check_inbox` with
+`wait_ms`); quote bodies verbatim; ack ids on your next pull and drain while
 `remaining > 0`; `deregister` only when the user says they are done.
 
 ## REST API
@@ -78,16 +104,11 @@ Every tool maps to a route, for scripts:
 | `check_inbox` | `/inboxes/{agent}?wait_ms=` | `GET` |
 | ack | `/inboxes/{agent}/ack` | `POST` |
 | `deregister` | `/agents/{agent}` | `DELETE` |
-| wrapper bind | `/agents/{agent}/wrapper` | `POST` |
-| wrapper unbind | `/agents/{agent}/wrapper` | `DELETE` |
-| agent nudge peek | `/nudge/{agent}?wait_ms=` | `GET` |
-| wake-session peek | `/wake/{wakeId}?wait_ms=` | `GET` |
-| wake-session clear | `/wake/{wakeId}` | `DELETE` |
 | health | `/health` | `GET` |
 
 Semantics: success is always `200` + JSON (no 201/204); failures are typed
 JSON errors via HTTP status (`invalid_body`, `unregistered`, `queue_full`,
-`roster_full`, `too_many_waiters`, `forbidden`, …); inbox responses answer with
+`roster_full`, `too_many_waiters`, …); inbox responses answer with
 `Cache-Control: no-store`; bodies cap at 1 MiB. A present `Origin` header must
 be loopback (`http://127.0.0.1`, `localhost`, `::1`); missing `Origin` (curl)
 is allowed.
@@ -127,87 +148,16 @@ claude mcp add --scope user --transport http mentischat http://127.0.0.1:9480/mc
 Wiring only connects the tools — an agent is addressable after it calls
 `register`. Closing a window does not deregister it.
 
-## Waking idle sessions (nudge)
+## Getting mail to an agent
 
-Mail reaches an agent only when its session calls `check_inbox`, and an idle
-TUI never does. The doorbell injects exactly one pointer into the harness —
-never message bodies, never scraped replies:
-
-```
-[mentischat] Mail waiting. Call check_inbox now.
-```
-
-The woken agent then pulls mail itself through its own MCP client. The
-mailbox stays the only content path.
-
-### Recommended: launch a harness under the wrapper
-
-```bash
-mentischat opencode          # window 1
-mentischat grok              # window 2
-mentischat claude -- model opus   # extra args forwarded
-
-mentischat --harness opencode     # explicit flag form
-```
-
-The wrapper runs the harness on a PTY, sets `MENTISCHAT_WAKE_ID`, long-polls
-`GET /wake/{wakeId}`, and types only the pointer when mail is pending. Inside
-the harness, register once with that id to bind the doorbell:
-
-```
-register({ "agent": "deepseek_v4_flash", "wakeId": "<MENTISCHAT_WAKE_ID>" })
-```
-
-On clean exit the wrapper clears its own session (`DELETE /wake/{wakeId}`).
-Exit code is the child's exit code. macOS + Linux (Unix PTYs).
-
-### Ownership tokens
-
-Every binding has exactly one owner. Bind endpoints mint (or accept) a token;
-clear endpoints must present it; **re-bind while already bound must present the
-same token** (silent mint while bound is `403 forbidden`):
-
-- `register({ wakeId })` binds that session — transport becomes `wrapper`
-  (replacing any prior token; the agent-owned takeover path).
-- `POST /agents/{agent}/wrapper` → returns `{"wakeId": ...}` when unbound, or
-  refreshes when the body carries the current token.
-- `DELETE /agents/{agent}/wrapper {"wakeId": ...}` unbinds only the owner;
-  wrong token is `403 forbidden`, missing token is `400 invalid_body`,
-  double-unbind is an idempotent `200`.
-
-So a stale wrapper exiting late can never detach its replacement's doorbell,
-and a peer cannot hijack bind with an empty POST.
-
-### Legacy mode
-
-```bash
-mentischat --agent deepseek_v4_flash opencode   # pin roster name up front
-mentischat --agent name opencode --no-register  # poll without binding
-```
-
-Legacy bindings use the same token rules via the wrapper REST routes. The
-standalone `mentis-wake` binary remains installed for existing scripts.
-
-### Submit key
-
-| Flag | Default | Purpose |
-|---|---|---|
-| `--harness` | — | Harness name (alternative to positional) |
-| `--agent` | optional | Pin roster name up front (legacy) |
-| `--url` | `http://127.0.0.1:9480` | Daemon base URL |
-| `--no-register` | false | Skip wrapper bind (legacy `--agent` mode) |
-| `--newline` | `cr` | Submit key: `cr`, `lf`, `crlf`, `ctrl-enter` |
-
-OpenCode submits on Enter by default; if you remapped submit to Ctrl+Enter in
-`~/.config/opencode/tui.json`, use `--newline ctrl-enter`.
-
-Start the daemon separately (`mentischat`, `mentischat serve`, `make start`).
-The daemon stays transport-agnostic: adapters consume the same peek contract,
-so the server never grows per-TUI code.
+mentischat has no wake-up layer. To have an agent read its mail, tell it to
+check its messages; it calls `check_inbox` with its registered name and keeps
+calling while `remaining > 0`. Messages stay queued (and are redelivered until
+acked) however long the agent takes.
 
 ## Caps
 
-Source of truth: `src/bus.rs`.
+Source of truth: `src/bus/model.rs`.
 
 | Limit | Value |
 |---|---|
@@ -218,8 +168,6 @@ Source of truth: `src/bus.rs`.
 | Batch per pull | 8 msgs / 16 KiB total body bytes |
 | Blocking pull (`wait_ms`) | 0–30000 ms |
 | Parked pulls per name | 8 |
-| Parked peeks per name | 2 |
-| Parked unbound wake sessions (global) | 64 |
 
 ## launchd (optional)
 
@@ -244,7 +192,7 @@ daemon exits non-zero on purpose) and a deliberate `make stop`.
 ## Tests
 
 ```bash
-cargo test          # bus behavior, store migrations, REST surface, MCP wire protocol
+cargo test          # bus behavior, store migrations, REST surface, MCP wire protocol, terminal view
 make clippy         # clippy --all-targets --all-features -- -D warnings
 make ci             # what CI runs: fmt --check, check, clippy, test, doc
 ```
@@ -262,9 +210,9 @@ rejects non-loopback `Origin` headers (browser CSRF). Remote hosting would
 require bearer auth (supported upstream), TLS, and real identity — deliberately
 out of scope for v1.
 
-Also out of scope: history, rooms, broadcast, auto-register, MentisDB
-dual-write, stdio transport, a sixth MCP tool, tmux/CDP/Playwright adapters,
-Windows PTY support, browser extension.
+Also out of scope: waking idle agents (no doorbell, wrapper or nudge), history,
+rooms, broadcast, auto-register, MentisDB dual-write, stdio transport, a sixth
+MCP tool.
 
 ## License
 
@@ -273,5 +221,5 @@ MIT. See [LICENSE](LICENSE).
 ## References
 
 Product and architecture: [PLAN.md](PLAN.md). Wire contracts, waiter algorithm,
-caps, and error tables: `src/bus.rs`, `src/errors.rs`, `tests/`. Release notes:
+caps, and error tables: `src/bus/`, `src/errors.rs`, `tests/`. Release notes:
 [changelog.txt](changelog.txt).

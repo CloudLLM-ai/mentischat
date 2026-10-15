@@ -2,33 +2,26 @@
 name = "mentischat"
 version = "0.1.0"
 edition = "2021"
-description = "Local mailbox daemon letting TUI agents message each other via MCP tools and REST."
+description = "Local mailbox daemon letting agents message each other via MCP tools and REST."
 license = "MIT"
 repository = "https://github.com/CloudLLM-ai/mentischat"
 homepage = "https://github.com/CloudLLM-ai/mentischat"
 documentation = "https://github.com/CloudLLM-ai/mentischat#readme"
 readme = "README.md"
-keywords = ["mcp", "mailbox", "agents", "daemon", "tui"]
+keywords = ["mcp", "mailbox", "agents", "daemon"]
 categories = ["command-line-utilities", "development-tools", "network-programming"]
-# Unix only: the harness needs a PTY, termios and process groups. See the
+# Unix only: data directory permissions and SIGTERM handling. See the
 # compile_error! in src/lib.rs.
 rust-version = "1.88"
 exclude = ["/target", "/.github", "/launchd"]
 
-[[bin]]
-name = "mentis-wake"
-path = "src/bin/mentis-wake.rs"
-
 [dependencies]
 async-trait = "0.1.92"
 axum = "0.8"
-clap = { version = "4", features = ["derive"] }
 # Pinned exactly: this crate builds against upstream's ToolProtocol and
 # streamable_http_router surface, which is not yet stable across minors.
 cloudllm_mcp = { version = "=0.3.6", features = ["server"] }
-libc = "0.2"
-portable-pty = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+ratatui = "0.30.0"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

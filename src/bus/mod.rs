@@ -25,7 +25,7 @@ pub use model::{
     MAX_WAIT_MS,
 };
 
-use delivery::{apply_acks, delete_acked, deliver_locked, empty_page};
+use delivery::{delete_acked, deliver_locked, empty_page, touch_last_seen};
 use waiters::{try_park, unpark, wake_one, WaiterMap};
 
 type MailErr = crate::errors::MailboxError;
@@ -102,8 +102,11 @@ impl Bus {
         name: &crate::names::AgentName,
         opts: Registration,
     ) -> Result<RegisterOutcome, MailErr> {
-        let now = now_rfc3339();
+        let description = opts.description.map(validate_description).transpose()?;
         let g = self.lock_open().await?;
+        // Stamped under the lock so concurrent registers cannot write last_seen
+        // out of order.
+        let now = now_rfc3339();
         let exists = is_registered(&g, name.as_str())?;
         let description: Option<String> = if exists {
             if opts.exclusive {
@@ -121,7 +124,7 @@ impl Bus {
                                                ELSE NULLIF(?3, '') END
                       WHERE name = ?1
                   RETURNING description",
-                    params![name.as_str(), now, opts.description],
+                    params![name.as_str(), now, description],
                     |r| r.get(0),
                 )
                 .map_err(sqlite_storage)?
@@ -138,7 +141,7 @@ impl Bus {
                     "INSERT INTO roster (name, last_seen, description)
                      VALUES (?1, ?2, NULLIF(?3, ''))
                      RETURNING description",
-                    params![name.as_str(), now, opts.description],
+                    params![name.as_str(), now, description],
                     |r| r.get(0),
                 )
                 .map_err(sqlite_storage)?
@@ -161,25 +164,19 @@ impl Bus {
     ) -> Result<DiscardOutcome, MailErr> {
         let mut g = self.lock_open().await?;
         ensure_registered(&g, name.as_str())?;
-        let discarded: i64 = g
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM messages WHERE recipient = ?1",
-                params![name.as_str()],
-                |r| r.get(0),
-            )
-            .map_err(sqlite_storage)?;
-        {
+        let discarded = {
             let tx = g.conn.transaction().map_err(sqlite_storage)?;
-            tx.execute(
-                "DELETE FROM messages WHERE recipient = ?1",
-                params![name.as_str()],
-            )
-            .map_err(sqlite_storage)?;
+            let discarded = tx
+                .execute(
+                    "DELETE FROM messages WHERE recipient = ?1",
+                    params![name.as_str()],
+                )
+                .map_err(sqlite_storage)?;
             tx.execute("DELETE FROM roster WHERE name = ?1", params![name.as_str()])
                 .map_err(sqlite_storage)?;
             tx.commit().map_err(sqlite_storage)?;
-        }
+            discarded as i64
+        };
         // Dropping senders wakes those pulls; they re-lock, see the name is
         // gone, and fail unregistered.
         g.waiters.remove(name.as_str());
@@ -248,8 +245,9 @@ impl Bus {
         if body.len() > MAX_BODY_BYTES || body.trim().is_empty() {
             return Err(MailErr::InvalidBody);
         }
-        let created_at = now_rfc3339();
         let mut g = self.lock_open().await?;
+        // Stamped under the lock so createdAt order matches seq order.
+        let created_at = now_rfc3339();
         ensure_registered(&g, from.as_str())?;
         ensure_registered(&g, to.as_str())?;
 
@@ -319,7 +317,8 @@ impl Bus {
     ) -> Result<InboxPage, MailErr> {
         let mut g = self.lock_open().await?;
         ensure_registered(&g, name.as_str())?;
-        apply_acks(&mut g, name.as_str(), &ack_ids)?;
+        delete_acked(&mut g, name.as_str(), &ack_ids)?;
+        touch_last_seen(&mut g, name.as_str())?;
 
         if let Some(page) = deliver_locked(&mut g, name.as_str())? {
             return Ok(page);
@@ -342,6 +341,8 @@ impl Bus {
             return Err(MailErr::ShuttingDown);
         }
         ensure_registered(&g, name.as_str())?;
+        // The agent was waiting all along; record when the pull ended.
+        touch_last_seen(&mut g, name.as_str())?;
         Ok(deliver_locked(&mut g, name.as_str())?.unwrap_or_else(|| empty_page(name)))
     }
 
@@ -405,6 +406,16 @@ impl Bus {
 fn sqlite_storage(e: rusqlite::Error) -> MailErr {
     tracing::error!(error = %e, "sqlite error");
     MailErr::StorageError
+}
+
+/// Trims a register description and enforces [`MAX_DESCRIPTION_BYTES`] and
+/// no control characters; `""` stays `""` (it clears the stored one).
+fn validate_description(raw: String) -> Result<String, MailErr> {
+    let trimmed = raw.trim();
+    if trimmed.len() > MAX_DESCRIPTION_BYTES || trimmed.chars().any(char::is_control) {
+        return Err(MailErr::InvalidDescription);
+    }
+    Ok(trimmed.to_string())
 }
 
 fn is_registered(g: &Inner, name: &str) -> Result<bool, MailErr> {

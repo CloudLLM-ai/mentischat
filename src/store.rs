@@ -1,8 +1,8 @@
-//! SQLite persistence: schema creation and pragmas only.
+//! SQLite persistence: opening, pragmas, schema and migrations.
 //!
-//! All mailbox logic lives in [`crate::bus`]; this module owns opening the
-//! database with the right on-disk permissions and providing parameterised
-//! SQL helpers over the two tables (`roster`, `messages`).
+//! All mailbox logic and SQL queries live in [`crate::bus`]; this module only
+//! opens the database with the right on-disk permissions and brings the two
+//! tables (`roster`, `messages`) up to the current schema.
 
 use std::fmt;
 use std::fs;

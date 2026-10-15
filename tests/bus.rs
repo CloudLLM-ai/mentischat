@@ -778,3 +778,37 @@ async fn list_agents_reports_queue_depth_without_delivering() {
     let page = bus.check_inbox(&name("b"), 0, vec![]).await.unwrap();
     assert_eq!(page.messages.len(), 3, "listing did not consume anything");
 }
+
+#[tokio::test]
+async fn abandoned_blocking_pulls_do_not_fill_the_waiter_cap() {
+    let (_d, bus) = fresh_bus("abandoned");
+    bus.register(&name("a")).await.unwrap();
+    bus.register(&name("b")).await.unwrap();
+
+    // Eight pulls park, then their clients go away (the futures are dropped
+    // mid-await, as when an HTTP connection closes), so none of them unparks.
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let b = bus.clone();
+        tasks.push(tokio::spawn(async move {
+            b.check_inbox(&name("b"), 30_000, vec![]).await
+        }));
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    for t in &tasks {
+        t.abort();
+    }
+    for t in tasks {
+        assert!(t.await.unwrap_err().is_cancelled());
+    }
+
+    // A fresh blocking pull must still park, and be woken by a send.
+    let b = bus.clone();
+    let pull = tokio::spawn(async move { b.check_inbox(&name("b"), 5_000, vec![]).await });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    bus.send(&name("a"), &name("b"), "still reachable".into())
+        .await
+        .unwrap();
+    let page = pull.await.unwrap().expect("not too_many_waiters");
+    assert_eq!(page.messages.len(), 1);
+}

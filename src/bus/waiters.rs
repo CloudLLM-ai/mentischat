@@ -28,7 +28,14 @@ pub(super) fn wake_one(q: &mut VecDeque<Waiter>) {
 ///
 /// Returns `(waiter id, receiver)`; the caller awaits the receiver outside
 /// the bus lock and must later call [`unpark`] with the id.
+///
+/// A pull whose client disconnected is dropped mid-await and never reaches
+/// [`unpark`]; its closed sender is pruned here so abandoned pulls cannot
+/// fill the cap and lock the name out of blocking pulls.
 pub(super) fn try_park(g: &mut Inner, name: &str) -> Result<(u64, oneshot::Receiver<()>), MailErr> {
+    if let Some(q) = g.waiters.get_mut(name) {
+        q.retain(|w| !w.tx.is_closed());
+    }
     let waiting = g.waiters.get(name).map_or(0, VecDeque::len);
     if waiting >= MAX_WAITERS_PER_AGENT {
         return Err(MailErr::TooManyWaiters {

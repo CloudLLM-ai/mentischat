@@ -19,7 +19,9 @@ pub const MAX_WAIT_MS: u32 = 30_000;
 pub const MAX_WAITERS_PER_AGENT: usize = 8;
 /// Cap on roster rows — bounds the number of parked pulls (8 per name).
 pub const MAX_ROSTER: i64 = 256;
-/// Cap on ids accepted in one `ack_ids` array.
+/// Cap on ids accepted in one `ack_ids` array. A generous bound: at most
+/// [`MAX_BATCH`] rows are ever `in_flight` (and so ackable) per name, but
+/// clients may resend stale ids, which are ignored.
 pub const MAX_ACK_IDS: usize = MAX_PENDING_PER_AGENT as usize;
 /// Maximum UTF-8 byte length of an agent's roster description.
 pub const MAX_DESCRIPTION_BYTES: usize = 256;
@@ -28,8 +30,9 @@ pub const MAX_DESCRIPTION_BYTES: usize = 256;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Registration {
     /// `None` keeps the stored description, `Some("")` clears it, and any
-    /// other value replaces it. Validated by the caller (see
-    /// [`MAX_DESCRIPTION_BYTES`]).
+    /// other value replaces it. The bus trims it and rejects anything over
+    /// [`MAX_DESCRIPTION_BYTES`] or holding control characters with
+    /// `invalid_description`.
     pub description: Option<String>,
     /// Fail `name_taken` instead of joining a name that is already on the
     /// roster, so two agents cannot silently share one inbox.

@@ -38,12 +38,7 @@ pub(super) fn delete_acked(g: &mut Inner, name: &str, ack_ids: &[String]) -> Res
     Ok(acked)
 }
 
-pub(super) fn apply_acks(g: &mut Inner, name: &str, ack_ids: &[String]) -> Result<(), MailErr> {
-    delete_acked(g, name, ack_ids)?;
-    touch_last_seen(g, name)
-}
-
-fn touch_last_seen(g: &mut Inner, name: &str) -> Result<(), MailErr> {
+pub(super) fn touch_last_seen(g: &mut Inner, name: &str) -> Result<(), MailErr> {
     g.conn
         .execute(
             "UPDATE roster SET last_seen = ?2 WHERE name = ?1",
@@ -71,14 +66,16 @@ pub(super) fn deliver_locked(g: &mut Inner, name: &str) -> Result<Option<InboxPa
         return Ok(None);
     }
     let batch = take_batch(&candidates);
-    for msg in &batch {
-        g.conn
-            .execute(
-                "UPDATE messages SET state = 'in_flight' WHERE id = ?1",
-                params![msg.id],
-            )
+    let tx = g.conn.transaction().map_err(sqlite_storage)?;
+    {
+        let mut stmt = tx
+            .prepare("UPDATE messages SET state = 'in_flight' WHERE id = ?1")
             .map_err(sqlite_storage)?;
+        for msg in &batch {
+            stmt.execute(params![msg.id]).map_err(sqlite_storage)?;
+        }
     }
+    tx.commit().map_err(sqlite_storage)?;
     page(g, name, batch).map(Some)
 }
 
@@ -97,7 +94,7 @@ fn take_batch(candidates: &[Message]) -> Vec<Message> {
     candidates[..take].to_vec()
 }
 
-fn page(g: &mut Inner, name: &str, messages: Vec<Message>) -> Result<InboxPage, MailErr> {
+fn page(g: &Inner, name: &str, messages: Vec<Message>) -> Result<InboxPage, MailErr> {
     // Unacked rows not in this page (leftover in_flight + still-pending).
     let total: i64 = g
         .conn
@@ -108,7 +105,6 @@ fn page(g: &mut Inner, name: &str, messages: Vec<Message>) -> Result<InboxPage, 
         )
         .map_err(sqlite_storage)?;
     let remaining = (total - messages.len() as i64).max(0);
-    touch_last_seen(g, name)?;
     Ok(InboxPage {
         agent: name.to_string(),
         messages,

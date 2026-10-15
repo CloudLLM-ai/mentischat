@@ -12,7 +12,7 @@ use std::sync::Arc;
 use mcp::protocol::{ToolMetadata, ToolParameter, ToolParameterType, ToolProtocol, ToolResult};
 use serde_json::{json, Value};
 
-use crate::bus::{Bus, Registration, MAX_DESCRIPTION_BYTES};
+use crate::bus::{Bus, Registration};
 use crate::errors::MailboxError;
 use crate::names::AgentName;
 
@@ -218,19 +218,13 @@ pub fn parse_registration(params: &Value) -> Result<Registration, MailboxError> 
 }
 
 /// Contract description semantics: absent/null -> keep the stored one; a
-/// string is trimmed, and empty clears it. Anything over
-/// [`MAX_DESCRIPTION_BYTES`] after trimming, containing control characters,
-/// or not a string -> `invalid_description`.
+/// string is passed to the bus, which trims it, treats empty as "clear", and
+/// rejects anything over [`crate::bus::MAX_DESCRIPTION_BYTES`] or containing
+/// control characters; any other JSON type -> `invalid_description`.
 pub fn parse_description(v: Option<&Value>) -> Result<Option<String>, MailboxError> {
     match v {
         None | Some(Value::Null) => Ok(None),
-        Some(Value::String(s)) => {
-            let s = s.trim();
-            if s.len() > MAX_DESCRIPTION_BYTES || s.chars().any(char::is_control) {
-                return Err(MailboxError::InvalidDescription);
-            }
-            Ok(Some(s.to_string()))
-        }
+        Some(Value::String(s)) => Ok(Some(s.clone())),
         Some(_) => Err(MailboxError::InvalidDescription),
     }
 }

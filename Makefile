@@ -1,5 +1,5 @@
 # Makefile
-.PHONY: build release clean fmt fmt-check check test doc help tasks clippy publish publish-dry-run install uninstall start start-plain stop ci msrv
+.PHONY: build release clean fmt fmt-check check test doc help tasks clippy publish publish-dry-run install uninstall run run-plain stop ci msrv
 
 default: help
 CARGO_CMD=/usr/bin/env cargo
@@ -69,11 +69,11 @@ clean: ## Remove build artifacts using cargo clean
 	${CARGO_CMD} clean
 
 # Run the mentischat daemon in the foreground (Ctrl-C to stop)
-start: ## Start mentischat in the foreground (cargo run --bin mentischat)
+run: ## Run mentischat in the foreground (cargo run --bin mentischat)
 	${CARGO_CMD} run --bin mentischat
 
 # Run the daemon with plain log lines instead of the terminal view
-start-plain: ## Start mentischat with plain logs (MENTISCHAT_PLAIN=1)
+run-plain: ## Run mentischat with plain logs (MENTISCHAT_PLAIN=1)
 	MENTISCHAT_PLAIN=1 ${CARGO_CMD} run --bin mentischat
 
 # Gracefully stop a locally running mentischat daemon (SIGTERM on the mailbox port)

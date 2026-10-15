@@ -158,7 +158,7 @@ UNRELEASED
     mapping, GET/DELETE 405, foreign Origin 403).
   - chore(build): single Makefile is now the cargo tool handler (build,
     release, fmt, check, clippy, test, doc, publish, install, clean);
-    `make start` runs the daemon in the foreground and `make stop` sends
+    `make run` runs the daemon in the foreground and `make stop` sends
     SIGTERM to the listener on :9480 (MENTISCHAT_PORT overrides), replacing
     the start_mentischat/stop_mentischat scripts and scripts/run.sh.
   - chore(rename): project renamed llm_chat -> mentischat everywhere

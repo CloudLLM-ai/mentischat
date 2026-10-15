@@ -1069,3 +1069,60 @@ async fn ack_deletes_only_in_flight_rows_owned_by_the_caller() {
     assert!(after.messages.is_empty());
     assert_eq!(after.remaining, 0);
 }
+
+#[tokio::test]
+async fn overview_reports_queue_depth_wake_transport_and_age() {
+    let (_d, bus) = fresh_bus("overview");
+    bus.register(&name("grok")).await.unwrap();
+    bus.register_with_wake(
+        &name("opencode"),
+        None,
+        Some("11111111-1111-4111-8111-111111111111"),
+    )
+    .await
+    .unwrap();
+    bus.send(&name("grok"), &name("opencode"), "one".into())
+        .await
+        .unwrap();
+    bus.send(&name("grok"), &name("opencode"), "two".into())
+        .await
+        .unwrap();
+
+    let rows = bus.overview().await.unwrap();
+    let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, ["grok", "opencode"], "sorted by name");
+    assert_eq!(rows[0].queued, 0);
+    assert_eq!(rows[0].nudge_transport, NudgeTransport::None);
+    assert_eq!(rows[1].queued, 2);
+    assert_eq!(rows[1].nudge_transport, NudgeTransport::Wrapper);
+    assert!(rows.iter().all(|r| (0..5).contains(&r.seen_secs_ago)));
+}
+
+#[tokio::test]
+async fn overview_counts_in_flight_mail_and_never_consumes_it() {
+    let (_d, bus) = fresh_bus("overview_inflight");
+    bus.register(&name("a")).await.unwrap();
+    bus.register(&name("b")).await.unwrap();
+    bus.send(&name("a"), &name("b"), "hi".into()).await.unwrap();
+    let page = bus.check_inbox(&name("b"), 0, vec![]).await.unwrap();
+    assert_eq!(page.messages.len(), 1, "now in_flight, not yet acked");
+
+    let before = bus.overview().await.unwrap();
+    let again = bus.overview().await.unwrap();
+    assert_eq!(before, again, "overview is read-only");
+    assert_eq!(before[1].queued, 1, "unacked in_flight still counts");
+
+    let redelivered = bus.check_inbox(&name("b"), 0, vec![]).await.unwrap();
+    assert_eq!(redelivered.messages.len(), 1);
+}
+
+#[tokio::test]
+async fn overview_fails_once_the_bus_is_closed() {
+    let (_d, bus) = fresh_bus("overview_closed");
+    bus.register(&name("a")).await.unwrap();
+    bus.shutdown().await.unwrap();
+    assert!(matches!(
+        bus.overview().await,
+        Err(MailboxError::ShuttingDown)
+    ));
+}

@@ -21,6 +21,17 @@ UNRELEASED
     MAX_PEEK_IDS (64) ids, so a stalled agent with a full queue no longer
     returns a 1024-uuid body on every 1 Hz poll.
 
+  - feat(tui): the daemon paints a live terminal view when started from a
+    terminal: the MENTIS CHAT banner, tiles for listen address, agent count
+    (and how many are woken by a wrapper), queued mail and uptime, a Logs
+    pane, and a Registered agents table (wake transport, last seen, queued).
+    q / Esc / Ctrl-C quit through the same graceful shutdown as SIGTERM, so
+    the mailbox is wiped exactly as before; Tab switches pane and the arrow
+    and page keys scroll. Without a terminal (launchd, a pipe) or with
+    MENTISCHAT_PLAIN=1 the daemon logs plain lines as before. Read-only: the
+    view uses the new Bus::overview and never touches last_seen, acks or
+    mail, and never shows message bodies. Adds the ratatui dependency.
+
   - refactor: retire the dead v1 window_title_match column (dropped on open;
     the nudgeWindow wire field stays null); drop check_inbox's duplicate
     waiter-cap check, which also inserted an empty queue as a side effect;

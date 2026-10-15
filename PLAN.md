@@ -41,6 +41,11 @@ the mailbox recovers; a graceful shutdown (SIGTERM/SIGINT) discards the
 roster and every pending/in_flight row in one transaction, so a deliberate
 restart starts clean — a bulk deregister of everyone.
 
+Operator view: started from a terminal the daemon paints a read-only ratatui
+dashboard (`src/tui.rs`) fed by `Bus::overview`; otherwise it logs plain lines
+(`MENTISCHAT_PLAIN=1` forces that). It is not a tool, adds no route, and quitting
+it is the same graceful shutdown as SIGTERM.
+
 Five tools, one `ToolProtocol`. REST mirrors them. Do not add a sixth tool.
 
 | Tool | REST | Role |

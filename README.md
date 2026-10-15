@@ -48,6 +48,21 @@ Data lives in `~/.cloudllm/mentischat/pending.sqlite` (`0700` dir / `0600`
 file). Override with `MENTISCHAT_DIR`. The listen address is compile-time
 fixed to `127.0.0.1:9480`; `MENTISCHAT_PORT` only affects `make stop`.
 
+## Terminal view
+
+Started from a terminal, the daemon paints a live view: the **MENTIS CHAT**
+banner (a one-line title on short terminals), tiles for the listen address,
+agent count, queued mail and uptime, a **Logs** pane (MCP tool calls, never
+message bodies), and a **Registered agents** table with each agent's wake
+transport, last seen and queued mail.
+
+`q`, `Esc` or `Ctrl-C` quit through the same graceful shutdown as `SIGTERM`
+(the mailbox is discarded as usual); `Tab` switches pane; `↑`/`↓`/`PgUp`/`PgDn`
+scroll; `End` follows the log tail. Without a terminal (launchd, a pipe) or with
+`MENTISCHAT_PLAIN=1`, it logs plain lines instead. The view is read-only and
+does not change `lastSeen` or touch any mail. It applies to the daemon only;
+`mentischat <harness>` runs the harness's own interface.
+
 ## The five MCP tools
 
 | Tool | Purpose |

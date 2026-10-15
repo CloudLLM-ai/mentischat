@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use mentischat::bus::Bus;
+use mentischat::bus::{Bus, Retention};
 use mentischat::tui::{self, LogBuffer};
 use mentischat::BIND_ADDR;
 use tokio::sync::Notify;
@@ -22,7 +22,12 @@ Usage: mentischat
 
 Serves MCP at /mcp and REST on 127.0.0.1:9480. Started from a terminal it paints
 a live view; set MENTISCHAT_PLAIN=1, or run it without a terminal, for plain logs.
-MENTISCHAT_DIR overrides the data directory (default ~/.cloudllm/mentischat).";
+MENTISCHAT_DIR overrides the data directory (default ~/.cloudllm/mentischat).
+
+Mail is deleted when read. Unread mail expires after MENTISCHAT_MESSAGE_TTL
+(default 1h) and agents idle for MENTISCHAT_AGENT_TTL (default 24h) leave the
+roster; values are seconds or a number with s, m, h or d. Everything is wiped
+at startup and on a clean stop unless MENTISCHAT_PERSIST=1.";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -70,6 +75,19 @@ async fn run_daemon() -> ExitCode {
             .init();
     }
 
+    let retention = match Retention::from_settings(
+        std::env::var("MENTISCHAT_MESSAGE_TTL").ok().as_deref(),
+        std::env::var("MENTISCHAT_AGENT_TTL").ok().as_deref(),
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("mentischat: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    // State lives for one server run unless MENTISCHAT_PERSIST=1.
+    let persist = std::env::var("MENTISCHAT_PERSIST").as_deref() == Ok("1");
+
     let data_dir = match std::env::var("MENTISCHAT_DIR") {
         Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
         _ => match std::env::var("HOME") {
@@ -98,13 +116,31 @@ async fn run_daemon() -> ExitCode {
         }
     };
 
-    let bus = Arc::new(match Bus::new(&data_dir) {
+    let bus = Arc::new(match Bus::with_retention(&data_dir, retention) {
         Ok(bus) => bus,
         Err(e) => {
             eprintln!("mentischat: failed to open {}: {e}", data_dir.display());
             return ExitCode::FAILURE;
         }
     });
+
+    // Clearing at startup also covers a previous run that crashed or was
+    // killed before its shutdown wipe.
+    if !persist {
+        match bus.clear().await {
+            Ok((0, 0)) => {}
+            Ok((messages, agents)) => tracing::info!(
+                messages,
+                agents,
+                "cleared mail and agents left by a previous run"
+            ),
+            Err(e) => {
+                eprintln!("mentischat: could not clear {}: {e}", data_dir.display());
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let sweeper = tokio::spawn(sweep_forever(bus.clone()));
 
     let app = mentischat::build_router(bus.clone());
     let shutdown_bus = bus.clone();
@@ -145,8 +181,9 @@ async fn run_daemon() -> ExitCode {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal(shutdown_bus, quit))
+    .with_graceful_shutdown(shutdown_signal(shutdown_bus, quit, persist))
     .await;
+    sweeper.abort();
     running.store(false, Ordering::Relaxed);
     if let Some(view) = view {
         match view.join() {
@@ -166,7 +203,28 @@ async fn run_daemon() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-async fn shutdown_signal(bus: Arc<Bus>, quit: Arc<Notify>) {
+/// Expire unread mail and idle agents on the retention's interval until the
+/// bus closes.
+async fn sweep_forever(bus: Arc<Bus>) {
+    let mut tick = tokio::time::interval(bus.retention().sweep_interval());
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        match bus.sweep().await {
+            Ok(out) if out.is_empty() => {}
+            Ok(out) => tracing::info!(
+                expired = out.expired,
+                discarded = out.discarded,
+                dropped = ?out.dropped_agents,
+                "expired unread mail and idle agents"
+            ),
+            Err(mentischat::errors::MailboxError::ShuttingDown) => return,
+            Err(e) => tracing::warn!(error = %e, "expiry sweep failed"),
+        }
+    }
+}
+
+async fn shutdown_signal(bus: Arc<Bus>, quit: Arc<Notify>, persist: bool) {
     use tokio::signal::unix::{signal, SignalKind};
     let terminate = async {
         match signal(SignalKind::terminate()) {
@@ -182,7 +240,9 @@ async fn shutdown_signal(bus: Arc<Bus>, quit: Arc<Notify>) {
         _ = quit.notified() => {}
     }
     tracing::info!("shutting down");
-    if let Err(e) = bus.shutdown().await {
+    if persist {
+        bus.close().await;
+    } else if let Err(e) = bus.shutdown().await {
         tracing::error!(error = %e, "mailbox wipe failed during shutdown");
         SHUTDOWN_WIPE_FAILED.store(true, Ordering::SeqCst);
     }

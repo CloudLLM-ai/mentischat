@@ -1,4 +1,5 @@
-//! The mailbox: roster, caps, ack/batch delivery, and blocking pulls.
+//! The mailbox: roster, caps, delete-on-read delivery, blocking pulls, and
+//! expiry of unread mail and idle agents.
 //!
 //! All state sits behind a single [`tokio::sync::Mutex`]; sqlite writes run
 //! inside the lock so waiters and rows cannot tear. The lock is **never**
@@ -8,7 +9,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use rusqlite::params;
 use tokio::sync::{Mutex, MutexGuard};
@@ -19,16 +20,16 @@ mod model;
 mod waiters;
 
 pub use crate::store::StoreError;
-pub use clock::now_rfc3339;
+pub use clock::{now_rfc3339, rfc3339};
 pub use model::{
-    AgentOverview, DiscardOutcome, InboxPage, Message, Overview, RegisterOutcome, Registration,
-    RosterEntry, SendReceipt, MAX_ACK_IDS, MAX_BATCH, MAX_BODY_BYTES, MAX_DESCRIPTION_BYTES,
-    MAX_PENDING_PER_AGENT, MAX_RETURN_BYTES, MAX_ROSTER, MAX_TOTAL_MESSAGES, MAX_WAITERS_PER_AGENT,
-    MAX_WAIT_MS,
+    parse_duration, AgentOverview, DiscardOutcome, InboxPage, Message, Overview, RegisterOutcome,
+    Registration, Retention, RosterEntry, SendReceipt, SweepOutcome, DEFAULT_AGENT_TTL,
+    DEFAULT_MESSAGE_TTL, MAX_BATCH, MAX_BODY_BYTES, MAX_DESCRIPTION_BYTES, MAX_PENDING_PER_AGENT,
+    MAX_RETURN_BYTES, MAX_ROSTER, MAX_TOTAL_MESSAGES, MAX_WAITERS_PER_AGENT, MAX_WAIT_MS,
 };
 
-use delivery::{delete_acked, deliver_locked, empty_page, touch_last_seen};
-use waiters::{try_park, unpark, wake_one, ParkGuard, WaiterMap};
+use delivery::{empty_page, take_locked, touch_last_seen};
+use waiters::{has_live_waiter, try_park, unpark, wake_one, ParkGuard, WaiterMap};
 
 type MailErr = crate::errors::MailboxError;
 
@@ -47,10 +48,12 @@ struct Inner {
 pub struct Bus {
     // Arc so a parked pull dropped mid-wait can settle its waiter from Drop.
     inner: Arc<Mutex<Inner>>,
+    retention: Retention,
 }
 
 impl Bus {
-    /// Open (creating if needed) the store under `data_dir`.
+    /// Open (creating if needed) the store under `data_dir` with the default
+    /// [`Retention`].
     ///
     /// # Examples
     ///
@@ -62,6 +65,12 @@ impl Bus {
     /// # }
     /// ```
     pub fn new(data_dir: &Path) -> Result<Self, StoreError> {
+        Self::with_retention(data_dir, Retention::default())
+    }
+
+    /// Open the store under `data_dir`, expiring unread mail and idle agents
+    /// per `retention` whenever [`sweep`](Self::sweep) runs.
+    pub fn with_retention(data_dir: &Path, retention: Retention) -> Result<Self, StoreError> {
         let conn = crate::store::open(data_dir)?;
         let next_seq: i64 = conn
             .query_row("SELECT COALESCE(MAX(seq), 0) + 1 FROM messages", [], |r| {
@@ -77,7 +86,13 @@ impl Bus {
                 messages_sent: 0,
                 closed: false,
             })),
+            retention,
         })
+    }
+
+    /// How long unread mail and idle agents are kept.
+    pub fn retention(&self) -> Retention {
+        self.retention
     }
 
     /// Locks the bus, failing `shutting_down` once it has been closed.
@@ -221,7 +236,7 @@ impl Bus {
     /// Shares its query with [`list_agents`](Self::list_agents); this shape
     /// trades the wire timestamp for an age the view can print.
     ///
-    /// Read-only: does not promote, ack, or touch `last_seen`. A `last_seen`
+    /// Read-only: does not deliver anything or touch `last_seen`. A `last_seen`
     /// that SQLite cannot parse reads as 0 seconds ago rather than failing the
     /// whole view.
     ///
@@ -287,8 +302,8 @@ impl Bus {
         let seq = g.next_seq;
         g.conn
             .execute(
-                "INSERT INTO messages (id, sender, recipient, body, created_at, seq, state)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending')",
+                "INSERT INTO messages (id, sender, recipient, body, created_at, seq)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![id, from.as_str(), to.as_str(), body, created_at, seq],
             )
             .map_err(sqlite_storage)?;
@@ -307,11 +322,11 @@ impl Bus {
         })
     }
 
-    /// Pull (and optionally block for) the next batch for `name`.
+    /// Pull (and optionally block for) the next batch for `name`. Returned
+    /// messages are deleted: each is handed out once and nothing is kept.
     ///
-    /// Applies `ack_ids` first (deleting matching `in_flight` rows owned by
-    /// this name), then delivers per batch+ack rules. Parks only when both
-    /// states are empty and `wait_ms > 0`; timeout is an empty success.
+    /// Parks only when the inbox is empty and `wait_ms > 0`; timeout is an
+    /// empty success.
     ///
     /// Fails [`crate::errors::MailboxError::TooManyWaiters`] when
     /// [`MAX_WAITERS_PER_AGENT`] pulls are already parked for this name.
@@ -319,14 +334,12 @@ impl Bus {
         &self,
         name: &crate::names::AgentName,
         wait_ms: u32,
-        ack_ids: Vec<String>,
     ) -> Result<InboxPage, MailErr> {
         let mut g = self.lock_open().await?;
         ensure_registered(&g, name.as_str())?;
-        delete_acked(&mut g, name.as_str(), &ack_ids)?;
         touch_last_seen(&mut g, name.as_str())?;
 
-        if let Some(page) = deliver_locked(&mut g, name.as_str())? {
+        if let Some(page) = take_locked(&mut g, name.as_str())? {
             return Ok(page);
         }
         if wait_ms == 0 {
@@ -356,7 +369,7 @@ impl Bus {
             ensure_registered(&g, name.as_str())?;
             // The agent was waiting all along; record when the pull ended.
             touch_last_seen(&mut g, name.as_str())?;
-            if let Some(page) = deliver_locked(&mut g, name.as_str())? {
+            if let Some(page) = take_locked(&mut g, name.as_str())? {
                 return Ok(page);
             }
             if tokio::time::Instant::now() >= deadline {
@@ -365,21 +378,76 @@ impl Bus {
         }
     }
 
-    /// Acknowledge-and-delete only (REST `POST /inboxes/{agent}/ack`).
-    /// Returns how many matching `in_flight` rows owned by `name` were
-    /// removed. Unknown ids are ignored (idempotent). Delivers nothing.
-    pub async fn ack(
-        &self,
-        name: &crate::names::AgentName,
-        ack_ids: Vec<String>,
-    ) -> Result<i64, MailErr> {
-        let mut g = self.lock_open().await?;
-        ensure_registered(&g, name.as_str())?;
-        delete_acked(&mut g, name.as_str(), &ack_ids)
+    /// Expire unread mail older than [`Retention::message_ttl`] and drop
+    /// agents not seen within [`Retention::agent_ttl`] (with their unread
+    /// inbox), as of now. The daemon runs this on a timer; see
+    /// [`sweep_at`](Self::sweep_at).
+    pub async fn sweep(&self) -> Result<SweepOutcome, MailErr> {
+        self.sweep_at(SystemTime::now()).await
     }
 
-    /// Roster size and total message row count (both states), for `/health`.
-    /// Does not promote, ack, or touch `last_seen`.
+    /// [`sweep`](Self::sweep) as of `now` (injectable for tests).
+    ///
+    /// An agent with a pull parked right now is never dropped, however old
+    /// its `last_seen`. When anything was deleted the write-ahead log is
+    /// truncated so the removed text does not linger on disk.
+    pub async fn sweep_at(&self, now: SystemTime) -> Result<SweepOutcome, MailErr> {
+        let mut g = self.lock_open().await?;
+        let cutoff =
+            |ttl: Duration| rfc3339(now.checked_sub(ttl).unwrap_or(SystemTime::UNIX_EPOCH));
+        let (message_cutoff, agent_cutoff) = (
+            cutoff(self.retention.message_ttl),
+            cutoff(self.retention.agent_ttl),
+        );
+        let stale: Vec<String> = {
+            let mut stmt = g
+                .conn
+                .prepare("SELECT name FROM roster WHERE last_seen < ?1 ORDER BY name")
+                .map_err(sqlite_storage)?;
+            let names = stmt
+                .query_map(params![agent_cutoff], |r| r.get::<_, String>(0))
+                .map_err(sqlite_storage)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(sqlite_storage)?;
+            names
+        };
+        let dropped: Vec<String> = stale
+            .into_iter()
+            .filter(|n| !has_live_waiter(&g.waiters, n))
+            .collect();
+
+        let tx = g.conn.transaction().map_err(sqlite_storage)?;
+        let expired = tx
+            .execute(
+                "DELETE FROM messages WHERE created_at < ?1",
+                params![message_cutoff],
+            )
+            .map_err(sqlite_storage)? as i64;
+        let mut discarded = 0i64;
+        for name in &dropped {
+            discarded += tx
+                .execute("DELETE FROM messages WHERE recipient = ?1", params![name])
+                .map_err(sqlite_storage)? as i64;
+            tx.execute("DELETE FROM roster WHERE name = ?1", params![name])
+                .map_err(sqlite_storage)?;
+        }
+        tx.commit().map_err(sqlite_storage)?;
+        for name in &dropped {
+            g.waiters.remove(name);
+        }
+        let out = SweepOutcome {
+            expired,
+            discarded,
+            dropped_agents: dropped,
+        };
+        if !out.is_empty() {
+            truncate_wal(&g.conn);
+        }
+        Ok(out)
+    }
+
+    /// Roster size and unread message count, for `/health`. Does not deliver
+    /// anything or touch `last_seen`.
     pub async fn stats(&self) -> Result<(i64, i64), MailErr> {
         let g = self.lock_open().await?;
         let agents: i64 = g
@@ -393,11 +461,21 @@ impl Bus {
         Ok((agents, pending))
     }
 
+    /// Delete every agent and message, then compact the database file and
+    /// truncate the write-ahead log so nothing is left on disk. The daemon
+    /// runs this at startup, which also clears whatever a crashed run left.
+    /// Returns `(messages, agents)` removed.
+    pub async fn clear(&self) -> Result<(i64, i64), MailErr> {
+        let mut g = self.lock_open().await?;
+        // Parked pulls fail unregistered: their names are gone.
+        g.waiters.clear();
+        clear_locked(&mut g)
+    }
+
     /// Mark the bus closed: every parked waiter fails `shutting_down` and no
     /// further operations are accepted. Then discard the whole mailbox —
-    /// roster and every pending/in_flight row — in one transaction, so a
-    /// restart starts completely clean (a bulk deregister of everyone).
-    /// Committed rows only survive a crash, never a graceful shutdown.
+    /// roster and every unread message — and scrub it from disk as
+    /// [`clear`](Self::clear) does, so nothing outlives the server run.
     ///
     /// Returns `Err` when the wipe transaction fails (rolled back); the bus
     /// is still closed either way.
@@ -405,20 +483,48 @@ impl Bus {
         let mut g = self.inner.lock().await;
         g.closed = true;
         g.waiters.clear(); // dropping senders wakes all parked pulls
-        let wipe_result = g.conn.transaction().and_then(|tx| {
-            tx.execute("DELETE FROM messages", [])?;
-            tx.execute("DELETE FROM roster", [])?;
-            tx.commit()
-        });
-        if let Err(e) = wipe_result {
+        clear_locked(&mut g).map(|_| ()).inspect_err(|_| {
             tracing::error!(
-                error = %e,
                 "shutdown: failed to discard mailbox transactionally; \
                  roster or messages may persist on disk"
             );
-            return Err(sqlite_storage(e));
-        }
-        Ok(())
+        })
+    }
+
+    /// Mark the bus closed like [`shutdown`](Self::shutdown) but keep the
+    /// roster and unread mail on disk (`MENTISCHAT_PERSIST=1`).
+    pub async fn close(&self) {
+        let mut g = self.inner.lock().await;
+        g.closed = true;
+        g.waiters.clear();
+    }
+}
+
+fn clear_locked(g: &mut Inner) -> Result<(i64, i64), MailErr> {
+    let tx = g.conn.transaction().map_err(sqlite_storage)?;
+    let messages = tx
+        .execute("DELETE FROM messages", [])
+        .map_err(sqlite_storage)? as i64;
+    let agents = tx
+        .execute("DELETE FROM roster", [])
+        .map_err(sqlite_storage)? as i64;
+    tx.commit().map_err(sqlite_storage)?;
+    // Best effort: the rows are gone either way; these shrink the file and
+    // drop the old pages and log frames that held them.
+    if let Err(e) = g.conn.execute_batch("VACUUM;") {
+        tracing::warn!(error = %e, "could not compact the database");
+    }
+    truncate_wal(&g.conn);
+    Ok((messages, agents))
+}
+
+/// Checkpoint the write-ahead log into the database and truncate it to zero
+/// bytes, so deleted message text is not left behind in the `-wal` file
+/// (`secure_delete` already zeroes it in the database pages). Best effort: a
+/// failure is logged, never surfaced, because the rows are already gone.
+pub(super) fn truncate_wal(conn: &rusqlite::Connection) {
+    if let Err(e) = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())) {
+        tracing::warn!(error = %e, "could not truncate the write-ahead log");
     }
 }
 

@@ -26,6 +26,13 @@ pub(super) fn wake_one(q: &mut VecDeque<Waiter>) {
     }
 }
 
+/// True when a pull is parked for `name` right now (its client still there).
+pub(super) fn has_live_waiter(waiters: &WaiterMap, name: &str) -> bool {
+    waiters
+        .get(name)
+        .is_some_and(|q| q.iter().any(|w| !w.tx.is_closed()))
+}
+
 /// Park a fresh waiter for `name`, enforcing the per-name cap.
 ///
 /// Returns `(waiter id, receiver)`; the caller awaits the receiver outside

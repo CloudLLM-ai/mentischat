@@ -5,13 +5,14 @@
 //! REST surface, served from a single loopback port. Nothing wakes an idle
 //! agent: mail is read when its recipient calls `check_inbox`.
 //!
-//! The daemon is a pipe, not a log: undelivered mail persists in sqlite
-//! (`pending` / `in_flight`) until the recipient acks, then the row is
-//! deleted. There is no history API.
+//! The daemon is a pipe, not a log or a store: a message is deleted the
+//! moment its recipient reads it, unread mail expires after an hour, idle
+//! agents leave the roster after a day, and everything is wiped at startup
+//! and on a clean stop. There is no history API.
 //!
 //! The MCP wire protocol is supplied by the [`mcp`] crate (`cloudllm_mcp`);
-//! this crate owns mailbox semantics: roster, caps, ack/batch delivery, and
-//! blocking pulls.
+//! this crate owns mailbox semantics: roster, caps, delete-on-read batches,
+//! expiry, and blocking pulls.
 
 // The data directory permissions (0700/0600) and SIGTERM handling use
 // Unix-only APIs, so say so at compile time instead of failing with a wall of
@@ -62,7 +63,7 @@ pub const BIND_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 
 pub fn build_router(bus: Arc<bus::Bus>) -> axum::Router {
     let transport = StreamableHttpConfig::new(SERVER_NAME, SERVER_VERSION)
         .with_endpoint_path("/")
-        .with_instructions(tools::INSTRUCTIONS);
+        .with_instructions(tools::instructions(&bus.retention()));
 
     // These two entries are the whole allowlist. Swallowing a rejection here
     // would silently ship a filter that does not say what we think it says,

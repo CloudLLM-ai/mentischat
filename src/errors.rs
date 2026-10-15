@@ -14,8 +14,8 @@ use serde_json::{json, Value};
 pub enum MailboxError {
     /// Name fails the roster regex.
     InvalidName { agent: String },
-    /// Missing / non-string / whitespace-only / oversized body, or a
-    /// malformed `ack_ids` array.
+    /// Missing / non-string / whitespace-only / oversized body, a body that
+    /// is not JSON, or a malformed flag such as `exclusive`.
     InvalidBody,
     /// `wait_ms` present but not an integer in `0..=30000`.
     InvalidWait,
@@ -28,7 +28,7 @@ pub enum MailboxError {
     /// An `exclusive` register named an agent that is already on the roster.
     /// Carries the current roster so the caller can pick a free name.
     NameTaken { agent: String, known: Vec<String> },
-    /// That recipient already holds `MAX_PENDING_PER_AGENT` unacked rows.
+    /// That recipient already holds `MAX_PENDING_PER_AGENT` unread messages.
     QueueFull { to: String, pending: i64 },
     /// Global row cap hit.
     StorageFull { pending: i64 },

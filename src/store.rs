@@ -39,6 +39,10 @@ pub fn open(data_dir: &Path) -> Result<Connection, StoreError> {
     // a few local agents, so the extra fsync is not felt.
     conn.pragma_update(None, "synchronous", "FULL")
         .map_err(StoreError::Sqlite)?;
+    // Overwrite deleted content with zeros instead of leaving it in free
+    // pages: read and expired messages must not be recoverable from the file.
+    conn.pragma_update(None, "secure_delete", "ON")
+        .map_err(StoreError::Sqlite)?;
 
     conn.execute_batch(
         r#"
@@ -54,16 +58,19 @@ pub fn open(data_dir: &Path) -> Result<Connection, StoreError> {
           recipient TEXT NOT NULL,
           body TEXT NOT NULL,
           created_at TEXT NOT NULL,
-          seq INTEGER NOT NULL,
-          state TEXT NOT NULL CHECK (state IN ('pending', 'in_flight'))
+          seq INTEGER NOT NULL
         );
-
-        CREATE INDEX IF NOT EXISTS idx_inbox ON messages (recipient, state, seq);
         "#,
     )
     .map_err(StoreError::Sqlite)?;
 
     migrate_roster(&conn).map_err(StoreError::Sqlite)?;
+    migrate_messages(&conn).map_err(StoreError::Sqlite)?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_inbox ON messages (recipient, seq);
+         CREATE INDEX IF NOT EXISTS idx_created ON messages (created_at);",
+    )
+    .map_err(StoreError::Sqlite)?;
     Ok(conn)
 }
 
@@ -87,6 +94,38 @@ fn migrate_roster(conn: &Connection) -> Result<(), rusqlite::Error> {
         conn.execute("ALTER TABLE roster ADD COLUMN description TEXT", [])?;
     }
     Ok(())
+}
+
+/// Brings a `messages` table from the acknowledge-to-delete era up to the
+/// delete-on-read shape: the `state` column (and the index over it) goes,
+/// keeping every unread row. SQLite cannot drop a column a CHECK constraint
+/// names, so the table is rebuilt in one transaction.
+fn migrate_messages(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let has_state = conn
+        .prepare("PRAGMA table_info(messages)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .any(|c| c == "state");
+    if !has_state {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "BEGIN;
+         CREATE TABLE messages_new (
+           id TEXT PRIMARY KEY,
+           sender TEXT NOT NULL,
+           recipient TEXT NOT NULL,
+           body TEXT NOT NULL,
+           created_at TEXT NOT NULL,
+           seq INTEGER NOT NULL
+         );
+         INSERT INTO messages_new (id, sender, recipient, body, created_at, seq)
+           SELECT id, sender, recipient, body, created_at, seq FROM messages;
+         DROP TABLE messages;
+         ALTER TABLE messages_new RENAME TO messages;
+         COMMIT;",
+    )
 }
 
 /// Failure modes of opening/migrating the store.

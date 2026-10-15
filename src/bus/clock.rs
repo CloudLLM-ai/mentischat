@@ -4,9 +4,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Current time as UTC RFC 3339 with millisecond precision.
 pub fn now_rfc3339() -> String {
-    let d = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
+    rfc3339(SystemTime::now())
+}
+
+/// `t` as UTC RFC 3339 with millisecond precision. The fixed width makes these
+/// strings sort in time order, which the expiry sweep relies on.
+pub fn rfc3339(t: SystemTime) -> String {
+    let d = t.duration_since(UNIX_EPOCH).unwrap_or_default();
     let secs = d.as_secs();
     let millis = d.subsec_millis();
     let (year, month, day) = civil_from_days((secs / 86_400) as i64);

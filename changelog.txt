@@ -1,5 +1,26 @@
 UNRELEASED
 
+  - feat(bus)!: read once, then gone. check_inbox deletes the batch it returns,
+    in the same transaction, so each message is delivered exactly once and
+    nothing is kept. The ack step is removed: the in_flight state, the
+    check_inbox ack_ids parameter and POST /inboxes/{agent}/ack are gone (old
+    databases are migrated, keeping unread rows). A truncated tool result or
+    a dropped connection after delivery now loses that batch instead of
+    redelivering it.
+
+  - feat(bus): short-lived mail. Unread messages expire after
+    MENTISCHAT_MESSAGE_TTL (default 1h) and agents idle past
+    MENTISCHAT_AGENT_TTL (default 24h) leave the roster with their unread mail
+    (never while a pull is parked); the daemon sweeps every minute. Values are
+    seconds or a number with s/m/h/d. The MCP instructions tell agents both
+    lifetimes.
+
+  - feat(store): nothing persists. The roster and all mail are wiped at
+    startup (clearing whatever a crashed run left) as well as on a clean stop;
+    MENTISCHAT_PERSIST=1 keeps them. Deleted text is overwritten
+    (secure_delete), the WAL is truncated after every read, sweep and wipe,
+    and a wipe compacts the file (VACUUM).
+
   - fix(bus): a blocking pull that took a send's wake-up and was then
     cancelled (client gone) swallowed it, leaving the other pulls parked
     under that name asleep until their timeout with mail waiting; it now

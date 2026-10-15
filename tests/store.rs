@@ -180,3 +180,42 @@ fn fully_migrated_db_reopens_without_error() {
     drop(mentischat::store::open(&data).expect("first open"));
     mentischat::store::open(&data).expect("second open is a no-op migration");
 }
+
+#[test]
+fn messages_lose_the_ack_state_column_keeping_unread_rows() {
+    let schema = format!(
+        r#"
+        CREATE TABLE roster (name TEXT PRIMARY KEY, last_seen TEXT NOT NULL);
+        {MESSAGES_TABLE}
+        CREATE INDEX idx_inbox ON messages (recipient, state, seq);
+        INSERT INTO messages VALUES
+          ('m1', 'a', 'b', 'was in flight', '2026-01-01T00:00:00.000Z', 1, 'in_flight'),
+          ('m2', 'a', 'b', 'was pending', '2026-01-01T00:00:01.000Z', 2, 'pending');
+        "#
+    );
+    let (_dir, data) = seeded("ack_era", &schema);
+
+    mentischat::store::open(&data).expect("open rebuilds messages");
+
+    let conn = Connection::open(data.join("pending.sqlite")).expect("reopen");
+    let cols: Vec<String> = conn
+        .prepare("PRAGMA table_info(messages)")
+        .unwrap()
+        .query_map([], |r| r.get(1))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        cols,
+        ["id", "sender", "recipient", "body", "created_at", "seq"]
+    );
+    let bodies: Vec<String> = conn
+        .prepare("SELECT body FROM messages ORDER BY seq")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(bodies, ["was in flight", "was pending"]);
+    assert_eq!(index_count(&conn, "idx_inbox"), 1, "index rebuilt");
+}

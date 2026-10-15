@@ -1,4 +1,4 @@
-//! Bus behavior tests: roster semantics, caps, batch+ack delivery, waiter
+//! Bus behavior tests: roster semantics, caps, delete-on-read delivery, waiter
 //! races, crash recovery, and mutex stress — all in-process against tempdirs.
 
 use std::sync::Arc;
@@ -19,7 +19,7 @@ fn fresh_bus(tag: &str) -> (tempfile::TempDir, Arc<Bus>) {
 }
 
 #[tokio::test]
-async fn register_is_idempotent_and_keeps_unacked_rows() {
+async fn register_is_idempotent_and_keeps_unread_mail() {
     let (_d, bus) = fresh_bus("idem");
     bus.register(&name("grok")).await.unwrap();
     bus.register(&name("opencode")).await.unwrap();
@@ -30,7 +30,7 @@ async fn register_is_idempotent_and_keeps_unacked_rows() {
     let again = bus.register(&name("grok")).await.unwrap();
     assert!(!again.created);
 
-    let page = bus.check_inbox(&name("grok"), 0, vec![]).await.unwrap();
+    let page = bus.check_inbox(&name("grok"), 0).await.unwrap();
     assert_eq!(page.messages.len(), 1, "queue survived re-register");
 }
 
@@ -47,7 +47,7 @@ async fn send_between_two_names() {
     assert_eq!(receipt.from, "a");
     assert_eq!(receipt.to, "b");
 
-    let page = bus.check_inbox(&name("b"), 0, vec![]).await.unwrap();
+    let page = bus.check_inbox(&name("b"), 0).await.unwrap();
     assert_eq!(page.messages.len(), 1);
     assert_eq!(page.messages[0].body, "hello");
     assert_eq!(page.messages[0].from, "a");
@@ -55,43 +55,17 @@ async fn send_between_two_names() {
 }
 
 #[tokio::test]
-async fn unacked_pull_redelivers_same_ids() {
-    let (_d, bus) = fresh_bus("redeliver");
+async fn a_read_message_is_gone() {
+    let (_d, bus) = fresh_bus("readonce");
     bus.register(&name("a")).await.unwrap();
     bus.register(&name("b")).await.unwrap();
     bus.send(&name("a"), &name("b"), "m1".into()).await.unwrap();
 
-    let p1 = bus.check_inbox(&name("b"), 0, vec![]).await.unwrap();
-    let p2 = bus.check_inbox(&name("b"), 0, vec![]).await.unwrap();
-    assert_eq!(
-        p1.messages[0].id, p2.messages[0].id,
-        "in_flight redelivered"
-    );
-}
-
-#[tokio::test]
-async fn ack_deletes_then_promotes_next_batch() {
-    let (_d, bus) = fresh_bus("ack");
-    bus.register(&name("a")).await.unwrap();
-    bus.register(&name("b")).await.unwrap();
-    for i in 0..3 {
-        bus.send(&name("a"), &name("b"), format!("m{i}"))
-            .await
-            .unwrap();
-    }
-
-    let p1 = bus.check_inbox(&name("b"), 0, vec![]).await.unwrap();
-    assert_eq!(p1.messages.len(), 3);
-
-    let ack_ids = vec![p1.messages[0].id.clone()];
-    let p2 = bus.check_inbox(&name("b"), 0, ack_ids).await.unwrap();
-    assert_eq!(p2.messages.len(), 2, "acked id deleted, rest redelivered");
-    assert!(p2.messages.iter().all(|m| m.id != p1.messages[0].id));
-
-    // Ack everything; inbox empties.
-    let all: Vec<String> = p2.messages.iter().map(|m| m.id.clone()).collect();
-    let p3 = bus.check_inbox(&name("b"), 0, all).await.unwrap();
-    assert!(p3.messages.is_empty());
+    let p1 = bus.check_inbox(&name("b"), 0).await.unwrap();
+    assert_eq!(p1.messages.len(), 1);
+    let p2 = bus.check_inbox(&name("b"), 0).await.unwrap();
+    assert!(p2.messages.is_empty(), "delivered once, then deleted");
+    assert_eq!(bus.stats().await.unwrap(), (2, 0), "nothing kept");
 }
 
 #[tokio::test]
@@ -105,12 +79,11 @@ async fn batch_cap_reports_remaining() {
             .unwrap();
     }
 
-    let p1 = bus.check_inbox(&name("b"), 0, vec![]).await.unwrap();
+    let p1 = bus.check_inbox(&name("b"), 0).await.unwrap();
     assert_eq!(p1.messages.len(), 8, "MAX_BATCH");
     assert_eq!(p1.remaining, 2);
 
-    let acks: Vec<String> = p1.messages.iter().map(|m| m.id.clone()).collect();
-    let p2 = bus.check_inbox(&name("b"), 0, acks).await.unwrap();
+    let p2 = bus.check_inbox(&name("b"), 0).await.unwrap();
     assert_eq!(p2.messages.len(), 2);
     assert_eq!(p2.remaining, 0);
 }
@@ -126,7 +99,7 @@ async fn oversized_first_message_still_delivers() {
         .await
         .unwrap();
 
-    let page = bus.check_inbox(&name("b"), 0, vec![]).await.unwrap();
+    let page = bus.check_inbox(&name("b"), 0).await.unwrap();
     assert_eq!(page.messages.len(), 1, "oversized first rides alone");
     assert_eq!(page.remaining, 1);
 }
@@ -148,10 +121,7 @@ async fn unregistered_operations_fail_with_known_roster() {
         other => panic!("expected unregistered, got {other:?}"),
     }
 
-    let err = bus
-        .check_inbox(&name("nobody"), 0, vec![])
-        .await
-        .unwrap_err();
+    let err = bus.check_inbox(&name("nobody"), 0).await.unwrap_err();
     assert!(matches!(err, MailboxError::Unregistered { .. }));
 
     let err = bus.deregister(&name("nobody")).await.unwrap_err();
@@ -236,7 +206,7 @@ async fn immediate_delivery_beats_wait() {
         .await
         .unwrap();
     let started = std::time::Instant::now();
-    let page = bus.check_inbox(&name("b"), 30_000, vec![]).await.unwrap();
+    let page = bus.check_inbox(&name("b"), 30_000).await.unwrap();
     assert_eq!(page.messages.len(), 1);
     assert!(started.elapsed() < std::time::Duration::from_secs(1));
 }
@@ -248,12 +218,7 @@ async fn parked_waiter_wakes_on_send() {
     bus.register(&name("b")).await.unwrap();
 
     let puller = bus.clone();
-    let task = tokio::spawn(async move {
-        puller
-            .check_inbox(&name("b"), 15_000, vec![])
-            .await
-            .unwrap()
-    });
+    let task = tokio::spawn(async move { puller.check_inbox(&name("b"), 15_000).await.unwrap() });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     bus.send(&name("a"), &name("b"), "wake up".into())
         .await
@@ -270,7 +235,7 @@ async fn timeout_is_empty_success_and_mail_survives_it() {
     bus.register(&name("a")).await.unwrap();
     bus.register(&name("b")).await.unwrap();
 
-    let page = bus.check_inbox(&name("b"), 150, vec![]).await.unwrap();
+    let page = bus.check_inbox(&name("b"), 150).await.unwrap();
     assert!(page.messages.is_empty());
     assert_eq!(page.remaining, 0);
 
@@ -278,7 +243,7 @@ async fn timeout_is_empty_success_and_mail_survives_it() {
     bus.send(&name("a"), &name("b"), "late".into())
         .await
         .unwrap();
-    let page = bus.check_inbox(&name("b"), 0, vec![]).await.unwrap();
+    let page = bus.check_inbox(&name("b"), 0).await.unwrap();
     assert_eq!(page.messages.len(), 1);
 }
 
@@ -289,9 +254,9 @@ async fn only_oldest_waiter_gets_the_batch() {
     bus.register(&name("b")).await.unwrap();
 
     let b1 = bus.clone();
-    let t1 = tokio::spawn(async move { b1.check_inbox(&name("b"), 5_000, vec![]).await });
+    let t1 = tokio::spawn(async move { b1.check_inbox(&name("b"), 5_000).await });
     let b2 = bus.clone();
-    let t2 = tokio::spawn(async move { b2.check_inbox(&name("b"), 5_000, vec![]).await });
+    let t2 = tokio::spawn(async move { b2.check_inbox(&name("b"), 500).await });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     bus.send(&name("a"), &name("b"), "just one".into())
@@ -301,10 +266,8 @@ async fn only_oldest_waiter_gets_the_batch() {
     let p1 = t1.await.unwrap().unwrap();
     let p2 = t2.await.unwrap().unwrap();
     assert_eq!(p1.messages.len(), 1);
-    // Shared-name rule: unacked in_flight belongs to the name, not the
-    // window — B's pull redelivers A's unacked batch until someone acks.
-    assert_eq!(p2.messages.len(), 1);
-    assert_eq!(p1.messages[0].id, p2.messages[0].id);
+    // Read means gone: the other pull under the same name times out empty.
+    assert!(p2.messages.is_empty());
 }
 
 #[tokio::test]
@@ -317,13 +280,13 @@ async fn ninth_waiter_fails_too_many_waiters() {
     for _ in 0..8 {
         let b = bus.clone();
         tasks.push(tokio::spawn(async move {
-            b.check_inbox(&name("b"), 2_000, vec![]).await
+            b.check_inbox(&name("b"), 2_000).await
         }));
     }
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     // The ninth pull attempts to park, which is what trips the cap.
-    let ninth = bus.check_inbox(&name("b"), 2_000, vec![]).await;
+    let ninth = bus.check_inbox(&name("b"), 2_000).await;
     match ninth {
         Err(MailboxError::TooManyWaiters { agent, waiting }) => {
             assert_eq!(agent, "b");
@@ -345,7 +308,7 @@ async fn deregister_rejects_parked_waiters_as_unregistered() {
     bus.register(&name("b")).await.unwrap();
 
     let b = bus.clone();
-    let task = tokio::spawn(async move { b.check_inbox(&name("b"), 10_000, vec![]).await });
+    let task = tokio::spawn(async move { b.check_inbox(&name("b"), 10_000).await });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     bus.deregister(&name("b")).await.unwrap();
 
@@ -369,7 +332,7 @@ async fn deregister_discards_inbox_but_keeps_sent_rows() {
     let out = bus.deregister(&name("leaver")).await.unwrap();
     assert_eq!(out.discarded, 1, "only leaver's inbox dropped");
 
-    let page = bus.check_inbox(&name("stayer"), 0, vec![]).await.unwrap();
+    let page = bus.check_inbox(&name("stayer"), 0).await.unwrap();
     assert_eq!(page.messages.len(), 1, "mail leaver sent survives");
 }
 
@@ -389,11 +352,11 @@ async fn crash_reopen_preserves_roster_and_rows() {
     let bus = Bus::new(&data).unwrap();
     let roster = bus.list_agents().await.unwrap();
     assert_eq!(roster.len(), 2, "roster survives a crash (no shutdown)");
-    let page = bus.check_inbox(&name("b"), 0, vec![]).await.unwrap();
+    let page = bus.check_inbox(&name("b"), 0).await.unwrap();
     assert_eq!(
         page.messages.len(),
         1,
-        "unacked mail survives a crash (no shutdown)"
+        "unread mail survives a crash when nothing clears it"
     );
 }
 
@@ -435,31 +398,21 @@ async fn concurrent_send_check_never_dups_or_drops() {
             b.send(&name("sender"), &name("receiver"), format!("m{i}"))
                 .await
                 .unwrap();
-            b.check_inbox(&name("receiver"), 0, Vec::new())
-                .await
-                .unwrap()
+            b.check_inbox(&name("receiver"), 0).await.unwrap()
         }));
     }
+    // Delete-on-read is exactly-once: no id may ever arrive twice.
     for t in tasks {
         for msg in t.await.unwrap().messages {
-            let id = msg.id;
-            seen.insert(id.clone());
+            assert!(seen.insert(msg.id), "duplicate delivery");
         }
     }
-    // Drain everything left, acking the previous batch on every pull.
-    // At-least-once allows the SAME id to arrive more than once while
-    // unacked; the invariant is: distinct ids == N, and nothing outside N.
-    let mut acks: Vec<String> = Vec::new();
     loop {
-        let page = bus
-            .check_inbox(&name("receiver"), 0, std::mem::take(&mut acks))
-            .await
-            .unwrap();
-        acks = page.messages.iter().map(|m| m.id.clone()).collect();
-        for id in &acks {
-            seen.insert(id.clone());
+        let page = bus.check_inbox(&name("receiver"), 0).await.unwrap();
+        for msg in &page.messages {
+            assert!(seen.insert(msg.id.clone()), "duplicate delivery");
         }
-        if acks.is_empty() && page.remaining == 0 {
+        if page.messages.is_empty() && page.remaining == 0 {
             break;
         }
     }
@@ -471,7 +424,7 @@ async fn shutdown_rejects_waiters() {
     let (_d, bus) = fresh_bus("shutdown");
     bus.register(&name("b")).await.unwrap();
     let b = bus.clone();
-    let task = tokio::spawn(async move { b.check_inbox(&name("b"), 10_000, vec![]).await });
+    let task = tokio::spawn(async move { b.check_inbox(&name("b"), 10_000).await });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     bus.shutdown().await.unwrap();
     let err = task.await.unwrap().unwrap_err();
@@ -494,7 +447,7 @@ async fn aborted_inbox_waiter_does_not_starve_the_next_one() {
     // Park a pull and kill its task mid-park: the receiver is dropped while
     // the waiter still sits in the queue.
     let b = bus.clone();
-    let first = tokio::spawn(async move { b.check_inbox(&name("b"), 30_000, vec![]).await });
+    let first = tokio::spawn(async move { b.check_inbox(&name("b"), 30_000).await });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     first.abort();
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -505,7 +458,7 @@ async fn aborted_inbox_waiter_does_not_starve_the_next_one() {
 
     // The next parked pull must be woken promptly, not after its full wait.
     let started = std::time::Instant::now();
-    let page = bus.check_inbox(&name("b"), 30_000, vec![]).await.unwrap();
+    let page = bus.check_inbox(&name("b"), 30_000).await.unwrap();
     assert_eq!(page.messages.len(), 1);
     assert!(
         started.elapsed() < std::time::Duration::from_secs(5),
@@ -532,8 +485,8 @@ async fn roster_honors_max_agents() {
 }
 
 #[tokio::test]
-async fn in_flight_redelivery_reports_remaining_unacked() {
-    let (_d, bus) = fresh_bus("inflightremain");
+async fn remaining_counts_what_the_next_pull_will_get() {
+    let (_d, bus) = fresh_bus("remaining");
     bus.register(&name("a")).await.unwrap();
     bus.register(&name("b")).await.unwrap();
     // Three mid-size bodies: first pull takes two (12 KiB), leaves one pending.
@@ -543,43 +496,14 @@ async fn in_flight_redelivery_reports_remaining_unacked() {
             .await
             .unwrap();
     }
-    let p1 = bus.check_inbox(&name("b"), 0, vec![]).await.unwrap();
+    let p1 = bus.check_inbox(&name("b"), 0).await.unwrap();
     assert_eq!(p1.messages.len(), 2);
     assert_eq!(p1.remaining, 1);
 
-    // Redeliver without ack: still two in_flight in the page, one pending left.
-    let p2 = bus.check_inbox(&name("b"), 0, vec![]).await.unwrap();
-    assert_eq!(p2.messages.len(), 2);
-    assert_eq!(p2.remaining, 1);
-    assert_eq!(p1.messages[0].id, p2.messages[0].id);
-}
-
-#[tokio::test]
-async fn ack_deletes_only_in_flight_rows_owned_by_the_caller() {
-    let (_d, bus) = fresh_bus("acktx");
-    bus.register(&name("a")).await.unwrap();
-    bus.register(&name("b")).await.unwrap();
-    bus.send(&name("a"), &name("b"), "one".into())
-        .await
-        .unwrap();
-    bus.send(&name("a"), &name("b"), "two".into())
-        .await
-        .unwrap();
-
-    let page = bus.check_inbox(&name("b"), 0, vec![]).await.unwrap();
-    assert_eq!(page.messages.len(), 2);
-    let ids: Vec<String> = page.messages.iter().map(|m| m.id.clone()).collect();
-
-    // Unknown ids and a foreign owner are ignored; the batch still commits.
-    let mut mixed = ids.clone();
-    mixed.push("not-a-real-id".into());
-    assert_eq!(bus.ack(&name("a"), ids.clone()).await.unwrap(), 0);
-    assert_eq!(bus.ack(&name("b"), mixed).await.unwrap(), 2);
-    assert_eq!(bus.ack(&name("b"), ids).await.unwrap(), 0, "idempotent");
-
-    let after = bus.check_inbox(&name("b"), 0, vec![]).await.unwrap();
-    assert!(after.messages.is_empty());
-    assert_eq!(after.remaining, 0);
+    let p2 = bus.check_inbox(&name("b"), 0).await.unwrap();
+    assert_eq!(p2.messages.len(), 1);
+    assert_eq!(p2.remaining, 0);
+    assert_ne!(p1.messages[0].id, p2.messages[0].id);
 }
 
 #[tokio::test]
@@ -606,7 +530,7 @@ async fn overview_reports_queue_depth_and_age_sorted_by_name() {
 }
 
 #[tokio::test]
-async fn overview_counts_messages_sent_even_after_they_are_acked_or_discarded() {
+async fn overview_counts_messages_sent_even_after_they_are_read_or_discarded() {
     let (_d, bus) = fresh_bus("overview_sent");
     bus.register(&name("a")).await.unwrap();
     bus.register(&name("b")).await.unwrap();
@@ -618,10 +542,8 @@ async fn overview_counts_messages_sent_even_after_they_are_acked_or_discarded() 
     bus.send(&name("a"), &name("b"), "two".into())
         .await
         .unwrap();
-    let page = bus.check_inbox(&name("b"), 0, vec![]).await.unwrap();
-    let ids = page.messages.iter().map(|m| m.id.clone()).collect();
-    bus.check_inbox(&name("b"), 0, ids).await.unwrap();
-    assert_eq!(bus.overview().await.unwrap().agents[1].queued, 0, "acked");
+    bus.check_inbox(&name("b"), 0).await.unwrap();
+    assert_eq!(bus.overview().await.unwrap().agents[1].queued, 0, "read");
 
     bus.send(&name("a"), &name("b"), "three".into())
         .await
@@ -630,7 +552,7 @@ async fn overview_counts_messages_sent_even_after_they_are_acked_or_discarded() 
     assert_eq!(
         bus.overview().await.unwrap().messages_sent,
         3,
-        "acked and discarded mail still counts as sent"
+        "read and discarded mail still counts as sent"
     );
 }
 
@@ -648,21 +570,19 @@ async fn overview_does_not_count_rejected_sends_or_reregistration() {
 }
 
 #[tokio::test]
-async fn overview_counts_in_flight_mail_and_never_consumes_it() {
-    let (_d, bus) = fresh_bus("overview_inflight");
+async fn overview_counts_unread_mail_and_never_consumes_it() {
+    let (_d, bus) = fresh_bus("overview_unread");
     bus.register(&name("a")).await.unwrap();
     bus.register(&name("b")).await.unwrap();
     bus.send(&name("a"), &name("b"), "hi".into()).await.unwrap();
-    let page = bus.check_inbox(&name("b"), 0, vec![]).await.unwrap();
-    assert_eq!(page.messages.len(), 1, "now in_flight, not yet acked");
 
     let before = bus.overview().await.unwrap();
     let again = bus.overview().await.unwrap();
     assert_eq!(before, again, "overview is read-only");
-    assert_eq!(before.agents[1].queued, 1, "unacked in_flight still counts");
+    assert_eq!(before.agents[1].queued, 1);
 
-    let redelivered = bus.check_inbox(&name("b"), 0, vec![]).await.unwrap();
-    assert_eq!(redelivered.messages.len(), 1);
+    let page = bus.check_inbox(&name("b"), 0).await.unwrap();
+    assert_eq!(page.messages.len(), 1, "still there for the recipient");
 }
 
 #[tokio::test]
@@ -775,7 +695,7 @@ async fn list_agents_reports_queue_depth_without_delivering() {
     let queued: Vec<(String, i64)> = roster.iter().map(|e| (e.name.clone(), e.queued)).collect();
     assert_eq!(queued, [("a".to_string(), 0), ("b".to_string(), 3)]);
 
-    let page = bus.check_inbox(&name("b"), 0, vec![]).await.unwrap();
+    let page = bus.check_inbox(&name("b"), 0).await.unwrap();
     assert_eq!(page.messages.len(), 3, "listing did not consume anything");
 }
 
@@ -791,7 +711,7 @@ async fn abandoned_blocking_pulls_do_not_fill_the_waiter_cap() {
     for _ in 0..8 {
         let b = bus.clone();
         tasks.push(tokio::spawn(async move {
-            b.check_inbox(&name("b"), 30_000, vec![]).await
+            b.check_inbox(&name("b"), 30_000).await
         }));
     }
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -804,7 +724,7 @@ async fn abandoned_blocking_pulls_do_not_fill_the_waiter_cap() {
 
     // A fresh blocking pull must still park, and be woken by a send.
     let b = bus.clone();
-    let pull = tokio::spawn(async move { b.check_inbox(&name("b"), 5_000, vec![]).await });
+    let pull = tokio::spawn(async move { b.check_inbox(&name("b"), 5_000).await });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     bus.send(&name("a"), &name("b"), "still reachable".into())
         .await
@@ -822,10 +742,10 @@ async fn a_cancelled_pull_hands_its_wake_to_the_next_waiter() {
     bus.register(&name("b")).await.unwrap();
 
     let b = bus.clone();
-    let first = tokio::spawn(async move { b.check_inbox(&name("b"), 10_000, vec![]).await });
+    let first = tokio::spawn(async move { b.check_inbox(&name("b"), 10_000).await });
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     let b = bus.clone();
-    let second = tokio::spawn(async move { b.check_inbox(&name("b"), 10_000, vec![]).await });
+    let second = tokio::spawn(async move { b.check_inbox(&name("b"), 10_000).await });
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
     bus.send(&name("a"), &name("b"), "for whoever is left".into())
@@ -851,17 +771,16 @@ async fn a_wake_with_nothing_left_keeps_waiting_until_the_deadline() {
 
     let b = bus.clone();
     let started = std::time::Instant::now();
-    let parked = tokio::spawn(async move { b.check_inbox(&name("b"), 400, vec![]).await });
+    let parked = tokio::spawn(async move { b.check_inbox(&name("b"), 400).await });
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
     // The send wakes the parked pull, but another pull under the same name
-    // takes and acks the message before the woken one gets the lock.
+    // takes the message before the woken one gets the lock.
     bus.send(&name("a"), &name("b"), "taken".into())
         .await
         .unwrap();
-    let page = bus.check_inbox(&name("b"), 0, vec![]).await.unwrap();
-    let ids: Vec<String> = page.messages.iter().map(|m| m.id.clone()).collect();
-    assert_eq!(bus.ack(&name("b"), ids).await.unwrap(), 1);
+    let page = bus.check_inbox(&name("b"), 0).await.unwrap();
+    assert_eq!(page.messages.len(), 1);
 
     let page = parked.await.unwrap().unwrap();
     assert!(page.messages.is_empty());
@@ -885,13 +804,13 @@ async fn batch_size_counts_escaped_json_not_raw_body_bytes() {
             .await
             .unwrap();
     }
-    let page = bus.check_inbox(&name("b"), 0, vec![]).await.unwrap();
+    let page = bus.check_inbox(&name("b"), 0).await.unwrap();
     assert_eq!(page.messages.len(), 1);
     assert_eq!(page.remaining, 1);
 }
 
 #[tokio::test]
-async fn delivery_order_survives_a_crash_and_acked_tail_rows() {
+async fn delivery_order_survives_a_crash() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("seq");
     let bus = Bus::new(&data).unwrap();
@@ -906,7 +825,195 @@ async fn delivery_order_survives_a_crash_and_acked_tail_rows() {
     bus.send(&name("a"), &name("b"), "second".into())
         .await
         .unwrap();
-    let page = bus.check_inbox(&name("b"), 0, vec![]).await.unwrap();
+    let page = bus.check_inbox(&name("b"), 0).await.unwrap();
     let bodies: Vec<&str> = page.messages.iter().map(|m| m.body.as_str()).collect();
     assert_eq!(bodies, ["first", "second"]);
+}
+
+fn bus_with(tag: &str, message_ttl: u64, agent_ttl: u64) -> (tempfile::TempDir, Arc<Bus>) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let retention = mentischat::bus::Retention {
+        message_ttl: std::time::Duration::from_secs(message_ttl),
+        agent_ttl: std::time::Duration::from_secs(agent_ttl),
+    };
+    let b = Bus::with_retention(&dir.path().join(tag), retention).expect("bus opens");
+    (dir, Arc::new(b))
+}
+
+fn later(secs: u64) -> std::time::SystemTime {
+    std::time::SystemTime::now() + std::time::Duration::from_secs(secs)
+}
+
+#[tokio::test]
+async fn unread_mail_expires_after_the_message_ttl() {
+    let (_d, bus) = bus_with("expire", 3600, 86_400);
+    bus.register(&name("a")).await.unwrap();
+    bus.register(&name("b")).await.unwrap();
+    bus.send(&name("a"), &name("b"), "read me soon".into())
+        .await
+        .unwrap();
+
+    let early = bus.sweep_at(later(59 * 60)).await.unwrap();
+    assert!(early.is_empty(), "{early:?}");
+    let late = bus.sweep_at(later(61 * 60)).await.unwrap();
+    assert_eq!(late.expired, 1);
+    assert!(late.dropped_agents.is_empty(), "agents are not idle yet");
+    assert!(bus
+        .check_inbox(&name("b"), 0)
+        .await
+        .unwrap()
+        .messages
+        .is_empty());
+}
+
+#[tokio::test]
+async fn idle_agents_drop_off_the_roster_with_their_unread_mail() {
+    let (_d, bus) = bus_with("idle", 2 * 86_400, 3600);
+    bus.register(&name("a")).await.unwrap();
+    bus.register(&name("b")).await.unwrap();
+    bus.send(&name("a"), &name("b"), "never read".into())
+        .await
+        .unwrap();
+
+    let out = bus.sweep_at(later(2 * 3600)).await.unwrap();
+    assert_eq!(out.dropped_agents, ["a", "b"]);
+    assert_eq!(out.discarded, 1);
+    assert_eq!(out.expired, 0);
+    assert_eq!(bus.stats().await.unwrap(), (0, 0));
+    assert!(matches!(
+        bus.check_inbox(&name("b"), 0).await,
+        Err(MailboxError::Unregistered { .. })
+    ));
+}
+
+#[tokio::test]
+async fn an_agent_with_a_parked_pull_is_never_dropped() {
+    let (_d, bus) = bus_with("parked", 3600, 3600);
+    bus.register(&name("a")).await.unwrap();
+    bus.register(&name("b")).await.unwrap();
+    let b = bus.clone();
+    let parked = tokio::spawn(async move { b.check_inbox(&name("b"), 2_000).await });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let out = bus.sweep_at(later(2 * 3600)).await.unwrap();
+    assert_eq!(out.dropped_agents, ["a"], "b is waiting right now");
+    bus.send(&name("b"), &name("b"), "still here".into())
+        .await
+        .unwrap();
+    assert_eq!(parked.await.unwrap().unwrap().messages.len(), 1);
+}
+
+#[tokio::test]
+async fn clear_wipes_everything_and_close_keeps_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("lifecycle");
+
+    let bus = Bus::new(&data).unwrap();
+    bus.register(&name("a")).await.unwrap();
+    bus.register(&name("b")).await.unwrap();
+    bus.send(&name("a"), &name("b"), "kept".into())
+        .await
+        .unwrap();
+    bus.close().await; // MENTISCHAT_PERSIST=1: nothing is wiped
+    assert!(matches!(bus.stats().await, Err(MailboxError::ShuttingDown)));
+    drop(bus);
+
+    let bus = Bus::new(&data).unwrap();
+    assert_eq!(bus.stats().await.unwrap(), (2, 1), "close kept the mailbox");
+    assert_eq!(bus.clear().await.unwrap(), (1, 2));
+    assert_eq!(bus.stats().await.unwrap(), (0, 0));
+}
+
+/// Every byte under the data directory, so a test can assert some text is
+/// nowhere on disk (database, `-wal`, `-shm`).
+fn disk_bytes(dir: &std::path::Path) -> Vec<u8> {
+    let mut all = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        all.extend(std::fs::read(entry.unwrap().path()).unwrap_or_default());
+    }
+    all
+}
+
+fn on_disk(dir: &std::path::Path, needle: &str) -> bool {
+    disk_bytes(dir)
+        .windows(needle.len())
+        .any(|w| w == needle.as_bytes())
+}
+
+#[tokio::test]
+async fn read_expired_and_shutdown_text_leaves_no_trace_on_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("scrub");
+    let bus = Bus::new(&data).unwrap();
+    bus.register(&name("a")).await.unwrap();
+    bus.register(&name("b")).await.unwrap();
+
+    bus.send(&name("a"), &name("b"), "READ-CANARY-4f1c".into())
+        .await
+        .unwrap();
+    assert!(on_disk(&data, "READ-CANARY-4f1c"), "unread mail is on disk");
+    bus.check_inbox(&name("b"), 0).await.unwrap();
+    assert!(
+        !on_disk(&data, "READ-CANARY-4f1c"),
+        "read mail lingered on disk"
+    );
+
+    bus.send(&name("a"), &name("b"), "EXPIRED-CANARY-9d2e".into())
+        .await
+        .unwrap();
+    bus.sweep_at(later(2 * 3600)).await.unwrap();
+    assert!(
+        !on_disk(&data, "EXPIRED-CANARY-9d2e"),
+        "expired mail lingered"
+    );
+
+    bus.register(&name("a")).await.unwrap();
+    bus.register(&name("b")).await.unwrap();
+    bus.send(&name("a"), &name("b"), "SHUTDOWN-CANARY-77aa".into())
+        .await
+        .unwrap();
+    bus.shutdown().await.unwrap();
+    assert!(
+        !on_disk(&data, "SHUTDOWN-CANARY-77aa"),
+        "shutdown left mail"
+    );
+}
+
+#[test]
+fn durations_parse_with_units_and_reject_junk() {
+    use mentischat::bus::parse_duration;
+    use std::time::Duration;
+    assert_eq!(parse_duration("90"), Ok(Duration::from_secs(90)));
+    assert_eq!(parse_duration("45s"), Ok(Duration::from_secs(45)));
+    assert_eq!(parse_duration("30m"), Ok(Duration::from_secs(1800)));
+    assert_eq!(parse_duration(" 1h "), Ok(Duration::from_secs(3600)));
+    assert_eq!(parse_duration("2d"), Ok(Duration::from_secs(172_800)));
+    for bad in [
+        "",
+        "0",
+        "0h",
+        "h",
+        "1.5h",
+        "-1",
+        "1w",
+        "1 h",
+        "99999999999999999999d",
+    ] {
+        assert!(parse_duration(bad).is_err(), "{bad:?} should not parse");
+    }
+}
+
+#[test]
+fn retention_defaults_and_sweep_interval() {
+    use mentischat::bus::Retention;
+    use std::time::Duration;
+    let r = Retention::from_settings(None, Some("")).unwrap();
+    assert_eq!(r, Retention::default());
+    assert_eq!(r.message_ttl, Duration::from_secs(3600));
+    assert_eq!(r.agent_ttl, Duration::from_secs(86_400));
+    assert_eq!(r.sweep_interval(), Duration::from_secs(60));
+    let short = Retention::from_settings(Some("20s"), None).unwrap();
+    assert_eq!(short.sweep_interval(), Duration::from_secs(5));
+    let err = Retention::from_settings(None, Some("forever")).unwrap_err();
+    assert!(err.contains("MENTISCHAT_AGENT_TTL"), "{err}");
 }

@@ -229,12 +229,11 @@ async fn send_and_pull_over_mcp_roundtrip() {
     let page: Value = serde_json::from_str(text).unwrap();
     assert_eq!(page["messages"][0]["body"], "ping");
 
-    // Ack via the next pull.
-    let id = page["messages"][0]["id"].as_str().unwrap().to_string();
+    // Read means gone: the next pull is empty.
     let (_, resp) = rpc(
         &app,
         "tools/call",
-        json!({ "name": "check_inbox", "arguments": { "agent": "codex", "wait_ms": 0, "ack_ids": [id] } }),
+        json!({ "name": "check_inbox", "arguments": { "agent": "codex", "wait_ms": 0 } }),
     )
     .await;
     let text = resp["result"]["content"][0]["text"].as_str().unwrap();
@@ -428,4 +427,31 @@ async fn dns_rebinding_host_gets_403() {
         let resp = app.clone().oneshot(get(loopback)).await.unwrap();
         assert_eq!(resp.status().as_u16(), 200, "Host {loopback}");
     }
+}
+
+#[tokio::test]
+async fn agents_are_told_reads_delete_and_unread_mail_expires() {
+    let (_d, app) = app();
+    let (_, init) = rpc(
+        &app,
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}),
+    )
+    .await;
+    let instructions = init["result"]["instructions"].as_str().unwrap();
+    assert!(
+        instructions.contains("deletes the messages it returns"),
+        "{instructions}"
+    );
+    assert!(
+        instructions.contains("expire 1 hour after"),
+        "{instructions}"
+    );
+    assert!(instructions.contains("for 1 day"), "{instructions}");
+    assert!(!instructions.contains("ack_ids"), "{instructions}");
+
+    let (_, list) = rpc(&app, "tools/list", json!({})).await;
+    let tools = list["result"]["tools"].as_array().unwrap();
+    let inbox = tools.iter().find(|t| t["name"] == "check_inbox").unwrap();
+    assert!(inbox["inputSchema"]["properties"].get("ack_ids").is_none());
 }

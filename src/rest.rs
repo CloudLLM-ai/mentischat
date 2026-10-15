@@ -28,7 +28,6 @@ pub fn router(bus: Ctx) -> Router {
         .route("/agents/{agent}", delete(deregister_one))
         .route("/messages", post(send_msg))
         .route("/inboxes/{agent}", get(pull))
-        .route("/inboxes/{agent}/ack", post(ack))
         .route("/health", get(health))
         .fallback(not_found)
         .with_state(bus)
@@ -145,7 +144,8 @@ async fn send_msg(State(bus): State<Ctx>, body: Result<Json<Value>, JsonRejectio
     }
 }
 
-/// `GET /inboxes/{agent}?wait_ms=` — check_inbox without ack.
+/// `GET /inboxes/{agent}?wait_ms=` — same as check_inbox: returned messages
+/// are deleted.
 async fn pull(
     State(bus): State<Ctx>,
     path: Result<Path<String>, PathRejection>,
@@ -162,32 +162,8 @@ async fn pull(
         Ok(w) => w,
         Err(e) => return err_response(e),
     };
-    match bus.check_inbox(&agent, wait_ms, Vec::new()).await {
+    match bus.check_inbox(&agent, wait_ms).await {
         Ok(page) => no_store_response(&page),
-        Err(e) => err_response(e),
-    }
-}
-
-/// `POST /inboxes/{agent}/ack` `{ "ids": [...] }` — ack only.
-async fn ack(
-    State(bus): State<Ctx>,
-    path: Result<Path<String>, PathRejection>,
-    body: Result<Json<Value>, JsonRejection>,
-) -> Response {
-    let agent = match path_name(path) {
-        Ok(a) => a,
-        Err(resp) => return resp,
-    };
-    let v = match json_body(body) {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
-    let ids = match crate::tools::parse_ack_ids(v.get("ids")) {
-        Ok(ids) => ids,
-        Err(e) => return err_response(e),
-    };
-    match bus.ack(&agent, ids).await {
-        Ok(acked) => ok_response(json!({ "agent": agent.to_string(), "acked": acked })),
         Err(e) => err_response(e),
     }
 }

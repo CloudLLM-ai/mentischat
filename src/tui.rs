@@ -456,39 +456,36 @@ impl Dashboard {
         }
     }
 
-    /// The footer: a green chip naming the focused pane, then that pane's keys
-    /// as yellow caps with white descriptions, on a black bar.
+    /// The footer: the focused pane's keys in white, each followed by its
+    /// description in gray, with no bar behind them.
     fn draw_hints(&self, f: &mut Frame, area: Rect) {
-        let bar = Style::new().bg(Color::Black).fg(Color::White);
-        let key = bold(Color::Black).bg(Color::Yellow);
-        let sep = Span::styled(" │ ", bar.fg(Color::Cyan).add_modifier(Modifier::BOLD));
+        let key = Style::new().fg(Color::White);
+        let sep = Span::styled("  ·  ", secondary());
         let hint = |keys: &'static str, what: &'static str| {
             [
                 Span::styled(keys, key),
-                Span::styled(format!(" {what}  "), bar),
+                Span::styled(format!(" {what}"), secondary()),
             ]
         };
-        let (label, pane_hints): (&str, Vec<[Span; 2]>) = match self.focus {
-            Focus::Logs => (
-                "Logs",
-                vec![
-                    hint("↑↓", "scroll"),
-                    hint("PgUp/PgDn", "page"),
-                    hint("End", "follow"),
-                ],
-            ),
-            Focus::Agents => ("Agents", vec![hint("↑↓", "select row")]),
+        let pane_hints: Vec<[Span; 2]> = match self.focus {
+            Focus::Logs => vec![
+                hint("↑↓", "scroll"),
+                hint("PgUp/PgDn", "page"),
+                hint("End", "follow"),
+            ],
+            Focus::Agents => vec![hint("↑↓", "select row")],
         };
-        let mut spans = vec![
-            Span::styled(format!(" {label} "), bold(Color::Black).bg(Color::Green)),
-            sep.clone(),
-        ];
-        for pair in pane_hints.into_iter().chain([hint("Tab", "next pane")]) {
+        let mut spans = Vec::new();
+        for pair in pane_hints
+            .into_iter()
+            .chain([hint("Tab", "next pane"), hint("q", "quit")])
+        {
+            if !spans.is_empty() {
+                spans.push(sep.clone());
+            }
             spans.extend(pair);
-            spans.push(sep.clone());
         }
-        spans.extend(hint("q", "quit"));
-        f.render_widget(Paragraph::new(Line::from(spans)).style(bar), area);
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     fn scroll(&mut self, up: bool, by: usize) {

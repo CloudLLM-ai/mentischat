@@ -460,42 +460,42 @@ fn scrollbars_appear_only_when_content_overflows() {
 }
 
 #[test]
-fn hint_bar_is_a_black_bar_with_a_green_pane_chip_and_yellow_keys() {
+fn key_guide_is_white_keys_and_gray_descriptions_with_no_bar() {
     let mut dash = sample();
     let buf = painted(&mut dash, 110, 36);
     let y = buf.area.height - 1;
-    assert!(
-        (0..buf.area.width).all(|x| buf[(x, y)].bg != Color::Reset),
-        "bar fills the row"
-    );
-    assert_eq!(buf[(buf.area.width - 1, y)].bg, Color::Black);
-
-    let (cx, _) = find(&buf, " Logs ");
-    let chip = &buf[(cx + 1, y)];
-    assert_eq!((chip.bg, chip.fg), (Color::Green, Color::Black));
-    let in_footer = |needle: &str| -> u16 {
-        let row = row_text(&buf, y);
-        let byte = row
-            .find(needle)
-            .unwrap_or_else(|| panic!("{needle:?} not in footer"));
-        row[..byte].chars().count() as u16
-    };
-    assert_eq!(buf[(in_footer("q quit"), y)].bg, Color::Yellow, "key cap");
-    assert_eq!(buf[(in_footer("│"), y)].fg, Color::Cyan, "separator");
-    assert_eq!(
-        buf[(in_footer("scroll"), y)].fg,
-        Color::White,
-        "description"
-    );
-
     let text = row_text(&buf, y);
-    assert!(text.contains("scroll") && text.contains("page") && text.contains("follow"));
+    let col = |needle: &str| -> u16 {
+        let byte = text
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} not in footer: {text:?}"));
+        text[..byte].chars().count() as u16
+    };
+
+    for key in ["↑↓", "PgUp/PgDn", "End", "Tab", "q"] {
+        assert_eq!(buf[(col(key), y)].fg, Color::White, "key {key:?}");
+    }
+    for description in ["scroll", "page", "follow", "next pane", "quit"] {
+        assert_eq!(
+            buf[(col(description), y)].fg,
+            Color::DarkGray,
+            "{description:?}"
+        );
+    }
+    assert_eq!(buf[(col("·"), y)].fg, Color::DarkGray, "separator");
+
+    // No bar, chip or key caps: nothing in the footer has a background.
+    assert!(
+        (0..buf.area.width).all(|x| buf[(x, y)].bg == Color::Reset),
+        "footer has no background color: {text:?}"
+    );
+    assert!(!text.contains("Logs") && !text.contains('│'), "{text:?}");
+
     dash.on_key(KeyCode::Tab, KeyModifiers::NONE);
     let text = row_text(&painted(&mut dash, 110, 36), y);
     assert!(
-        text.contains(" Agents ") && text.contains("select row"),
-        "{text}"
+        text.contains("select row") && !text.contains("follow"),
+        "{text:?}"
     );
-    assert!(!text.contains("follow"));
     assert!(text.contains("Tab") && text.contains("quit"));
 }

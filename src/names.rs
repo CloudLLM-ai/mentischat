@@ -35,15 +35,23 @@ impl AgentName {
         if head_ok && tail_ok && raw.len() <= 63 {
             Ok(Self(raw.to_string()))
         } else {
-            Err(MailboxError::InvalidName {
-                agent: raw.to_string(),
-            })
+            Err(MailboxError::InvalidName { agent: echo(raw) })
         }
     }
 
     /// The validated name.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// The rejected input as echoed in `invalid_name`: at most 64 characters, so
+/// a megabyte "name" is not sent straight back.
+fn echo(raw: &str) -> String {
+    const MAX_ECHO_CHARS: usize = 64;
+    match raw.char_indices().nth(MAX_ECHO_CHARS) {
+        Some((cut, _)) => format!("{}…", &raw[..cut]),
+        None => raw.to_string(),
     }
 }
 

@@ -357,3 +357,29 @@ async fn exclusive_register_of_a_taken_name_is_a_conflict() {
     .await;
     assert_eq!((s, v["error"].as_str()), (400, Some("invalid_body")));
 }
+
+#[tokio::test]
+async fn undecodable_paths_and_queries_get_contract_errors() {
+    let (_d, mut app) = app();
+    register_two(&mut app).await;
+    let (s, v) = send(&mut app, req("GET", "/inboxes/%FF")).await;
+    assert_eq!((s, v["error"].as_str()), (400, Some("invalid_name")), "{v}");
+    let (s, v) = send(&mut app, req("DELETE", "/agents/%FF%FE")).await;
+    assert_eq!((s, v["error"].as_str()), (400, Some("invalid_name")), "{v}");
+    let (s, v) = send(&mut app, req("GET", "/inboxes/b?wait_ms=%FF")).await;
+    assert_eq!((s, v["error"].as_str()), (400, Some("invalid_wait")), "{v}");
+}
+
+#[tokio::test]
+async fn invalid_name_echo_is_capped() {
+    let (_d, mut app) = app();
+    let huge = format!(r#"{{"agent":"-{}"}}"#, "x".repeat(100_000));
+    let (s, v) = send(&mut app, post("/agents", &huge)).await;
+    assert_eq!(s, 400);
+    assert_eq!(v["error"], "invalid_name");
+    assert!(
+        v["agent"].as_str().unwrap().chars().count() <= 65,
+        "{}",
+        v["agent"]
+    );
+}

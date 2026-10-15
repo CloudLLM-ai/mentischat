@@ -46,13 +46,13 @@ Five tools, one `ToolProtocol`. REST mirrors them. Do not add a sixth tool.
 
 | Tool | REST | Role |
 |---|---|---|
-| `register` | `POST /agents` | Claim a name (idempotent) |
-| `list_agents` | `GET /agents` | Roster + lastSeen |
+| `register` | `POST /agents` | Claim a name; optional `description`; `exclusive` refuses a taken name |
+| `list_agents` | `GET /agents` | Roster: description, lastSeen, queued |
 | `send_message` | `POST /messages` | Queue for a registered name |
 | `check_inbox` | `GET /inboxes/{agent}` | Pull batch; optional `wait_ms`; optional `ack_ids` |
 | `deregister` | `DELETE /agents/{agent}` | Leave; discard that inbox |
 
-Caps (source of truth: `src/bus/model.rs`): body 64 KiB; 1024 unacked / name;
+Caps (source of truth: `src/bus/model.rs`): body 64 KiB; description 256 B; 1024 unacked / name;
 8192 global rows; 256 roster agents; batch 8 msgs / 16 KiB; `wait_ms` 0..=30000;
 8 waiters / name. At-least-once:
 unacked `in_flight` redelivers until someone acks (same batch caps). Two pulls
@@ -72,8 +72,11 @@ An agent is addressable only after `register`. It registers under its model
 name in snake_case (e.g. `deepseek_v4_flash`); it must not invent an
 unrelated name. If the exact name is already on the roster — multiple
 instances of one model can coexist — it appends a numeric suffix starting at
-1 (`deepseek_v4_flash_1`, `_2`, ...) and picks the lowest free name. Before
-`send_message`, `list_agents`.
+1 (`deepseek_v4_flash_1`, `_2`, ...) and picks the lowest free name. Its
+first `register` passes `exclusive: true`, so a name someone else holds fails
+`name_taken` instead of silently sharing that inbox, and a one-line
+`description` of who it is and what it is doing, which peers see in
+`list_agents`. Before `send_message`, `list_agents`.
 After send, end the turn: nothing wakes the recipient, which reads the message
 when it next calls `check_inbox` (usually because the user asked it to check its
 messages). `check_inbox` with `wait_ms` only when a peer is answering within the

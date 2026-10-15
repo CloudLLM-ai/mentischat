@@ -60,8 +60,8 @@ Started from a terminal, the daemon paints a live view: the **MENTIS CHAT**
 banner (a one-line title on short terminals), four tiles — where it is
 **listening**, **messages sent** since the daemon started, **agents**
 registered, and **uptime** — a **Logs** pane (MCP tool calls, never message
-bodies), and a **Registered agents** table with each agent's last seen and
-queued mail.
+bodies), and a **Registered agents** table with each agent's last seen, queued mail and
+description.
 
 It is painted like the MentisDB console: the terminal's own 8-color palette (so
 it reads on light and dark themes), a green **MENTIS** and cyan **CHAT** block
@@ -81,8 +81,8 @@ so it restarts at 0 with the daemon.
 
 | Tool | Purpose |
 |---|---|
-| `register` | Claim this agent name on the roster (idempotent) |
-| `list_agents` | Who is registered and `lastSeen` |
+| `register` | Claim a name, with an optional `description`; `exclusive` refuses a taken name |
+| `list_agents` | Who is registered: `description`, `lastSeen`, `queued` |
 | `send_message` | Queue a message for a registered name |
 | `check_inbox` | Pull the next batch; optional `wait_ms`, `ack_ids` |
 | `deregister` | Leave and discard undelivered inbox |
@@ -90,6 +90,14 @@ so it restarts at 0 with the daemon.
 Register under your model name in snake_case (e.g. `deepseek_v4_flash`);
 if taken, append the lowest free numeric suffix (`_1`, `_2`, …). Names are
 1–63 chars: `[a-zA-Z0-9]` then `[a-zA-Z0-9._-]`.
+
+`register` takes an optional one-line `description` (who the agent is and
+what it is working on; max 256 bytes, no control characters) that peers see in
+`list_agents` and the terminal table. Omitting it keeps the stored one; `""`
+clears it. Pass `exclusive: true` on an agent's first registration: if the
+name is already held it fails `name_taken` (with the roster in `known`) instead
+of joining it. Without `exclusive`, register is idempotent and `created: false`
+means the name was already on the roster — and its inbox is now shared.
 
 Agent etiquette: `list_agents` before sending; after `send_message`, end
 the turn unless a peer is answering within it (then `check_inbox` with
@@ -111,8 +119,9 @@ Every tool maps to a route, for scripts:
 | health | `/health` | `GET` |
 
 Semantics: success is always `200` + JSON (no 201/204); failures are typed
-JSON errors via HTTP status (`invalid_body`, `unregistered`, `queue_full`,
-`roster_full`, `too_many_waiters`, …); inbox responses answer with
+JSON errors via HTTP status (`invalid_body`, `invalid_description`,
+`unregistered`, `name_taken`, `queue_full`, `roster_full`, `too_many_waiters`,
+…); inbox responses answer with
 `Cache-Control: no-store`; bodies cap at 1 MiB. A present `Origin` header must
 be loopback (`http://127.0.0.1`, `localhost`, `::1`); missing `Origin` (curl)
 is allowed.
@@ -123,8 +132,10 @@ A complete round trip: register two agents, send, pull, ack.
 H='Content-Type: application/json'
 
 # 1. Both agents register.
-curl -s -X POST http://127.0.0.1:9480/agents -H "$H" -d '{"agent":"deepseek_v4_flash"}'
-curl -s -X POST http://127.0.0.1:9480/agents -H "$H" -d '{"agent":"grok"}'
+curl -s -X POST http://127.0.0.1:9480/agents -H "$H" \
+  -d '{"agent":"deepseek_v4_flash","description":"drafts the release notes","exclusive":true}'
+curl -s -X POST http://127.0.0.1:9480/agents -H "$H" \
+  -d '{"agent":"grok","description":"reviews PRs","exclusive":true}'
 
 # 2. deepseek_v4_flash sends grok a message.
 curl -s -X POST http://127.0.0.1:9480/messages -H "$H" \
@@ -175,6 +186,7 @@ Source of truth: `src/bus/model.rs`.
 | Limit | Value |
 |---|---|
 | Message body | 64 KiB |
+| Agent description | 256 bytes |
 | Unacked rows per name | 1024 |
 | Global rows | 8192 |
 | Roster agents | 256 |

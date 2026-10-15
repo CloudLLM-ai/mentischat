@@ -1,5 +1,16 @@
 UNRELEASED
 
+  - feat(roster): register takes an optional description (max 256 bytes,
+    trimmed, no control characters; omitted keeps the stored one, "" clears
+    it) and an optional exclusive flag. An exclusive register of a name that
+    is already on the roster fails name_taken (409) and leaves the holder's
+    description and last_seen alone, so two agents can no longer silently
+    share one inbox. list_agents returns each agent's description and queue
+    depth (queued); the terminal table gains a DESCRIPTION column. Older
+    databases gain the description column on open. The instructions and tool
+    descriptions say to call list_agents before register, to pass
+    exclusive: true on first registration, and what created: false means.
+
   - fix(security): REST/MCP Origin guard rejects non-loopback Origin (curl
     with no Origin still works); roster capped at 256 agents (roster_full);
     in_flight redelivery uses the same batch byte/count caps and remaining

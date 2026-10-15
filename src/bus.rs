@@ -149,6 +149,23 @@ pub struct RosterEntry {
     pub nudge_transport: NudgeTransport,
 }
 
+/// One roster row as the terminal view shows it: who is registered, how it is
+/// woken, how recently it was seen, and how much undelivered mail it holds.
+///
+/// Built by [`Bus::overview`]. Read-only: producing it never touches
+/// `last_seen` or message state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentOverview {
+    /// Agent name.
+    pub name: String,
+    /// How this session is woken while idle.
+    pub nudge_transport: NudgeTransport,
+    /// Whole seconds since the last `register` / `check_inbox`, never negative.
+    pub seen_secs_ago: i64,
+    /// Undelivered messages addressed to this agent (`pending` plus `in_flight`).
+    pub queued: i64,
+}
+
 /// Deregister outcome.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -477,6 +494,47 @@ impl Bus {
                     last_seen: r.get(1)?,
                     nudge_window: None,
                     nudge_transport: NudgeTransport::from_db(r.get(2)?),
+                })
+            })
+            .map_err(sqlite_storage)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sqlite_storage)?;
+        Ok(rows)
+    }
+
+    /// Roster sorted by name with each agent's queue depth and last-seen age,
+    /// for the operator terminal view.
+    ///
+    /// Read-only: does not promote, ack, or touch `last_seen`. A `last_seen`
+    /// that SQLite cannot parse reads as 0 seconds ago rather than failing the
+    /// whole view.
+    ///
+    /// # Errors
+    ///
+    /// `shutting_down` once the bus is closed; `storage_error` on a sqlite
+    /// failure.
+    pub async fn overview(&self) -> Result<Vec<AgentOverview>, MailErr> {
+        let g = self.inner.lock().await;
+        if g.closed {
+            return Err(MailErr::ShuttingDown);
+        }
+        let mut stmt = g
+            .conn
+            .prepare(
+                "SELECT r.name, r.nudge_transport,
+                        MAX(0, COALESCE(CAST(strftime('%s', 'now') AS INTEGER)
+                                        - CAST(strftime('%s', r.last_seen) AS INTEGER), 0)),
+                        (SELECT COUNT(*) FROM messages m WHERE m.recipient = r.name)
+                 FROM roster r ORDER BY r.name ASC",
+            )
+            .map_err(sqlite_storage)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(AgentOverview {
+                    name: r.get(0)?,
+                    nudge_transport: NudgeTransport::from_db(r.get(1)?),
+                    seen_secs_ago: r.get(2)?,
+                    queued: r.get(3)?,
                 })
             })
             .map_err(sqlite_storage)?

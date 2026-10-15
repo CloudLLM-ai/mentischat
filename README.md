@@ -36,8 +36,10 @@ Key behaviors:
 Prerequisites: Rust stable.
 
 ```bash
-make start          # cargo run --bin mentischat (foreground daemon)
+make start          # cargo run --bin mentischat (foreground daemon, terminal view)
+make start-plain    # same, with plain log lines (MENTISCHAT_PLAIN=1)
 make stop           # from another terminal: SIGTERM whatever owns :9480
+make help           # every target (ci, msrv, install, uninstall, ...)
 
 # release build, or install to PATH:
 cargo build --release && ./target/release/mentischat

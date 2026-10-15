@@ -1,9 +1,10 @@
 # Makefile
-.PHONY: build release clean fmt fmt-check check test doc help tasks clippy publish publish-dry-run install start stop ci
+.PHONY: build release clean fmt fmt-check check test doc help tasks clippy publish publish-dry-run install uninstall start start-plain stop ci msrv
 
 default: help
 CARGO_CMD=/usr/bin/env cargo
 MENTISCHAT_PORT?=9480
+MSRV?=1.88
 
 # ----------------------------------------------------------------------------------------------------------------------
 # Targets
@@ -18,6 +19,10 @@ release: fmt check clippy build test doc ## Perform a full release (fmt, check, 
 
 # What CI runs: verifies formatting instead of rewriting it
 ci: fmt-check check clippy test doc ## Verification-only pipeline (no source rewrites)
+
+# Check the rust-version claim in Cargo.toml (needs rustup and the toolchain)
+msrv: ## Type-check on the minimum supported Rust version (MSRV, default 1.88)
+	${CARGO_CMD} +$(MSRV) check --all-targets --all-features --locked
 
 # Format the code
 fmt: ## Format the code using cargo fmt
@@ -55,6 +60,10 @@ publish-dry-run: ## Dry-run publish to crates.io
 install: ## Install mentischat via cargo install
 	${CARGO_CMD} install --path . --locked
 
+# Remove the installed daemon
+uninstall: ## Remove the installed mentischat binary
+	${CARGO_CMD} uninstall mentischat
+
 # Clean build artifacts
 clean: ## Remove build artifacts using cargo clean
 	${CARGO_CMD} clean
@@ -63,8 +72,12 @@ clean: ## Remove build artifacts using cargo clean
 start: ## Start mentischat in the foreground (cargo run --bin mentischat)
 	${CARGO_CMD} run --bin mentischat
 
+# Run the daemon with plain log lines instead of the terminal view
+start-plain: ## Start mentischat with plain logs (MENTISCHAT_PLAIN=1)
+	MENTISCHAT_PLAIN=1 ${CARGO_CMD} run --bin mentischat
+
 # Gracefully stop a locally running mentischat daemon (SIGTERM on the mailbox port)
-stop: ## Stop the daemon listening on :$(MENTISCHAT_PORT) with SIGTERM
+stop: ## Stop the running daemon with SIGTERM (port from MENTISCHAT_PORT, default 9480)
 	@pids="$$(lsof -nP -iTCP:$(MENTISCHAT_PORT) -sTCP:LISTEN -t 2>/dev/null || true)"; \
 	if [ -z "$$pids" ]; then \
 		echo "mentischat: nothing listening on port $(MENTISCHAT_PORT)"; \

@@ -1,5 +1,26 @@
 UNRELEASED
 
+  - fix(bus): a blocking pull that took a send's wake-up and was then
+    cancelled (client gone) swallowed it, leaving the other pulls parked
+    under that name asleep until their timeout with mail waiting; it now
+    hands the wake to the next live waiter. A woken pull that finds nothing
+    to deliver (another pull took it) parks again for the rest of wait_ms
+    instead of returning empty early.
+
+  - fix(bus): the 16 KiB batch cap counts each message's serialized JSON,
+    not its raw body, so heavily escaped bodies cannot blow past client
+    truncation limits. send takes delivery order from an in-memory counter
+    seeded at open instead of a MAX(seq) scan, and checks both queue caps in
+    one query.
+
+  - fix(store): synchronous=FULL, so an accepted send survives an OS crash or
+    power loss (NORMAL could roll back the last commits).
+
+  - fix(http): a REST path or query axum cannot decode (/inboxes/%FF,
+    ?wait_ms=%FF) answered axum's plain-text 400; it now returns the typed
+    invalid_name / invalid_wait JSON like every other failure. invalid_name
+    echoes at most 64 characters of the rejected input.
+
   - fix(security): requests whose Host header names a non-loopback host get
     403, closing DNS rebinding: a rebound page reaches 127.0.0.1 under its own
     hostname and its same-origin GETs (GET /inboxes/{agent}, GET /agents)

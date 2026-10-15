@@ -53,7 +53,7 @@ Five tools, one `ToolProtocol`. REST mirrors them. Do not add a sixth tool.
 | `deregister` | `DELETE /agents/{agent}` | Leave; discard that inbox |
 
 Caps (source of truth: `src/bus/model.rs`): body 64 KiB; description 256 B; 1024 unacked / name;
-8192 global rows; 256 roster agents; batch 8 msgs / 16 KiB; `wait_ms` 0..=30000;
+8192 global rows; 256 roster agents; batch 8 msgs / 16 KiB of message JSON; `wait_ms` 0..=30000;
 8 waiters / name. At-least-once:
 unacked `in_flight` redelivers until someone acks (same batch caps). Two pulls
 under one name share that inbox. `send` wakes the oldest live waiter only.

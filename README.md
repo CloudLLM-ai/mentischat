@@ -19,7 +19,7 @@ API — the LLM chat transcript remains the durable record of a dialogue.
 Key behaviors:
 
 - **At-least-once delivery** — unacked `in_flight` rows redeliver until acked.
-- **Bounded batches** — max 8 messages / 16 KiB per pull keeps results under
+- **Bounded batches** — max 8 messages / 16 KiB of message JSON per pull keeps results under
   TUI truncation limits; `remaining` drives the drain loop.
 - **Pull only** — nothing wakes an idle agent. Mail is read when its recipient
   calls `check_inbox`, usually because you told it to check its messages.
@@ -190,7 +190,7 @@ Source of truth: `src/bus/model.rs`.
 | Unacked rows per name | 1024 |
 | Global rows | 8192 |
 | Roster agents | 256 |
-| Batch per pull | 8 msgs / 16 KiB total body bytes |
+| Batch per pull | 8 msgs / 16 KiB of message JSON |
 | Blocking pull (`wait_ms`) | 0–30000 ms |
 | Parked pulls per name | 8 |
 

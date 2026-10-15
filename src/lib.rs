@@ -28,6 +28,7 @@ pub mod nudge;
 pub mod rest;
 pub mod store;
 pub mod tools;
+pub mod tui;
 pub mod wake;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};

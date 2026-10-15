@@ -1,13 +1,17 @@
 //! Process entry: mailbox daemon or TUI harness launcher.
 
+use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use tokio::sync::Notify;
+
 use clap::Parser;
 use mentischat::bus::Bus;
+use mentischat::tui::{self, LogBuffer};
 use mentischat::wake::WakeConfig;
 use mentischat::BIND_ADDR;
 
@@ -112,11 +116,31 @@ fn harness_command(cli: &Cli) -> Option<Vec<String>> {
     }
 }
 
+/// The live view needs a terminal on both ends; under launchd, a pipe, or with
+/// `MENTISCHAT_PLAIN` set, the daemon logs plain lines instead.
+fn wants_terminal_view() -> bool {
+    std::env::var_os("MENTISCHAT_PLAIN").is_none()
+        && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+}
+
 async fn run_daemon() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_target(false)
-        .compact()
-        .init();
+    let use_view = wants_terminal_view();
+    let logs = LogBuffer::new();
+    if use_view {
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_target(false)
+            .without_time()
+            .compact()
+            .with_writer(logs.clone())
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_target(false)
+            .compact()
+            .init();
+    }
 
     let data_dir = match std::env::var("MENTISCHAT_DIR") {
         Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
@@ -154,6 +178,7 @@ async fn run_daemon() -> ExitCode {
 
     let app = mentischat::build_router(bus.clone());
     let shutdown_bus = bus.clone();
+    let quit = Arc::new(Notify::new());
 
     tracing::info!(
         addr = %BIND_ADDR,
@@ -161,13 +186,46 @@ async fn run_daemon() -> ExitCode {
         "serving MCP at /mcp and REST"
     );
 
-    let serve = axum::serve(
+    let running = Arc::new(AtomicBool::new(true));
+    let view = use_view.then(|| {
+        let (bus, logs, running, quit) = (bus.clone(), logs, running.clone(), quit.clone());
+        let handle = tokio::runtime::Handle::current();
+        let info = tui::Info {
+            version: env!("CARGO_PKG_VERSION").into(),
+            url: format!("http://{BIND_ADDR}"),
+            data_path: data_dir.display().to_string(),
+        };
+        // The view runs on its own OS thread, so it may block on the bus.
+        std::thread::spawn(move || {
+            tui::run_guarded(
+                || {
+                    tui::run(
+                        || handle.block_on(bus.overview()).ok(),
+                        &logs,
+                        info,
+                        &running,
+                    )
+                },
+                &quit,
+            )
+        })
+    });
+
+    let served = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal(shutdown_bus));
-
-    if let Err(e) = serve.await {
+    .with_graceful_shutdown(shutdown_signal(shutdown_bus, quit))
+    .await;
+    running.store(false, Ordering::Relaxed);
+    if let Some(view) = view {
+        match view.join() {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => eprintln!("mentischat: terminal view failed: {e}"),
+            Err(_) => eprintln!("mentischat: terminal view thread panicked"),
+        }
+    }
+    if let Err(e) = served {
         eprintln!("mentischat: server error: {e}");
         return ExitCode::FAILURE;
     }
@@ -178,7 +236,7 @@ async fn run_daemon() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-async fn shutdown_signal(bus: Arc<Bus>) {
+async fn shutdown_signal(bus: Arc<Bus>, quit: Arc<Notify>) {
     use tokio::signal::unix::{signal, SignalKind};
     let terminate = async {
         match signal(SignalKind::terminate()) {
@@ -191,6 +249,7 @@ async fn shutdown_signal(bus: Arc<Bus>) {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = terminate => {}
+        _ = quit.notified() => {}
     }
     tracing::info!("shutting down");
     if let Err(e) = bus.shutdown().await {

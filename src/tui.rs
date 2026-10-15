@@ -24,7 +24,10 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table, TableState},
+    widgets::{
+        Block, BorderType, Borders, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation,
+        ScrollbarState, Table, TableState,
+    },
     Frame,
 };
 use tokio::sync::Notify;
@@ -158,65 +161,60 @@ pub enum Focus {
     Agents,
 }
 
-/// xterm-256 orange; 24-bit RGB is not understood by every terminal.
-const ORANGE: Color = Color::Indexed(208);
-const HIGHLIGHT: Style = Style::new().fg(Color::Black).bg(ORANGE);
+/// Colors come from the terminal's own 8-color palette, never a fixed-palette
+/// index or RGB value, so the view stays readable on dark and light themes.
+const HIGHLIGHT: Style = Style::new()
+    .add_modifier(Modifier::REVERSED)
+    .add_modifier(Modifier::BOLD);
 
-const GLYPH_ROWS: usize = 5;
 const TITLE: &str = "MENTIS CHAT";
 
-fn glyph(c: char) -> [&'static str; GLYPH_ROWS] {
-    match c {
-        'M' => ["█   █", "██ ██", "█ █ █", "█   █", "█   █"],
-        'E' => ["█████", "█    ", "████ ", "█    ", "█████"],
-        'N' => ["█   █", "██  █", "█ █ █", "█  ██", "█   █"],
-        'T' => ["█████", "  █  ", "  █  ", "  █  ", "  █  "],
-        'I' => ["█████", "  █  ", "  █  ", "  █  ", "█████"],
-        'S' => [" ████", "█    ", " ███ ", "    █", "████ "],
-        'C' => [" ████", "█    ", "█    ", "█    ", " ████"],
-        'H' => ["█   █", "█   █", "█████", "█   █", "█   █"],
-        'A' => [" ███ ", "█   █", "█████", "█   █", "█   █"],
-        _ => ["   "; GLYPH_ROWS],
-    }
+/// Rows in the block-letter banner.
+const BANNER_ROWS: usize = 6;
+
+/// `MENTIS` in the same block letters as the MentisDB banner.
+const MENTIS_PART: [&str; BANNER_ROWS] = [
+    "███╗   ███╗███████╗███╗   ██╗████████╗██╗███████╗",
+    "████╗ ████║██╔════╝████╗  ██║╚══██╔══╝██║██╔════╝",
+    "██╔████╔██║█████╗  ██╔██╗ ██║   ██║   ██║███████╗",
+    "██║╚██╔╝██║██╔══╝  ██║╚██╗██║   ██║   ██║╚════██║",
+    "██║ ╚═╝ ██║███████╗██║ ╚████║   ██║   ██║███████║",
+    "╚═╝     ╚═╝╚══════╝╚═╝  ╚═══╝   ╚═╝   ╚═╝╚══════╝",
+];
+
+/// `CHAT` in the same font, led by the gap between the two words.
+const CHAT_PART: [&str; BANNER_ROWS] = [
+    "    ██████╗██╗  ██╗ █████╗ ████████╗",
+    "   ██╔════╝██║  ██║██╔══██╗╚══██╔══╝",
+    "   ██║     ███████║███████║   ██║   ",
+    "   ██║     ██╔══██║██╔══██║   ██║   ",
+    "   ╚██████╗██║  ██║██║  ██║   ██║   ",
+    "    ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝   ",
+];
+
+fn banner_width() -> u16 {
+    (MENTIS_PART[0].chars().count() + CHAT_PART[0].chars().count()) as u16
 }
 
-fn big_title() -> Vec<String> {
-    (0..GLYPH_ROWS)
-        .map(|row| {
-            TITLE
-                .chars()
-                .map(|c| glyph(c)[row])
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .collect()
+fn bold(color: Color) -> Style {
+    Style::new().fg(color).add_modifier(Modifier::BOLD)
 }
 
-fn pane(title: String, focused: bool) -> Block<'static> {
+/// A rounded panel: dark gray at rest, bold yellow while it has focus.
+fn panel(focused: bool) -> Block<'static> {
     let border = if focused {
-        Style::new().fg(ORANGE)
+        bold(Color::Yellow)
     } else {
-        Style::new()
+        Style::new().fg(Color::DarkGray)
     };
     Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(border)
-        .title(Span::styled(
-            title,
-            Style::new().fg(ORANGE).add_modifier(Modifier::BOLD),
-        ))
 }
 
-fn dim() -> Style {
-    Style::new().add_modifier(Modifier::DIM)
-}
-
-fn orange_block() -> Block<'static> {
-    Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(ORANGE))
+fn secondary() -> Style {
+    Style::new().fg(Color::DarkGray)
 }
 
 fn log_style(line: &str) -> Style {
@@ -224,8 +222,14 @@ fn log_style(line: &str) -> Style {
     match level {
         "ERROR" => Style::new().fg(Color::Red),
         "WARN" => Style::new().fg(Color::Yellow),
-        _ => Style::new(),
+        _ => secondary(),
     }
+}
+
+fn scrollbar() -> Scrollbar<'static> {
+    Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(Some("↑"))
+        .end_symbol(Some("↓"))
 }
 
 /// The screen state: what to draw and which pane has focus. It owns no I/O,
@@ -287,13 +291,12 @@ impl Dashboard {
     }
 
     /// Draws one frame. Layout adapts to the terminal size: the block-letter
-    /// banner needs 30 rows and enough width, otherwise a one-line title is
+    /// banner needs 31 rows and enough width, otherwise a one-line title is
     /// used.
     pub fn render(&mut self, f: &mut Frame) {
-        let title_width = big_title()[0].chars().count() as u16;
-        let big = f.area().height >= 30 && f.area().width >= title_width + 4;
+        let big = f.area().height >= 31 && f.area().width >= banner_width() + 4;
         let [banner, tiles, logs, agents, footer] = Layout::vertical([
-            Constraint::Length(if big { GLYPH_ROWS as u16 + 2 } else { 3 }),
+            Constraint::Length(if big { BANNER_ROWS as u16 + 2 } else { 3 }),
             Constraint::Length(3),
             Constraint::Fill(3),
             Constraint::Fill(2),
@@ -304,29 +307,44 @@ impl Dashboard {
         self.draw_tiles(f, tiles);
         self.draw_logs(f, logs);
         self.draw_agents(f, agents);
-        let hints = "q quit  ·  Tab switch pane  ·  ↑/↓ PgUp/PgDn scroll  ·  End follow logs";
-        f.render_widget(Paragraph::new(Span::styled(hints, dim())), footer);
+        self.draw_hints(f, footer);
     }
 
     fn draw_banner(&self, f: &mut Frame, area: Rect, big: bool) {
-        let bold_orange = Style::new().fg(ORANGE).add_modifier(Modifier::BOLD);
         let lines: Vec<Line> = if big {
-            big_title()
-                .into_iter()
-                .map(|l| Line::from(Span::styled(l, bold_orange)))
+            MENTIS_PART
+                .iter()
+                .zip(CHAT_PART)
+                .map(|(mentis, chat)| {
+                    Line::from(vec![
+                        Span::styled(*mentis, Style::new().fg(Color::Green)),
+                        Span::styled(chat, Style::new().fg(Color::Cyan)),
+                    ])
+                })
                 .collect()
         } else {
-            let spaced: Vec<String> = TITLE.chars().map(String::from).collect();
-            vec![Line::from(Span::styled(spaced.join(" "), bold_orange))]
+            let spaced = |word: &str| word.chars().map(String::from).collect::<Vec<_>>().join(" ");
+            let (mentis, chat) = TITLE.split_once(' ').unwrap_or((TITLE, ""));
+            vec![Line::from(vec![
+                Span::styled(spaced(mentis), bold(Color::Green)),
+                Span::raw("   "),
+                Span::styled(spaced(chat), bold(Color::Cyan)),
+            ])]
         };
-        let block = orange_block()
+        let block = panel(false)
             .title_top(
-                Line::from(Span::styled(format!(" v{} ", self.info.version), dim()))
-                    .right_aligned(),
+                Line::from(Span::styled(
+                    format!(" v{} ", self.info.version),
+                    Style::new().add_modifier(Modifier::BOLD),
+                ))
+                .right_aligned(),
             )
             .title_bottom(
-                Line::from(Span::styled(format!(" {} ", self.info.data_path), dim()))
-                    .right_aligned(),
+                Line::from(Span::styled(
+                    format!(" {} ", self.info.data_path),
+                    secondary(),
+                ))
+                .right_aligned(),
             );
         f.render_widget(
             Paragraph::new(lines)
@@ -351,33 +369,33 @@ impl Dashboard {
         ])
         .areas(area);
         for ((label, value), area) in tiles.into_iter().zip(areas) {
-            let bold = Style::new().add_modifier(Modifier::BOLD);
             let value = if label == "LISTEN" {
                 Line::from(vec![
-                    Span::styled("● ", Style::new().fg(Color::Green)),
-                    Span::styled(value, bold),
+                    Span::styled("● ", bold(Color::Green)),
+                    Span::styled(value, Style::new().add_modifier(Modifier::BOLD)),
                 ])
             } else {
-                Line::from(Span::styled(value, bold))
+                Line::from(Span::styled(
+                    value,
+                    Style::new().add_modifier(Modifier::BOLD),
+                ))
             };
-            let block = orange_block().title(Span::styled(format!(" {label} "), dim()));
             f.render_widget(
                 Paragraph::new(value)
                     .alignment(Alignment::Center)
-                    .block(block),
+                    .block(panel(false).title(format!(" {label} "))),
                 area,
             );
         }
     }
 
     fn draw_logs(&mut self, f: &mut Frame, area: Rect) {
-        let focused = self.focus == Focus::Logs;
         let title = if self.log_scroll == 0 {
             " Logs ".to_string()
         } else {
             format!(" Logs (scrolled back {}) ", self.log_scroll)
         };
-        let block = pane(title, focused);
+        let block = panel(self.focus == Focus::Logs).title(title);
         let height = block.inner(area).height as usize;
         let total = self.logs.len();
         self.log_scroll = self.log_scroll.min(total.saturating_sub(height));
@@ -388,24 +406,29 @@ impl Dashboard {
             .map(|l| Line::from(Span::styled(l.clone(), log_style(l))))
             .collect();
         f.render_widget(Paragraph::new(lines).block(block), area);
+        if total > height {
+            let mut bar = ScrollbarState::new(total - height).position(start);
+            f.render_stateful_widget(scrollbar(), area, &mut bar);
+        }
     }
 
     fn draw_agents(&mut self, f: &mut Frame, area: Rect) {
-        let focused = self.focus == Focus::Agents;
-        let block = pane(
-            format!(" Registered agents ({}) ", self.overview.agents.len()),
-            focused,
-        );
-        if self.overview.agents.is_empty() {
-            let msg = Paragraph::new(Span::styled("no agents registered yet", dim())).block(block);
+        let count = self.overview.agents.len();
+        let block =
+            panel(self.focus == Focus::Agents).title(format!(" Registered agents ({count}) "));
+        if count == 0 {
+            let msg =
+                Paragraph::new(Span::styled("no agents registered yet", secondary())).block(block);
             f.render_widget(msg, area);
             return;
         }
+        // One row of the inner area is the header.
+        let visible = block.inner(area).height.saturating_sub(1) as usize;
         let rows = self.overview.agents.iter().map(|a| {
             let queued = if a.queued > 0 {
                 Span::styled(a.queued.to_string(), Style::new().fg(Color::Yellow))
             } else {
-                Span::styled("0", dim())
+                Span::styled("0", secondary())
             };
             Row::new([
                 Cell::from(plain(&a.name)),
@@ -413,8 +436,7 @@ impl Dashboard {
                 Cell::from(queued),
             ])
         });
-        let header = Row::new(["NAME", "LAST SEEN", "QUEUED"])
-            .style(Style::new().fg(ORANGE).add_modifier(Modifier::BOLD));
+        let header = Row::new(["NAME", "LAST SEEN", "QUEUED"]).style(bold(Color::Yellow));
         let table = Table::new(
             rows,
             [
@@ -425,8 +447,48 @@ impl Dashboard {
         )
         .header(header)
         .block(block)
-        .row_highlight_style(if focused { HIGHLIGHT } else { Style::new() });
+        .row_highlight_style(HIGHLIGHT);
         f.render_stateful_widget(table, area, &mut self.table);
+        if count > visible {
+            let mut bar = ScrollbarState::new(count - visible)
+                .position(self.table.selected().unwrap_or(0).min(count - visible));
+            f.render_stateful_widget(scrollbar(), area, &mut bar);
+        }
+    }
+
+    /// The footer: a green chip naming the focused pane, then that pane's keys
+    /// as yellow caps with white descriptions, on a black bar.
+    fn draw_hints(&self, f: &mut Frame, area: Rect) {
+        let bar = Style::new().bg(Color::Black).fg(Color::White);
+        let key = bold(Color::Black).bg(Color::Yellow);
+        let sep = Span::styled(" │ ", bar.fg(Color::Cyan).add_modifier(Modifier::BOLD));
+        let hint = |keys: &'static str, what: &'static str| {
+            [
+                Span::styled(keys, key),
+                Span::styled(format!(" {what}  "), bar),
+            ]
+        };
+        let (label, pane_hints): (&str, Vec<[Span; 2]>) = match self.focus {
+            Focus::Logs => (
+                "Logs",
+                vec![
+                    hint("↑↓", "scroll"),
+                    hint("PgUp/PgDn", "page"),
+                    hint("End", "follow"),
+                ],
+            ),
+            Focus::Agents => ("Agents", vec![hint("↑↓", "select row")]),
+        };
+        let mut spans = vec![
+            Span::styled(format!(" {label} "), bold(Color::Black).bg(Color::Green)),
+            sep.clone(),
+        ];
+        for pair in pane_hints.into_iter().chain([hint("Tab", "next pane")]) {
+            spans.extend(pair);
+            spans.push(sep.clone());
+        }
+        spans.extend(hint("q", "quit"));
+        f.render_widget(Paragraph::new(Line::from(spans)).style(bar), area);
     }
 
     fn scroll(&mut self, up: bool, by: usize) {

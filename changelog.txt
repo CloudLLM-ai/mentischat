@@ -50,6 +50,10 @@ UNRELEASED
     Bus::overview (roster, queue depth, age, and an in-memory sent counter)
     and never touches last_seen, acks or mail, and never shows message
     bodies. Adds the ratatui dependency.
+    The view is painted like MentisDB's console: terminal-palette colors only,
+    a green MENTIS / cyan CHAT block banner, dark-gray rounded panels with a
+    bold yellow focused border, a yellow table header, overflow scrollbars and
+    a footer hint bar.
 
   - refactor: retire the dead v1 window_title_match column (dropped on open;
     the nudgeWindow wire field stays null); drop check_inbox's duplicate

@@ -59,6 +59,12 @@ registered, and **uptime** — a **Logs** pane (MCP tool calls, never message
 bodies), and a **Registered agents** table with each agent's last seen and
 queued mail.
 
+It is painted like the MentisDB console: the terminal's own 8-color palette (so
+it reads on light and dark themes), a green **MENTIS** and cyan **CHAT** block
+banner, dark-gray rounded panels whose border turns bold yellow on the focused
+pane, a yellow table header with a reverse-video selected row, ↑/↓ scrollbars
+when a pane overflows, and a footer bar of key hints for the focused pane.
+
 `q`, `Esc` or `Ctrl-C` quit through the same graceful shutdown as `SIGTERM`
 (the mailbox is discarded as usual); `Tab` switches pane; `↑`/`↓`/`PgUp`/`PgDn`
 scroll; `End` follows the log tail. Without a terminal (launchd, a pipe) or with

@@ -7,7 +7,9 @@ use std::time::Duration;
 use mentischat::bus::{AgentOverview, Overview};
 use mentischat::tui::{run_guarded, Dashboard, Focus, Info, LogBuffer};
 use ratatui::backend::TestBackend;
+use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+use ratatui::style::{Color, Modifier};
 use ratatui::Terminal;
 use tokio::sync::Notify;
 
@@ -34,14 +36,36 @@ fn overview(sent: u64, agents: Vec<AgentOverview>) -> Overview {
     }
 }
 
-fn rendered(dash: &mut Dashboard, w: u16, h: u16) -> String {
+fn painted(dash: &mut Dashboard, w: u16, h: u16) -> Buffer {
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
     term.draw(|f| dash.render(f)).unwrap();
-    let buf = term.backend().buffer().clone();
+    term.backend().buffer().clone()
+}
+
+fn row_text(buf: &Buffer, y: u16) -> String {
+    (0..buf.area.width)
+        .map(|x| buf[(x, y)].symbol())
+        .collect::<String>()
+}
+
+fn rendered(dash: &mut Dashboard, w: u16, h: u16) -> String {
+    let buf = painted(dash, w, h);
     (0..h)
-        .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>())
+        .map(|y| row_text(&buf, y))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Cell position of the first occurrence of `needle` (all cells are one column
+/// wide, so character index equals column).
+fn find(buf: &Buffer, needle: &str) -> (u16, u16) {
+    for y in 0..buf.area.height {
+        let row = row_text(buf, y);
+        if let Some(byte) = row.find(needle) {
+            return (row[..byte].chars().count() as u16, y);
+        }
+    }
+    panic!("missing {needle:?}");
 }
 
 async fn notified(n: &Notify) -> bool {
@@ -87,7 +111,7 @@ fn renders_banner_tiles_logs_and_agents_in_order() {
             ],
         ),
     );
-    let out = rendered(&mut dash, 100, 30);
+    let out = rendered(&mut dash, 100, 32);
     let at = |s: &str| {
         out.find(s)
             .unwrap_or_else(|| panic!("missing {s:?}\n{out}"))
@@ -243,4 +267,235 @@ async fn view_quit_or_error_stops_the_server_but_server_stop_does_not() {
     assert!(notified(&stop).await);
     assert!(!run_guarded(|| Ok(false), &stop).unwrap());
     assert!(!notified(&stop).await);
+}
+
+fn sample() -> Dashboard {
+    let mut logs = LogBuffer::new();
+    writeln!(logs, " INFO served").unwrap();
+    writeln!(logs, " WARN careful").unwrap();
+    writeln!(logs, " ERROR broke").unwrap();
+    let mut dash = dashboard();
+    dash.update(
+        logs.lines(),
+        overview(
+            3,
+            vec![agent("claude_code", 4, 2), agent("grok_build", 9, 0)],
+        ),
+    );
+    dash
+}
+
+#[test]
+fn banner_paints_mentis_green_and_chat_cyan_with_a_gap_on_every_row() {
+    let mut dash = sample();
+    let buf = painted(&mut dash, 110, 36);
+    let (_, top) = find(&buf, "███╗   ███╗");
+    for y in top..top + 6 {
+        let colored = |color: Color| -> Vec<u16> {
+            (0..buf.area.width)
+                .filter(|&x| buf[(x, y)].fg == color && buf[(x, y)].symbol() != " ")
+                .collect()
+        };
+        let (green, cyan) = (colored(Color::Green), colored(Color::Cyan));
+        assert!(
+            !green.is_empty() && !cyan.is_empty(),
+            "row {y}: both words painted"
+        );
+        let (last_green, first_cyan) = (*green.last().unwrap(), cyan[0]);
+        assert!(
+            first_cyan - last_green >= 4,
+            "row {y}: MENTIS and CHAT need a gap, got {} blank cells",
+            first_cyan - last_green - 1
+        );
+    }
+}
+
+#[test]
+fn compact_title_is_green_then_cyan() {
+    let mut dash = sample();
+    let buf = painted(&mut dash, 100, 24);
+    let (mx, my) = find(&buf, "M E N T I S");
+    let (cx, cy) = find(&buf, "C H A T");
+    assert_eq!(my, cy);
+    assert_eq!(buf[(mx, my)].fg, Color::Green);
+    assert_eq!(buf[(cx, cy)].fg, Color::Cyan);
+    assert!(buf[(mx, my)].modifier.contains(Modifier::BOLD));
+}
+
+#[test]
+fn only_terminal_palette_colors_are_used() {
+    let mut dash = sample();
+    for (w, h) in [(110, 36), (100, 24)] {
+        let buf = painted(&mut dash, w, h);
+        for cell in &buf.content {
+            for color in [cell.fg, cell.bg] {
+                assert!(
+                    !matches!(color, Color::Indexed(_) | Color::Rgb(..)),
+                    "fixed-palette color {color:?} breaks light themes"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn panels_are_dark_gray_and_the_focused_one_is_bold_yellow() {
+    let mut dash = sample();
+    let border = |dash: &mut Dashboard, title: &str| {
+        let buf = painted(dash, 110, 36);
+        let (_, y) = find(&buf, title);
+        buf[(0, y)].clone()
+    };
+    for title in [
+        "╭ LISTEN",
+        "╭ MESSAGES SENT",
+        "╭ Logs",
+        "╭ Registered agents",
+    ] {
+        let (x, y) = find(&painted(&mut dash, 110, 36), title);
+        let cell = painted(&mut dash, 110, 36)[(x, y)].clone();
+        let expect = if title == "╭ Logs" {
+            Color::Yellow
+        } else {
+            Color::DarkGray
+        };
+        assert_eq!(cell.fg, expect, "{title}");
+    }
+    let logs = border(&mut dash, "╭ Logs");
+    assert!(
+        logs.modifier.contains(Modifier::BOLD),
+        "focused border is bold"
+    );
+
+    dash.on_key(KeyCode::Tab, KeyModifiers::NONE);
+    assert_eq!(border(&mut dash, "╭ Logs").fg, Color::DarkGray);
+    let agents = border(&mut dash, "╭ Registered agents");
+    assert_eq!(agents.fg, Color::Yellow);
+    assert!(agents.modifier.contains(Modifier::BOLD));
+}
+
+#[test]
+fn table_header_is_bold_yellow_and_the_selected_row_is_reversed() {
+    let mut dash = sample();
+    let buf = painted(&mut dash, 110, 36);
+    let (x, y) = find(&buf, "NAME");
+    assert_eq!(buf[(x, y)].fg, Color::Yellow);
+    assert!(buf[(x, y)].modifier.contains(Modifier::BOLD));
+
+    let (x, y) = find(&buf, "claude_code");
+    let selected = buf[(x, y)].modifier;
+    assert!(selected.contains(Modifier::REVERSED) && selected.contains(Modifier::BOLD));
+    let (x, y) = find(&buf, "grok_build");
+    assert!(!buf[(x, y)].modifier.contains(Modifier::REVERSED));
+}
+
+#[test]
+fn queued_is_yellow_when_mail_waits_and_dark_gray_when_empty() {
+    let mut dash = sample();
+    let buf = painted(&mut dash, 110, 36);
+    // The QUEUED digit is the first digit after the "ago" in the agent's row.
+    let queued_color = |name: &str| {
+        let (_, y) = find(&buf, name);
+        let row: Vec<char> = row_text(&buf, y).chars().collect();
+        let ago = row
+            .windows(3)
+            .position(|w| w == ['a', 'g', 'o'])
+            .expect("age column");
+        let digit = (ago..row.len())
+            .find(|&x| row[x].is_ascii_digit())
+            .expect("queued digit");
+        buf[(digit as u16, y)].fg
+    };
+    assert_eq!(queued_color("claude_code"), Color::Yellow);
+    assert_eq!(queued_color("grok_build"), Color::DarkGray);
+}
+
+#[test]
+fn log_lines_are_colored_by_level() {
+    let mut dash = sample();
+    let buf = painted(&mut dash, 110, 36);
+    let fg = |word: &str| {
+        let (x, y) = find(&buf, word);
+        buf[(x, y)].fg
+    };
+    assert_eq!(fg("served"), Color::DarkGray);
+    assert_eq!(fg("careful"), Color::Yellow);
+    assert_eq!(fg("broke"), Color::Red);
+}
+
+/// The screen without its footer, whose key hints legitimately contain arrows.
+fn panes_only(dash: &mut Dashboard, w: u16, h: u16) -> String {
+    let buf = painted(dash, w, h);
+    (0..h - 1)
+        .map(|y| row_text(&buf, y))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn scrollbars_appear_only_when_content_overflows() {
+    let mut dash = sample();
+    let calm = panes_only(&mut dash, 110, 36);
+    assert!(!calm.contains('↑') && !calm.contains('↓'), "{calm}");
+
+    let mut logs = LogBuffer::new();
+    for i in 0..200 {
+        writeln!(logs, " INFO line {i}").unwrap();
+    }
+    let many: Vec<AgentOverview> = (0..30)
+        .map(|i| agent(&format!("agent_{i}"), 1, 0))
+        .collect();
+    dash.update(logs.lines(), overview(0, many));
+    let busy = panes_only(&mut dash, 110, 36);
+    assert_eq!(
+        busy.matches('↑').count(),
+        2,
+        "one per overflowing pane\n{busy}"
+    );
+    assert_eq!(
+        busy.matches('↓').count(),
+        2,
+        "one per overflowing pane\n{busy}"
+    );
+}
+
+#[test]
+fn hint_bar_is_a_black_bar_with_a_green_pane_chip_and_yellow_keys() {
+    let mut dash = sample();
+    let buf = painted(&mut dash, 110, 36);
+    let y = buf.area.height - 1;
+    assert!(
+        (0..buf.area.width).all(|x| buf[(x, y)].bg != Color::Reset),
+        "bar fills the row"
+    );
+    assert_eq!(buf[(buf.area.width - 1, y)].bg, Color::Black);
+
+    let (cx, _) = find(&buf, " Logs ");
+    let chip = &buf[(cx + 1, y)];
+    assert_eq!((chip.bg, chip.fg), (Color::Green, Color::Black));
+    let in_footer = |needle: &str| -> u16 {
+        let row = row_text(&buf, y);
+        let byte = row
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} not in footer"));
+        row[..byte].chars().count() as u16
+    };
+    assert_eq!(buf[(in_footer("q quit"), y)].bg, Color::Yellow, "key cap");
+    assert_eq!(buf[(in_footer("│"), y)].fg, Color::Cyan, "separator");
+    assert_eq!(
+        buf[(in_footer("scroll"), y)].fg,
+        Color::White,
+        "description"
+    );
+
+    let text = row_text(&buf, y);
+    assert!(text.contains("scroll") && text.contains("page") && text.contains("follow"));
+    dash.on_key(KeyCode::Tab, KeyModifiers::NONE);
+    let text = row_text(&painted(&mut dash, 110, 36), y);
+    assert!(
+        text.contains(" Agents ") && text.contains("select row"),
+        "{text}"
+    );
+    assert!(!text.contains("follow"));
+    assert!(text.contains("Tab") && text.contains("quit"));
 }

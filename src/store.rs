@@ -63,35 +63,21 @@ pub fn open(data_dir: &Path) -> Result<Connection, StoreError> {
     Ok(conn)
 }
 
+/// Brings a roster created by an older build up to the current shape: the
+/// wake/nudge columns and their index are dropped, keeping every row.
 fn migrate_roster(conn: &Connection) -> Result<(), rusqlite::Error> {
     let mut stmt = conn.prepare("PRAGMA table_info(roster)")?;
     let cols: Vec<String> = stmt
         .query_map([], |r| r.get::<_, String>(1))?
         .collect::<Result<Vec<_>, _>>()?;
-    // v1 stored an AppleScript window title here. That doorbell is gone and
-    // the column has been written as NULL ever since, so retire it. (SQLite
-    // >= 3.35; the bundled build is well past that, and the column carries no
-    // index or constraint.)
-    if cols.iter().any(|c| c == "window_title_match") {
-        conn.execute("ALTER TABLE roster DROP COLUMN window_title_match", [])?;
+    // The unique index must go before the column it covers. (DROP COLUMN needs
+    // SQLite >= 3.35; the bundled build is well past that.)
+    conn.execute("DROP INDEX IF EXISTS idx_roster_wake_id", [])?;
+    for retired in ["window_title_match", "nudge_transport", "wake_id"] {
+        if cols.iter().any(|c| c == retired) {
+            conn.execute(&format!("ALTER TABLE roster DROP COLUMN {retired}"), [])?;
+        }
     }
-    if !cols.iter().any(|c| c == "nudge_transport") {
-        conn.execute(
-            "ALTER TABLE roster ADD COLUMN nudge_transport TEXT NOT NULL DEFAULT 'none'",
-            [],
-        )?;
-    }
-    if !cols.iter().any(|c| c == "wake_id") {
-        conn.execute("ALTER TABLE roster ADD COLUMN wake_id TEXT", [])?;
-    }
-    // Unconditional: a database created by an older implementation, or one
-    // interrupted between the column and index steps, can hold `wake_id`
-    // without its unique index.
-    conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_roster_wake_id ON roster (wake_id)
-         WHERE wake_id IS NOT NULL AND length(trim(wake_id)) > 0",
-        [],
-    )?;
     Ok(())
 }
 

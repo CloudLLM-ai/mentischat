@@ -30,7 +30,7 @@ use ratatui::{
 use tokio::sync::Notify;
 use tracing_subscriber::fmt::MakeWriter;
 
-use crate::bus::{AgentOverview, NudgeTransport};
+use crate::bus::Overview;
 
 const MAX_LOG_LINES: usize = 1000;
 const REFRESH: Duration = Duration::from_millis(500);
@@ -250,7 +250,7 @@ pub struct Dashboard {
     info: Info,
     started: Instant,
     logs: Vec<String>,
-    agents: Vec<AgentOverview>,
+    overview: Overview,
     focus: Focus,
     /// Lines scrolled back from the newest log line; 0 follows the tail.
     log_scroll: usize,
@@ -264,21 +264,21 @@ impl Dashboard {
             info,
             started: Instant::now(),
             logs: Vec::new(),
-            agents: Vec::new(),
+            overview: Overview::default(),
             focus: Focus::Logs,
             log_scroll: 0,
             table: TableState::default(),
         }
     }
 
-    /// Replaces the displayed logs and roster, keeping the selected row in
-    /// range.
-    pub fn update(&mut self, logs: Vec<String>, agents: Vec<AgentOverview>) {
+    /// Replaces the displayed logs, roster and sent-message count, keeping the
+    /// selected row in range.
+    pub fn update(&mut self, logs: Vec<String>, overview: Overview) {
         self.logs = logs;
-        self.agents = agents;
+        self.overview = overview;
         let sel = self.table.selected().unwrap_or(0);
         self.table
-            .select(Some(sel.min(self.agents.len().saturating_sub(1))));
+            .select(Some(sel.min(self.overview.agents.len().saturating_sub(1))));
     }
 
     /// The pane the arrow keys currently scroll.
@@ -337,21 +337,10 @@ impl Dashboard {
     }
 
     fn draw_tiles(&self, f: &mut Frame, area: Rect) {
-        let wrapped = self
-            .agents
-            .iter()
-            .filter(|a| a.nudge_transport == NudgeTransport::Wrapper)
-            .count();
-        let queued: i64 = self.agents.iter().map(|a| a.queued).sum();
-        let agents = if wrapped > 0 {
-            format!("{} · {wrapped} woken", self.agents.len())
-        } else {
-            self.agents.len().to_string()
-        };
         let tiles = [
             ("LISTEN", self.info.url.clone()),
-            ("AGENTS", agents),
-            ("QUEUED", queued.to_string()),
+            ("MESSAGES SENT", self.overview.messages_sent.to_string()),
+            ("AGENTS", self.overview.agents.len().to_string()),
             ("UPTIME", elapsed_clock(self.started.elapsed())),
         ];
         let areas: [Rect; 4] = Layout::horizontal([
@@ -404,15 +393,15 @@ impl Dashboard {
     fn draw_agents(&mut self, f: &mut Frame, area: Rect) {
         let focused = self.focus == Focus::Agents;
         let block = pane(
-            format!(" Registered agents ({}) ", self.agents.len()),
+            format!(" Registered agents ({}) ", self.overview.agents.len()),
             focused,
         );
-        if self.agents.is_empty() {
+        if self.overview.agents.is_empty() {
             let msg = Paragraph::new(Span::styled("no agents registered yet", dim())).block(block);
             f.render_widget(msg, area);
             return;
         }
-        let rows = self.agents.iter().map(|a| {
+        let rows = self.overview.agents.iter().map(|a| {
             let queued = if a.queued > 0 {
                 Span::styled(a.queued.to_string(), Style::new().fg(Color::Yellow))
             } else {
@@ -420,18 +409,16 @@ impl Dashboard {
             };
             Row::new([
                 Cell::from(plain(&a.name)),
-                Cell::from(a.nudge_transport.as_str()),
                 Cell::from(ago(a.seen_secs_ago)),
                 Cell::from(queued),
             ])
         });
-        let header = Row::new(["NAME", "WAKE", "LAST SEEN", "QUEUED"])
+        let header = Row::new(["NAME", "LAST SEEN", "QUEUED"])
             .style(Style::new().fg(ORANGE).add_modifier(Modifier::BOLD));
         let table = Table::new(
             rows,
             [
                 Constraint::Length(28),
-                Constraint::Length(10),
                 Constraint::Length(12),
                 Constraint::Fill(1),
             ],
@@ -452,7 +439,7 @@ impl Dashboard {
                 };
             }
             Focus::Agents => {
-                let last = self.agents.len().saturating_sub(1);
+                let last = self.overview.agents.len().saturating_sub(1);
                 let cur = self.table.selected().unwrap_or(0);
                 let next = if up {
                     cur.saturating_sub(by)
@@ -489,8 +476,9 @@ impl Dashboard {
 
 /// Runs the terminal view until the user quits or `running` is cleared.
 ///
-/// `roster` is polled every 500 ms for the agent table; when it returns
-/// `None` (the mailbox is shutting down) the previous roster stays on screen.
+/// `overview` is polled every 500 ms for the tiles and agent table; when it
+/// returns `None` (the mailbox is shutting down) the previous values stay on
+/// screen.
 /// Takes over the terminal (raw mode, alternate screen) and restores it before
 /// returning, including on error.
 ///
@@ -501,7 +489,7 @@ impl Dashboard {
 ///
 /// Any terminal I/O failure.
 pub fn run(
-    mut roster: impl FnMut() -> Option<Vec<AgentOverview>>,
+    mut overview: impl FnMut() -> Option<Overview>,
     logs: &LogBuffer,
     info: Info,
     running: &AtomicBool,
@@ -509,14 +497,14 @@ pub fn run(
     let mut dash = Dashboard::new(info);
     let mut terminal = ratatui::init();
     let result = (|| {
-        let mut agents = Vec::new();
+        let mut latest = Overview::default();
         let mut last_refresh: Option<Instant> = None;
         while running.load(Ordering::Relaxed) {
             if last_refresh.is_none_or(|t| t.elapsed() >= REFRESH) {
-                if let Some(fresh) = roster() {
-                    agents = fresh;
+                if let Some(fresh) = overview() {
+                    latest = fresh;
                 }
-                dash.update(logs.lines(), agents.clone());
+                dash.update(logs.lines(), latest.clone());
                 last_refresh = Some(Instant::now());
             }
             terminal.draw(|f| dash.render(f))?;

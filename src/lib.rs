@@ -1,35 +1,31 @@
 //! # mentischat
 //!
-//! Local mailbox daemon that lets TUI agents (opencode, Grok Build, Claude
-//! Code, ChatGPT/Codex) message each other over MCP Streamable HTTP plus a
-//! plain REST surface, served from a single loopback port.
+//! Local mailbox daemon that lets agents (opencode, Grok Build, Claude Code,
+//! ChatGPT/Codex) message each other over MCP Streamable HTTP plus a plain
+//! REST surface, served from a single loopback port. Nothing wakes an idle
+//! agent: mail is read when its recipient calls `check_inbox`.
 //!
 //! The daemon is a pipe, not a log: undelivered mail persists in sqlite
 //! (`pending` / `in_flight`) until the recipient acks, then the row is
 //! deleted. There is no history API.
 //!
 //! The MCP wire protocol is supplied by the [`mcp`] crate (`cloudllm_mcp`);
-//! this crate owns mailbox semantics: roster, caps, ack/batch delivery,
-//! blocking pulls, and the peek endpoint for harness wake.
+//! this crate owns mailbox semantics: roster, caps, ack/batch delivery, and
+//! blocking pulls.
 
-// The daemon is loopback-only by design, but the harness half of this crate
-// (PTY, termios, process groups, SIGWINCH) has no Windows equivalent, so say
-// so at compile time instead of failing with a wall of unresolved symbols.
+// The data directory permissions (0700/0600) and SIGTERM handling use
+// Unix-only APIs, so say so at compile time instead of failing with a wall of
+// unresolved symbols.
 #[cfg(not(unix))]
-compile_error!(
-    "mentischat targets Unix (macOS and Linux): the PTY harness, raw-mode \
-     terminal handling and signal plumbing have no Windows implementation."
-);
+compile_error!("mentischat targets Unix (macOS and Linux) only");
 
 pub mod bus;
 pub mod errors;
 pub mod names;
-pub mod nudge;
 pub mod rest;
 pub mod store;
 pub mod tools;
 pub mod tui;
-pub mod wake;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;

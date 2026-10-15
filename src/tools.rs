@@ -12,19 +12,17 @@ use std::sync::Arc;
 use mcp::protocol::{ToolMetadata, ToolParameter, ToolParameterType, ToolProtocol, ToolResult};
 use serde_json::{json, Value};
 
-use crate::bus::{Bus, NudgeTransport};
+use crate::bus::Bus;
 use crate::errors::MailboxError;
 use crate::names::AgentName;
 
 /// Ritual returned in the MCP `initialize` result so every harness sees the
 /// same instructions.
 pub const INSTRUCTIONS: &str = "\
-mentischat is a local mailbox between TUI agents on this machine.
+mentischat is a local mailbox between agents on this machine.
 Register using your model name in snake_case, e.g. deepseek_v4_flash. If that exact name is already on the roster (multiple instances of the same model can coexist), append a numeric suffix starting at 1 — deepseek_v4_flash_1, _2, ... — and pick the lowest free name. Call list_agents first to see which names are taken.
-When running under mentischat (e.g. mentischat opencode), the environment variable MENTISCHAT_WAKE_ID is set. On your first register, pass that value as wakeId so this session binds for idle wake. You choose the agent name; the command line does not need it upfront.
-If nudgeTransport is not wrapper and MENTISCHAT_WAKE_ID is unset, tell the user this session cannot be woken while idle.
 Before send_message, call list_agents. Only send to names that appear there. from must be your registered name. When you need a reply, say so in the body so the recipient responds when done.
-After send_message, end your turn — do not wait inline. mentis-wake injects the pointer when a reply lands; then call check_inbox with wait_ms 0 to pull it. Use wait_ms > 0 only when a peer is answering within the same turn.
+Nothing wakes an idle agent: a message is read only when its recipient calls check_inbox, usually because the user asked it to check its messages. After send_message, end your turn unless a peer is answering within the same turn, in which case call check_inbox with wait_ms > 0 to wait for the reply.
 When check_inbox returns messages, quote the bodies in your reply. Pass those ids as ack_ids on the next check_inbox. If remaining > 0, check_inbox again (wait_ms 0) until remaining is 0.
 Call deregister only when the user says they are done.";
 
@@ -51,17 +49,9 @@ fn metadata_for(tool_name: &str) -> Option<ToolMetadata> {
         "register" => Some(
             ToolMetadata::new(
                 "register",
-                "Claim this agent name on the local mentischat roster. Idempotent. Use your model name in snake_case (e.g. deepseek_v4_flash); if that name is taken, append a numeric suffix starting at 1 (..._1, ..._2) and pick the lowest free one. When MENTISCHAT_WAKE_ID is set in the environment (mentis-wake), pass it as wakeId on register to bind idle wake. Optional nudgeTransport: 'none' (default) or 'wrapper'.",
+                "Claim this agent name on the local mentischat roster. Idempotent. Use your model name in snake_case (e.g. deepseek_v4_flash); if that name is taken, append a numeric suffix starting at 1 (..._1, ..._2) and pick the lowest free one.",
             )
-            .with_parameter(str_param("agent", "The exact roster name to claim"))
-            .with_parameter(
-                ToolParameter::new("wakeId", ToolParameterType::String)
-                    .with_description("MENTISCHAT_WAKE_ID from the environment when running under mentis-wake"),
-            )
-            .with_parameter(
-                ToolParameter::new("nudgeTransport", ToolParameterType::String)
-                    .with_description("Wake transport: 'none' (default), 'wrapper', or deprecated 'terminal' (treated as none)"),
-            ),
+            .with_parameter(str_param("agent", "The exact roster name to claim")),
         ),
         "deregister" => Some(
             ToolMetadata::new(
@@ -73,7 +63,7 @@ fn metadata_for(tool_name: &str) -> Option<ToolMetadata> {
         "send_message" => Some(
             ToolMetadata::new(
                 "send_message",
-                "Queue a message for a registered agent. Fails if from or to is not registered. Put what you need in the body (say if you expect a reply). After sending, end your turn — the doorbell nudges you when the reply arrives; do not wait inline.",
+                "Queue a message for a registered agent. Fails if from or to is not registered. Put what you need in the body (say if you expect a reply). Nothing wakes the recipient: it reads the message when it next calls check_inbox.",
             )
             .with_parameter(str_param("from", "Your registered name"))
             .with_parameter(str_param("to", "Recipient's registered name (must be on the roster)"))
@@ -82,12 +72,12 @@ fn metadata_for(tool_name: &str) -> Option<ToolMetadata> {
         "check_inbox" => Some(
             ToolMetadata::new(
                 "check_inbox",
-                "Return the next batch of messages for this registered name (at-least-once). Optional ack_ids deletes previously returned in-flight messages. wait_ms (0-30000) blocks for mail — use only when a peer is replying within the same turn; otherwise rely on the doorbell to nudge you. Quote bodies, then ack those ids on the next call. If remaining > 0, call again.",
+                "Return the next batch of messages for this registered name (at-least-once). Optional ack_ids deletes previously returned in-flight messages. wait_ms (0-30000) blocks for mail — use only when a peer is replying within the same turn. Quote bodies, then ack those ids on the next call. If remaining > 0, call again.",
             )
             .with_parameter(str_param("agent", "Your registered name"))
             .with_parameter(
                 ToolParameter::new("wait_ms", ToolParameterType::Integer)
-                    .with_description("Block up to this many ms waiting for mail (0-30000); prefer 0 and rely on the doorbell to wake you")
+                    .with_description("Block up to this many ms waiting for mail (0-30000); use 0 unless a peer is replying within this turn")
                     .with_default(json!(0)),
             )
             .with_parameter(
@@ -98,7 +88,7 @@ fn metadata_for(tool_name: &str) -> Option<ToolMetadata> {
         ),
         "list_agents" => Some(ToolMetadata::new(
             "list_agents",
-            "Names on the roster, lastSeen, nudgeWindow (always null), and nudgeTransport (wrapper | none).",
+            "Names on the roster and when each was last seen.",
         )),
         _ => None,
     }
@@ -163,18 +153,11 @@ impl ToolProtocol for MailboxProtocol {
 impl MailboxProtocol {
     async fn register(&self, params: &Value) -> Result<Value, MailboxError> {
         let agent = required_name(params, "agent")?;
-        let transport = parse_transport(params.get("nudgeTransport"))?;
-        let wake_id = parse_wake_id(params.get("wakeId"))?;
-        let out = self
-            .bus
-            .register_with_wake(&agent, transport, wake_id.as_deref())
-            .await?;
+        let out = self.bus.register(&agent).await?;
         Ok(json!({
             "agent": out.agent,
             "created": out.created,
             "lastSeen": out.last_seen,
-            "nudgeWindow": out.nudge_window,
-            "nudgeTransport": out.nudge_transport,
         }))
     }
 
@@ -215,25 +198,6 @@ impl MailboxProtocol {
 fn required_name(params: &Value, key: &str) -> Result<AgentName, MailboxError> {
     let raw = params.get(key).and_then(Value::as_str).unwrap_or("");
     AgentName::parse(raw)
-}
-
-pub fn parse_wake_id(v: Option<&Value>) -> Result<Option<String>, MailboxError> {
-    match v {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(s)) => Ok(Some(crate::nudge::validate_wake_id(s)?)),
-        Some(_) => Err(MailboxError::InvalidBody),
-    }
-}
-
-/// Contract `nudgeTransport` semantics: absent/null -> keep existing on
-/// re-register; new names default to none. `terminal` is a deprecated alias
-/// for none.
-pub fn parse_transport(v: Option<&Value>) -> Result<Option<NudgeTransport>, MailboxError> {
-    match v {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(s)) => NudgeTransport::parse(Some(s)),
-        Some(_) => Err(MailboxError::InvalidBody),
-    }
 }
 
 /// Contract wait_ms semantics: absent/null -> 0; integer or digit string in

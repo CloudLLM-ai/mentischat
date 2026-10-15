@@ -51,8 +51,8 @@ publish: ## Publish mentischat to crates.io
 publish-dry-run: ## Dry-run publish to crates.io
 	${CARGO_CMD} publish --dry-run
 
-# Install the mentischat executables locally (daemon + mentis-wake wrapper)
-install: ## Install mentischat and mentis-wake via cargo install
+# Install the mentischat daemon locally
+install: ## Install mentischat via cargo install
 	${CARGO_CMD} install --path . --locked
 
 # Clean build artifacts

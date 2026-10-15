@@ -11,7 +11,7 @@ env:
 
 jobs:
   verify:
-    # mentischat is Unix-only by design (PTY harness, termios, process groups),
+    # mentischat is Unix-only by design (data directory permissions, SIGTERM),
     # so both supported platforms are covered and Windows is not attempted.
     strategy:
       fail-fast: false

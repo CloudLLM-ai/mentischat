@@ -1,4 +1,4 @@
-//! Process entry: mailbox daemon or TUI harness launcher.
+//! Process entry: the mailbox daemon.
 
 use std::io::IsTerminal;
 use std::net::SocketAddr;
@@ -7,112 +7,40 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use tokio::sync::Notify;
-
-use clap::Parser;
 use mentischat::bus::Bus;
 use mentischat::tui::{self, LogBuffer};
-use mentischat::wake::WakeConfig;
 use mentischat::BIND_ADDR;
+use tokio::sync::Notify;
 
 /// Set when graceful shutdown could not wipe the mailbox on disk.
 static SHUTDOWN_WIPE_FAILED: AtomicBool = AtomicBool::new(false);
 
-#[derive(Parser)]
-#[command(
-    name = "mentischat",
-    about = "Local mailbox daemon and TUI harness launcher",
-    version,
-    after_help = "\
-Examples:
-  mentischat              Start the mailbox daemon
-  mentischat serve        Start the mailbox daemon
-  mentischat opencode     Run OpenCode with idle wake
-  mentischat grok         Run Grok Build with idle wake
-  mentischat claude       Run Claude Code with idle wake
+const USAGE: &str = "\
+mentischat: local mailbox daemon for agents
 
-The agent picks its roster name on first register; pass MENTISCHAT_WAKE_ID as wakeId."
-)]
-struct Cli {
-    /// Run the mailbox daemon instead of a harness.
-    #[arg(long, short = 's', conflicts_with = "harness")]
-    serve: bool,
+Usage: mentischat
 
-    /// TUI harness to run (alternative to a positional name).
-    #[arg(long = "harness", conflicts_with = "serve")]
-    harness: Option<String>,
-
-    /// Pin roster name up front (legacy; omit for auto-bind).
-    #[arg(long)]
-    agent: Option<String>,
-
-    /// Daemon base URL (harness mode).
-    #[arg(long, default_value = "http://127.0.0.1:9480")]
-    url: String,
-
-    /// Skip wrapper bind (legacy --agent mode only).
-    #[arg(long)]
-    no_register: bool,
-
-    /// Submit key after the pointer: cr (Enter, default), lf, crlf, or
-    /// ctrl-enter (OpenCode when input_submit is ctrl+return).
-    #[arg(long, default_value = "cr")]
-    newline: String,
-
-    /// Harness command and args (e.g. `opencode` or `claude -- model opus`).
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    rest: Vec<String>,
-}
+Serves MCP at /mcp and REST on 127.0.0.1:9480. Started from a terminal it paints
+a live view; set MENTISCHAT_PLAIN=1, or run it without a terminal, for plain logs.
+MENTISCHAT_DIR overrides the data directory (default ~/.cloudllm/mentischat).";
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let cli = Cli::parse();
-    // Harness-only flags in daemon mode are a misconfiguration, not a no-op:
-    // say so rather than starting a daemon that ignores half its arguments.
-    let command = harness_command(&cli);
-    if command.is_none() && (cli.agent.is_some() || cli.no_register) {
-        eprintln!(
-            "mentischat: --agent and --no-register apply to harness mode only \
-             (e.g. `mentischat opencode`); refusing to start the daemon with them"
-        );
-        return ExitCode::from(2);
-    }
-    if let Some(command) = command {
-        return mentischat::wake::run_harness(WakeConfig {
-            program: "mentischat",
-            agent: cli.agent,
-            url: cli.url,
-            no_register: cli.no_register,
-            newline: cli.newline,
-            command,
-        })
-        .await;
-    }
-    run_daemon().await
-}
-
-/// Resolve harness argv, or `None` to start the daemon.
-fn harness_command(cli: &Cli) -> Option<Vec<String>> {
-    if cli.serve {
-        return None;
-    }
-    if let Some(name) = &cli.harness {
-        let mut command = vec![name.clone()];
-        command.extend(cli.rest.clone());
-        return Some(command);
-    }
-    if cli.rest.is_empty() {
-        return None;
-    }
-    match cli.rest[0].as_str() {
-        "serve" | "daemon" => {
-            if cli.rest.len() > 1 {
-                eprintln!("mentischat: unexpected arguments after `{}`", cli.rest[0]);
-                std::process::exit(2);
-            }
-            None
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        None => run_daemon().await,
+        Some("--help" | "-h") => {
+            println!("{USAGE}");
+            ExitCode::SUCCESS
         }
-        _ => Some(cli.rest.clone()),
+        Some("--version" | "-V") => {
+            println!("mentischat {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
+        Some(other) => {
+            eprintln!("mentischat: unexpected argument '{other}'\n\n{USAGE}");
+            ExitCode::from(2)
+        }
     }
 }
 

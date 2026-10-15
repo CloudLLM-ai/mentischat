@@ -4,7 +4,7 @@
 use std::io::Write;
 use std::time::Duration;
 
-use mentischat::bus::{AgentOverview, NudgeTransport};
+use mentischat::bus::{AgentOverview, Overview};
 use mentischat::tui::{run_guarded, Dashboard, Focus, Info, LogBuffer};
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyModifiers};
@@ -19,12 +19,18 @@ fn dashboard() -> Dashboard {
     })
 }
 
-fn agent(name: &str, transport: NudgeTransport, secs: i64, queued: i64) -> AgentOverview {
+fn agent(name: &str, secs: i64, queued: i64) -> AgentOverview {
     AgentOverview {
         name: name.into(),
-        nudge_transport: transport,
         seen_secs_ago: secs,
         queued,
+    }
+}
+
+fn overview(sent: u64, agents: Vec<AgentOverview>) -> Overview {
+    Overview {
+        agents,
+        messages_sent: sent,
     }
 }
 
@@ -73,10 +79,13 @@ fn renders_banner_tiles_logs_and_agents_in_order() {
     let mut dash = dashboard();
     dash.update(
         logs.lines(),
-        vec![
-            agent("claude_code", NudgeTransport::Wrapper, 4, 2),
-            agent("grok\x1b[2Jbuild", NudgeTransport::None, 125, 0),
-        ],
+        overview(
+            37,
+            vec![
+                agent("claude_code", 4, 2),
+                agent("grok\x1b[2Jbuild", 125, 0),
+            ],
+        ),
     );
     let out = rendered(&mut dash, 100, 30);
     let at = |s: &str| {
@@ -84,32 +93,83 @@ fn renders_banner_tiles_logs_and_agents_in_order() {
             .unwrap_or_else(|| panic!("missing {s:?}\n{out}"))
     };
     assert!(at("█") < at("LISTEN"));
-    assert!(at("LISTEN") < at("AGENTS") && at("AGENTS") < at("QUEUED"));
-    assert!(at("QUEUED") < at("UPTIME") && at("UPTIME") < at("Logs"));
-    assert!(out.contains("2 · 1 woken"), "{out}");
+    assert!(at("LISTEN") < at("MESSAGES SENT") && at("MESSAGES SENT") < at("AGENTS"));
+    assert!(at("AGENTS") < at("UPTIME") && at("UPTIME") < at("Logs"));
     assert!(at("Logs") < at("POST /messages 200"));
     assert!(at("POST /messages 200") < at("Registered agents (2)"));
     assert!(at("Registered agents (2)") < at("claude_code"));
-    assert!(out.contains("wrapper") && out.contains("none"), "{out}");
     assert!(out.contains("4s ago") && out.contains("2m ago"), "{out}");
-    assert!(out.contains("v9.9.9") && out.contains("http://127.0.0.1:9480"));
+    assert!(out.contains("v9.9.9"));
     assert!(out.contains("grok?[2Jbuild"), "{out}");
     assert!(!out.contains('\x1b'));
 }
 
 #[test]
-fn queued_tile_sums_every_agents_queue() {
+fn each_tile_shows_its_own_value() {
     let mut dash = dashboard();
     dash.update(
         vec![],
-        vec![
-            agent("a", NudgeTransport::None, 0, 11),
-            agent("b", NudgeTransport::None, 0, 13),
-        ],
+        overview(37, vec![agent("a", 0, 11), agent("b", 0, 13)]),
     );
     let out = rendered(&mut dash, 100, 30);
-    let queued_row = out.lines().nth(8).expect("tile value row");
-    assert!(queued_row.contains("24"), "{out}");
+    let labels = out
+        .lines()
+        .find(|l| l.contains("LISTEN"))
+        .expect("tile labels");
+    let values = out
+        .lines()
+        .nth(out.lines().position(|l| l.contains("LISTEN")).unwrap() + 1)
+        .expect("tile values");
+    // Character columns, not byte offsets: box-drawing characters are 3 bytes.
+    let col = |line: &str, needle: &str| {
+        let byte = line
+            .find(needle)
+            .unwrap_or_else(|| panic!("missing {needle:?} in {line:?}"));
+        line[..byte].chars().count()
+    };
+    let between = |line: &str, from: usize, to: usize| -> String {
+        line.chars().skip(from).take(to - from).collect()
+    };
+    let (sent_label, agents_label, uptime_label) = (
+        col(labels, "MESSAGES SENT"),
+        col(labels, "AGENTS"),
+        col(labels, "UPTIME"),
+    );
+    assert!(col(values, "http://127.0.0.1:9480") < sent_label, "{out}");
+    assert!(
+        between(values, sent_label, agents_label).contains("37"),
+        "{out}"
+    );
+    assert!(
+        between(values, agents_label, uptime_label).contains('2'),
+        "{out}"
+    );
+    assert!(
+        values
+            .chars()
+            .skip(uptime_label)
+            .collect::<String>()
+            .contains("00:00:0"),
+        "{out}"
+    );
+}
+
+#[test]
+fn the_view_never_mentions_waking() {
+    let mut dash = dashboard();
+    dash.update(vec![], overview(1, vec![agent("claude_code", 3, 1)]));
+    let out = rendered(&mut dash, 100, 30).to_lowercase();
+    for word in ["wake", "woken", "wrapper", "nudge"] {
+        assert!(!out.contains(word), "{word:?} on screen\n{out}");
+    }
+    let header = out
+        .lines()
+        .find(|l| l.contains("last seen"))
+        .expect("table header");
+    assert!(
+        header.contains("name") && header.contains("queued"),
+        "{header}"
+    );
 }
 
 #[test]
@@ -137,7 +197,7 @@ fn keys_scroll_focus_and_quit() {
         writeln!(logs, " INFO line {i}").unwrap();
     }
     let mut dash = dashboard();
-    dash.update(logs.lines(), vec![]);
+    dash.update(logs.lines(), Overview::default());
     let none = KeyModifiers::NONE;
 
     assert!(!dash.on_key(KeyCode::Up, none));
@@ -158,15 +218,11 @@ fn keys_scroll_focus_and_quit() {
 #[test]
 fn agent_selection_stays_in_range_when_the_roster_shrinks() {
     let mut dash = dashboard();
-    let three = vec![
-        agent("a", NudgeTransport::None, 0, 0),
-        agent("b", NudgeTransport::None, 0, 0),
-        agent("c", NudgeTransport::None, 0, 0),
-    ];
-    dash.update(vec![], three);
+    let three = vec![agent("a", 0, 0), agent("b", 0, 0), agent("c", 0, 0)];
+    dash.update(vec![], overview(0, three));
     dash.on_key(KeyCode::Tab, KeyModifiers::NONE);
     dash.on_key(KeyCode::PageDown, KeyModifiers::NONE);
-    dash.update(vec![], vec![agent("a", NudgeTransport::None, 0, 0)]);
+    dash.update(vec![], overview(0, vec![agent("a", 0, 0)]));
     assert!(rendered(&mut dash, 100, 30).contains("Registered agents (1)"));
 }
 

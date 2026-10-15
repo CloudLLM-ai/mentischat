@@ -21,6 +21,20 @@ pub const MAX_WAITERS_PER_AGENT: usize = 8;
 pub const MAX_ROSTER: i64 = 256;
 /// Cap on ids accepted in one `ack_ids` array.
 pub const MAX_ACK_IDS: usize = MAX_PENDING_PER_AGENT as usize;
+/// Maximum UTF-8 byte length of an agent's roster description.
+pub const MAX_DESCRIPTION_BYTES: usize = 256;
+
+/// How a `register` call treats the roster entry it names.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Registration {
+    /// `None` keeps the stored description, `Some("")` clears it, and any
+    /// other value replaces it. Validated by the caller (see
+    /// [`MAX_DESCRIPTION_BYTES`]).
+    pub description: Option<String>,
+    /// Fail `name_taken` instead of joining a name that is already on the
+    /// roster, so two agents cannot silently share one inbox.
+    pub exclusive: bool,
+}
 
 /// A delivered or queued mail row (wire shape).
 #[derive(Debug, Clone, Serialize)]
@@ -62,20 +76,26 @@ pub struct RegisterOutcome {
     pub created: bool,
     /// Fresh last-seen timestamp.
     pub last_seen: String,
+    /// The description now stored for this name, if any.
+    pub description: Option<String>,
 }
 
-/// Roster entry.
+/// Roster entry (wire shape of `list_agents`).
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RosterEntry {
     /// Agent name.
     pub name: String,
+    /// What the agent said it is or does at `register`, if anything.
+    pub description: Option<String>,
     /// UTC RFC 3339 timestamp of the last register / check_inbox.
-    #[serde(rename = "lastSeen")]
     pub last_seen: String,
+    /// Undelivered messages addressed to this agent (`pending` plus `in_flight`).
+    pub queued: i64,
 }
 
-/// One roster row as the terminal view shows it: who is registered, how
-/// recently it was seen, and how much undelivered mail it holds.
+/// One roster row as the terminal view shows it: who is registered, what it
+/// does, how recently it was seen, and how much undelivered mail it holds.
 ///
 /// Built by [`crate::bus::Bus::overview`]. Read-only: producing it never touches
 /// `last_seen` or message state.
@@ -83,6 +103,8 @@ pub struct RosterEntry {
 pub struct AgentOverview {
     /// Agent name.
     pub name: String,
+    /// What the agent said it is or does at `register`, if anything.
+    pub description: Option<String>,
     /// Whole seconds since the last `register` / `check_inbox`, never negative.
     pub seen_secs_ago: i64,
     /// Undelivered messages addressed to this agent (`pending` plus `in_flight`).

@@ -41,7 +41,8 @@ pub fn open(data_dir: &Path) -> Result<Connection, StoreError> {
         r#"
         CREATE TABLE IF NOT EXISTS roster (
           name TEXT PRIMARY KEY,
-          last_seen TEXT NOT NULL
+          last_seen TEXT NOT NULL,
+          description TEXT
         );
 
         CREATE TABLE IF NOT EXISTS messages (
@@ -64,7 +65,8 @@ pub fn open(data_dir: &Path) -> Result<Connection, StoreError> {
 }
 
 /// Brings a roster created by an older build up to the current shape: the
-/// wake/nudge columns and their index are dropped, keeping every row.
+/// wake/nudge columns and their index are dropped and the `description`
+/// column is added, keeping every row.
 fn migrate_roster(conn: &Connection) -> Result<(), rusqlite::Error> {
     let mut stmt = conn.prepare("PRAGMA table_info(roster)")?;
     let cols: Vec<String> = stmt
@@ -77,6 +79,9 @@ fn migrate_roster(conn: &Connection) -> Result<(), rusqlite::Error> {
         if cols.iter().any(|c| c == retired) {
             conn.execute(&format!("ALTER TABLE roster DROP COLUMN {retired}"), [])?;
         }
+    }
+    if !cols.iter().any(|c| c == "description") {
+        conn.execute("ALTER TABLE roster ADD COLUMN description TEXT", [])?;
     }
     Ok(())
 }

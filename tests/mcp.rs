@@ -144,14 +144,21 @@ async fn domain_error_is_iserror_true_content_block() {
 }
 
 #[tokio::test]
-async fn register_tool_takes_only_an_agent_name() {
+async fn register_tool_takes_a_name_description_and_exclusive_flag() {
     let (_d, app) = app();
     let (_, resp) = rpc(&app, "tools/list", json!({})).await;
     let tools = resp["result"]["tools"].as_array().unwrap();
     let register = tools.iter().find(|t| t["name"] == "register").unwrap();
     let props = register["inputSchema"]["properties"].as_object().unwrap();
-    let names: Vec<&str> = props.keys().map(String::as_str).collect();
-    assert_eq!(names, ["agent"], "no wakeId or nudgeTransport parameter");
+    let mut names: Vec<&str> = props.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        ["agent", "description", "exclusive"],
+        "no wakeId or nudgeTransport parameter"
+    );
+    let required = register["inputSchema"]["required"].as_array().unwrap();
+    assert_eq!(required, &[json!("agent")], "only the name is required");
 
     let (_, reg) = rpc(
         &app,
@@ -350,4 +357,44 @@ async fn non_loopback_peer_is_403() {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status().as_u16(), 403);
+}
+
+#[tokio::test]
+async fn register_over_mcp_stores_a_description_and_honors_exclusive() {
+    let (_d, app) = app();
+    let call = |args: Value| json!({ "name": "register", "arguments": args });
+
+    let (_, reg) = rpc(
+        &app,
+        "tools/call",
+        call(json!({"agent": "grok", "description": "reviews PRs", "exclusive": true})),
+    )
+    .await;
+    assert_eq!(reg["result"]["isError"], false, "{reg}");
+    let out: Value =
+        serde_json::from_str(reg["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(out["created"], true);
+    assert_eq!(out["description"], "reviews PRs");
+
+    let (_, taken) = rpc(
+        &app,
+        "tools/call",
+        call(json!({"agent": "grok", "exclusive": true})),
+    )
+    .await;
+    assert_eq!(taken["result"]["isError"], true, "{taken}");
+    let err: Value =
+        serde_json::from_str(taken["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(err["error"], "name_taken");
+
+    let (_, list) = rpc(
+        &app,
+        "tools/call",
+        json!({ "name": "list_agents", "arguments": {} }),
+    )
+    .await;
+    let roster: Value =
+        serde_json::from_str(list["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(roster["agents"][0]["description"], "reviews PRs");
+    assert_eq!(roster["agents"][0]["queued"], 0);
 }

@@ -44,13 +44,13 @@ fn seeded(tag: &str, schema: &str) -> (tempfile::TempDir, std::path::PathBuf) {
 }
 
 #[test]
-fn a_fresh_database_has_only_name_and_last_seen() {
+fn a_fresh_database_has_name_last_seen_and_description() {
     let dir = tempfile::tempdir().expect("tempdir");
     let data = dir.path().join("fresh");
     drop(mentischat::store::open(&data).expect("open"));
 
     let conn = Connection::open(data.join("pending.sqlite")).expect("reopen");
-    assert_eq!(roster_columns(&conn), ["name", "last_seen"]);
+    assert_eq!(roster_columns(&conn), ["name", "last_seen", "description"]);
 }
 
 #[test]
@@ -80,7 +80,7 @@ fn wake_columns_and_their_index_are_dropped_keeping_rows() {
     mentischat::store::open(&data).expect("open migrates");
 
     let conn = Connection::open(data.join("pending.sqlite")).expect("reopen");
-    assert_eq!(roster_columns(&conn), ["name", "last_seen"]);
+    assert_eq!(roster_columns(&conn), ["name", "last_seen", "description"]);
     assert_eq!(index_count(&conn, "idx_roster_wake_id"), 0);
     let names: Vec<String> = conn
         .prepare("SELECT name FROM roster ORDER BY name")
@@ -117,7 +117,7 @@ fn a_column_dropped_but_index_left_behind_still_opens() {
     mentischat::store::open(&data).expect("index is dropped before its column");
 
     let conn = Connection::open(data.join("pending.sqlite")).expect("reopen");
-    assert_eq!(roster_columns(&conn), ["name", "last_seen"]);
+    assert_eq!(roster_columns(&conn), ["name", "last_seen", "description"]);
 }
 
 #[test]
@@ -139,7 +139,38 @@ fn v1_window_title_column_is_retired() {
     mentischat::store::open(&data).expect("open migrates a v1 database");
 
     let conn = Connection::open(data.join("pending.sqlite")).expect("reopen");
-    assert_eq!(roster_columns(&conn), ["name", "last_seen"]);
+    assert_eq!(roster_columns(&conn), ["name", "last_seen", "description"]);
+}
+
+#[test]
+fn a_roster_without_descriptions_gains_the_column_keeping_rows() {
+    let schema = format!(
+        r#"
+        CREATE TABLE roster (
+          name TEXT PRIMARY KEY,
+          last_seen TEXT NOT NULL
+        );
+        {MESSAGES_TABLE}
+        INSERT INTO roster (name, last_seen) VALUES ('legacy', '2026-01-01T00:00:00.000Z');
+        "#
+    );
+    let (_dir, data) = seeded("pre_description", &schema);
+
+    mentischat::store::open(&data).expect("open adds the description column");
+
+    let conn = Connection::open(data.join("pending.sqlite")).expect("reopen");
+    assert_eq!(roster_columns(&conn), ["name", "last_seen", "description"]);
+    let description: Option<String> = conn
+        .query_row(
+            "SELECT description FROM roster WHERE name = 'legacy'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        description, None,
+        "existing agents start with no description"
+    );
 }
 
 #[test]

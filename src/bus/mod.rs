@@ -19,9 +19,10 @@ mod waiters;
 pub use crate::store::StoreError;
 pub use clock::now_rfc3339;
 pub use model::{
-    AgentOverview, DiscardOutcome, InboxPage, Message, Overview, RegisterOutcome, RosterEntry,
-    SendReceipt, MAX_ACK_IDS, MAX_BATCH, MAX_BODY_BYTES, MAX_PENDING_PER_AGENT, MAX_RETURN_BYTES,
-    MAX_ROSTER, MAX_TOTAL_MESSAGES, MAX_WAITERS_PER_AGENT, MAX_WAIT_MS,
+    AgentOverview, DiscardOutcome, InboxPage, Message, Overview, RegisterOutcome, Registration,
+    RosterEntry, SendReceipt, MAX_ACK_IDS, MAX_BATCH, MAX_BODY_BYTES, MAX_DESCRIPTION_BYTES,
+    MAX_PENDING_PER_AGENT, MAX_RETURN_BYTES, MAX_ROSTER, MAX_TOTAL_MESSAGES, MAX_WAITERS_PER_AGENT,
+    MAX_WAIT_MS,
 };
 
 use delivery::{apply_acks, delete_acked, deliver_locked, empty_page};
@@ -76,34 +77,54 @@ impl Bus {
         }
     }
 
-    /// Claim `name` on the roster. Idempotent: refreshes `last_seen` and keeps
-    /// any pending queue.
-    ///
-    /// # Errors
-    ///
-    /// `shutting_down` once the bus is closed; `roster_full` when a new name
-    /// would exceed [`MAX_ROSTER`]; `storage_error` on a sqlite failure.
+    /// Claim `name` on the roster with default options: keep any stored
+    /// description and join the name if it is already registered. See
+    /// [`register_with`](Self::register_with).
     pub async fn register(
         &self,
         name: &crate::names::AgentName,
     ) -> Result<RegisterOutcome, MailErr> {
+        self.register_with(name, Registration::default()).await
+    }
+
+    /// Claim `name` on the roster. Idempotent unless `opts.exclusive`:
+    /// refreshes `last_seen`, applies `opts.description`, and keeps any
+    /// pending queue.
+    ///
+    /// # Errors
+    ///
+    /// `shutting_down` once the bus is closed; `name_taken` when
+    /// `opts.exclusive` and the name is already on the roster; `roster_full`
+    /// when a new name would exceed [`MAX_ROSTER`]; `storage_error` on a sqlite
+    /// failure.
+    pub async fn register_with(
+        &self,
+        name: &crate::names::AgentName,
+        opts: Registration,
+    ) -> Result<RegisterOutcome, MailErr> {
         let now = now_rfc3339();
         let g = self.lock_open().await?;
-        let exists: bool = g
-            .conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM roster WHERE name = ?1)",
-                params![name.as_str()],
-                |r| r.get(0),
-            )
-            .map_err(sqlite_storage)?;
-        if exists {
+        let exists = is_registered(&g, name.as_str())?;
+        let description: Option<String> = if exists {
+            if opts.exclusive {
+                return Err(MailErr::NameTaken {
+                    agent: name.to_string(),
+                    known: roster_sorted(&g)?,
+                });
+            }
+            // A NULL ?3 keeps the stored description; '' clears it.
             g.conn
-                .execute(
-                    "UPDATE roster SET last_seen = ?2 WHERE name = ?1",
-                    params![name.as_str(), now],
+                .query_row(
+                    "UPDATE roster
+                        SET last_seen = ?2,
+                            description = CASE WHEN ?3 IS NULL THEN description
+                                               ELSE NULLIF(?3, '') END
+                      WHERE name = ?1
+                  RETURNING description",
+                    params![name.as_str(), now, opts.description],
+                    |r| r.get(0),
                 )
-                .map_err(sqlite_storage)?;
+                .map_err(sqlite_storage)?
         } else {
             let agents: i64 = g
                 .conn
@@ -113,17 +134,21 @@ impl Bus {
                 return Err(MailErr::RosterFull { agents });
             }
             g.conn
-                .execute(
-                    "INSERT INTO roster (name, last_seen) VALUES (?1, ?2)",
-                    params![name.as_str(), now],
+                .query_row(
+                    "INSERT INTO roster (name, last_seen, description)
+                     VALUES (?1, ?2, NULLIF(?3, ''))
+                     RETURNING description",
+                    params![name.as_str(), now, opts.description],
+                    |r| r.get(0),
                 )
-                .map_err(sqlite_storage)?;
-        }
+                .map_err(sqlite_storage)?
+        };
         drop(g);
         Ok(RegisterOutcome {
             agent: name.to_string(),
             created: !exists,
             last_seen: now,
+            description,
         })
     }
 
@@ -164,33 +189,27 @@ impl Bus {
         })
     }
 
-    /// Current roster sorted by name ascending.
+    /// Current roster sorted by name ascending, with each agent's description
+    /// and queue depth. Read-only: does not touch `last_seen`.
     pub async fn list_agents(&self) -> Result<Vec<RosterEntry>, MailErr> {
         let g = self.lock_open().await?;
-        let mut stmt = g
-            .conn
-            .prepare("SELECT name, last_seen FROM roster ORDER BY name ASC")
-            .map_err(sqlite_storage)?;
-        let rows = stmt
-            .query_map([], |r| {
-                Ok(RosterEntry {
-                    name: r.get(0)?,
-                    last_seen: r.get(1)?,
-                })
+        Ok(roster_rows(&g)?
+            .into_iter()
+            .map(|row| RosterEntry {
+                name: row.name,
+                description: row.description,
+                last_seen: row.last_seen,
+                queued: row.queued,
             })
-            .map_err(sqlite_storage)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(sqlite_storage)?;
-        Ok(rows)
+            .collect())
     }
 
-    /// The roster with each agent's queue depth and last-seen age, plus the
-    /// number of messages sent since the daemon started, for the operator
-    /// terminal view.
+    /// The roster with each agent's description, queue depth and last-seen
+    /// age, plus the number of messages sent since the daemon started, for the
+    /// operator terminal view.
     ///
-    /// Separate from [`list_agents`](Self::list_agents) on purpose: that one is
-    /// the wire contract (`name`, `lastSeen`) that clients and tests pin, while
-    /// this is a read model for the operator view with a different shape.
+    /// Shares its query with [`list_agents`](Self::list_agents); this shape
+    /// trades the wire timestamp for an age the view can print.
     ///
     /// Read-only: does not promote, ack, or touch `last_seen`. A `last_seen`
     /// that SQLite cannot parse reads as 0 seconds ago rather than failing the
@@ -202,27 +221,15 @@ impl Bus {
     /// failure.
     pub async fn overview(&self) -> Result<Overview, MailErr> {
         let g = self.lock_open().await?;
-        let mut stmt = g
-            .conn
-            .prepare(
-                "SELECT r.name,
-                        MAX(0, COALESCE(CAST(strftime('%s', 'now') AS INTEGER)
-                                        - CAST(strftime('%s', r.last_seen) AS INTEGER), 0)),
-                        (SELECT COUNT(*) FROM messages m WHERE m.recipient = r.name)
-                 FROM roster r ORDER BY r.name ASC",
-            )
-            .map_err(sqlite_storage)?;
-        let agents = stmt
-            .query_map([], |r| {
-                Ok(AgentOverview {
-                    name: r.get(0)?,
-                    seen_secs_ago: r.get(1)?,
-                    queued: r.get(2)?,
-                })
+        let agents = roster_rows(&g)?
+            .into_iter()
+            .map(|row| AgentOverview {
+                name: row.name,
+                description: row.description,
+                seen_secs_ago: row.seen_secs_ago,
+                queued: row.queued,
             })
-            .map_err(sqlite_storage)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(sqlite_storage)?;
+            .collect();
         Ok(Overview {
             agents,
             messages_sent: g.messages_sent,
@@ -400,22 +407,60 @@ fn sqlite_storage(e: rusqlite::Error) -> MailErr {
     MailErr::StorageError
 }
 
-fn ensure_registered(g: &Inner, name: &str) -> Result<(), MailErr> {
-    let exists: bool = g
-        .conn
+fn is_registered(g: &Inner, name: &str) -> Result<bool, MailErr> {
+    g.conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM roster WHERE name = ?1)",
             params![name],
             |r| r.get(0),
         )
-        .map_err(sqlite_storage)?;
-    if exists {
+        .map_err(sqlite_storage)
+}
+
+fn ensure_registered(g: &Inner, name: &str) -> Result<(), MailErr> {
+    if is_registered(g, name)? {
         return Ok(());
     }
     Err(MailErr::Unregistered {
         agent: name.to_string(),
         known: roster_sorted(g)?,
     })
+}
+
+/// One roster row with everything `list_agents` and `overview` need.
+struct RosterRow {
+    name: String,
+    description: Option<String>,
+    last_seen: String,
+    seen_secs_ago: i64,
+    queued: i64,
+}
+
+fn roster_rows(g: &Inner) -> Result<Vec<RosterRow>, MailErr> {
+    let mut stmt = g
+        .conn
+        .prepare(
+            "SELECT r.name, r.description, r.last_seen,
+                    MAX(0, COALESCE(CAST(strftime('%s', 'now') AS INTEGER)
+                                    - CAST(strftime('%s', r.last_seen) AS INTEGER), 0)),
+                    (SELECT COUNT(*) FROM messages m WHERE m.recipient = r.name)
+             FROM roster r ORDER BY r.name ASC",
+        )
+        .map_err(sqlite_storage)?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(RosterRow {
+                name: r.get(0)?,
+                description: r.get(1)?,
+                last_seen: r.get(2)?,
+                seen_secs_ago: r.get(3)?,
+                queued: r.get(4)?,
+            })
+        })
+        .map_err(sqlite_storage)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sqlite_storage)?;
+    Ok(rows)
 }
 
 fn roster_sorted(g: &Inner) -> Result<Vec<String>, MailErr> {

@@ -62,7 +62,7 @@ fn json_body(body: Result<Json<Value>, JsonRejection>) -> Result<Value, Response
     }
 }
 
-/// `POST /agents` `{ "agent" }` — same as register.
+/// `POST /agents` `{ "agent", "description"?, "exclusive"? }` — same as register.
 async fn register(State(bus): State<Ctx>, body: Result<Json<Value>, JsonRejection>) -> Response {
     let v = match json_body(body) {
         Ok(v) => v,
@@ -72,12 +72,12 @@ async fn register(State(bus): State<Ctx>, body: Result<Json<Value>, JsonRejectio
         Ok(a) => a,
         Err(e) => return err_response(e),
     };
-    match bus.register(&agent).await {
-        Ok(out) => ok_response(json!({
-            "agent": out.agent,
-            "created": out.created,
-            "lastSeen": out.last_seen,
-        })),
+    let opts = match crate::tools::parse_registration(&v) {
+        Ok(opts) => opts,
+        Err(e) => return err_response(e),
+    };
+    match bus.register_with(&agent, opts).await {
+        Ok(out) => ok_response(serde_json::to_value(out).unwrap_or(Value::Null)),
         Err(e) => err_response(e),
     }
 }

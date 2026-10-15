@@ -675,3 +675,106 @@ async fn overview_fails_once_the_bus_is_closed() {
         Err(MailboxError::ShuttingDown)
     ));
 }
+
+#[tokio::test]
+async fn description_is_set_kept_and_cleared_by_register() {
+    use mentischat::bus::Registration;
+    let (_d, bus) = fresh_bus("describe");
+    let set = |d: &str| Registration {
+        description: Some(d.into()),
+        exclusive: false,
+    };
+
+    let out = bus
+        .register_with(&name("grok"), set("reviews PRs"))
+        .await
+        .unwrap();
+    assert!(out.created);
+    assert_eq!(out.description.as_deref(), Some("reviews PRs"));
+
+    let kept = bus.register(&name("grok")).await.unwrap();
+    assert_eq!(
+        kept.description.as_deref(),
+        Some("reviews PRs"),
+        "a register without a description keeps the stored one"
+    );
+
+    bus.register_with(&name("grok"), set("writes docs"))
+        .await
+        .unwrap();
+    let roster = bus.list_agents().await.unwrap();
+    assert_eq!(roster[0].description.as_deref(), Some("writes docs"));
+
+    let cleared = bus.register_with(&name("grok"), set("")).await.unwrap();
+    assert_eq!(cleared.description, None, "an empty description clears it");
+    assert_eq!(bus.list_agents().await.unwrap()[0].description, None);
+}
+
+#[tokio::test]
+async fn exclusive_register_refuses_a_taken_name_without_touching_it() {
+    use mentischat::bus::Registration;
+    let (_d, bus) = fresh_bus("exclusive");
+    let first = Registration {
+        description: Some("first holder".into()),
+        exclusive: true,
+    };
+    assert!(
+        bus.register_with(&name("claude"), first)
+            .await
+            .unwrap()
+            .created
+    );
+
+    let before = bus.list_agents().await.unwrap();
+    let second = Registration {
+        description: Some("impostor".into()),
+        exclusive: true,
+    };
+    match bus
+        .register_with(&name("claude"), second)
+        .await
+        .unwrap_err()
+    {
+        MailboxError::NameTaken { agent, known } => {
+            assert_eq!(agent, "claude");
+            assert_eq!(known, ["claude"]);
+        }
+        other => panic!("expected name_taken, got {other:?}"),
+    }
+    let after = bus.list_agents().await.unwrap();
+    assert_eq!(
+        after[0].description.as_deref(),
+        Some("first holder"),
+        "a refused claim must not overwrite the holder's description"
+    );
+    assert_eq!(after[0].last_seen, before[0].last_seen, "nor its last_seen");
+
+    let next = Registration {
+        description: None,
+        exclusive: true,
+    };
+    assert!(
+        bus.register_with(&name("claude_1"), next)
+            .await
+            .unwrap()
+            .created
+    );
+}
+
+#[tokio::test]
+async fn list_agents_reports_queue_depth_without_delivering() {
+    let (_d, bus) = fresh_bus("queued");
+    bus.register(&name("a")).await.unwrap();
+    bus.register(&name("b")).await.unwrap();
+    for i in 0..3 {
+        bus.send(&name("a"), &name("b"), format!("m{i}"))
+            .await
+            .unwrap();
+    }
+    let roster = bus.list_agents().await.unwrap();
+    let queued: Vec<(String, i64)> = roster.iter().map(|e| (e.name.clone(), e.queued)).collect();
+    assert_eq!(queued, [("a".to_string(), 0), ("b".to_string(), 3)]);
+
+    let page = bus.check_inbox(&name("b"), 0, vec![]).await.unwrap();
+    assert_eq!(page.messages.len(), 3, "listing did not consume anything");
+}

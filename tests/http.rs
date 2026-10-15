@@ -294,3 +294,66 @@ fn ack_body_with(count: usize) -> String {
         .join(",");
     format!(r#"{{"ids":[{ids}]}}"#)
 }
+
+#[tokio::test]
+async fn register_accepts_a_description_and_lists_it() {
+    let (_d, mut app) = app();
+    let (s, v) = send(
+        &mut app,
+        post(
+            "/agents",
+            r#"{"agent":"grok","description":"  reviews PRs  "}"#,
+        ),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["description"], "reviews PRs", "stored trimmed");
+
+    let (_, v) = send(&mut app, req("GET", "/agents")).await;
+    assert_eq!(v["agents"][0]["description"], "reviews PRs");
+    assert_eq!(v["agents"][0]["queued"], 0);
+
+    let too_long = format!(r#"{{"agent":"grok","description":"{}"}}"#, "x".repeat(257));
+    let (s, v) = send(&mut app, post("/agents", &too_long)).await;
+    assert_eq!((s, v["error"].as_str()), (400, Some("invalid_description")));
+
+    let (s, v) = send(
+        &mut app,
+        post("/agents", r#"{"agent":"grok","description":7}"#),
+    )
+    .await;
+    assert_eq!((s, v["error"].as_str()), (400, Some("invalid_description")));
+
+    let (s, v) = send(
+        &mut app,
+        post("/agents", r#"{"agent":"grok","description":"line\nbreak"}"#),
+    )
+    .await;
+    assert_eq!((s, v["error"].as_str()), (400, Some("invalid_description")));
+}
+
+#[tokio::test]
+async fn exclusive_register_of_a_taken_name_is_a_conflict() {
+    let (_d, mut app) = app();
+    let (s, _) = send(
+        &mut app,
+        post("/agents", r#"{"agent":"grok","exclusive":true}"#),
+    )
+    .await;
+    assert_eq!(s, 200);
+    let (s, v) = send(
+        &mut app,
+        post("/agents", r#"{"agent":"grok","exclusive":true}"#),
+    )
+    .await;
+    assert_eq!(s, 409, "{v}");
+    assert_eq!(v["error"], "name_taken");
+    assert_eq!(v["known"], serde_json::json!(["grok"]));
+
+    let (s, v) = send(
+        &mut app,
+        post("/agents", r#"{"agent":"grok","exclusive":"yes"}"#),
+    )
+    .await;
+    assert_eq!((s, v["error"].as_str()), (400, Some("invalid_body")));
+}

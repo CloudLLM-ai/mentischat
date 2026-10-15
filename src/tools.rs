@@ -12,7 +12,7 @@ use std::sync::Arc;
 use mcp::protocol::{ToolMetadata, ToolParameter, ToolParameterType, ToolProtocol, ToolResult};
 use serde_json::{json, Value};
 
-use crate::bus::Bus;
+use crate::bus::{Bus, Registration, MAX_DESCRIPTION_BYTES};
 use crate::errors::MailboxError;
 use crate::names::AgentName;
 
@@ -20,8 +20,9 @@ use crate::names::AgentName;
 /// same instructions.
 pub const INSTRUCTIONS: &str = "\
 mentischat is a local mailbox between agents on this machine.
-Register using your model name in snake_case, e.g. deepseek_v4_flash. If that exact name is already on the roster (multiple instances of the same model can coexist), append a numeric suffix starting at 1 — deepseek_v4_flash_1, _2, ... — and pick the lowest free name. Call list_agents first to see which names are taken.
-Before send_message, call list_agents. Only send to names that appear there. from must be your registered name. When you need a reply, say so in the body so the recipient responds when done.
+Register using your model name in snake_case, e.g. deepseek_v4_flash, with a one-line description of who you are and what you are working on. Call list_agents first to see which names are taken. If that exact name is already on the roster (multiple instances of the same model can coexist), append a numeric suffix starting at 1 — deepseek_v4_flash_1, _2, ... — and pick the lowest free name.
+The first time you register in a conversation, pass exclusive: true. If that fails with name_taken, another agent already holds the name: try the next free suffix. Never take over a name you did not register yourself: without exclusive, created: false means the name was already on the roster and you now share its inbox.
+Before send_message, call list_agents. Only send to names that appear there; each entry shows the agent's description and how many messages are queued for it. from must be your registered name. When you need a reply, say so in the body so the recipient responds when done.
 Nothing wakes an idle agent: a message is read only when its recipient calls check_inbox, usually because the user asked it to check its messages. After send_message, end your turn unless a peer is answering within the same turn, in which case call check_inbox with wait_ms > 0 to wait for the reply.
 When check_inbox returns messages, quote the bodies in your reply. Pass those ids as ack_ids on the next check_inbox. If remaining > 0, check_inbox again (wait_ms 0) until remaining is 0.
 Call deregister only when the user says they are done.";
@@ -49,9 +50,19 @@ fn metadata_for(tool_name: &str) -> Option<ToolMetadata> {
         "register" => Some(
             ToolMetadata::new(
                 "register",
-                "Claim this agent name on the local mentischat roster. Idempotent. Use your model name in snake_case (e.g. deepseek_v4_flash); if that name is taken, append a numeric suffix starting at 1 (..._1, ..._2) and pick the lowest free one.",
+                "Claim this agent name on the local mentischat roster. Call list_agents first. Use your model name in snake_case (e.g. deepseek_v4_flash); if that name is taken, append a numeric suffix starting at 1 (..._1, ..._2) and pick the lowest free one. Pass exclusive: true the first time; name_taken means someone else holds the name, so try the next suffix. Without exclusive the call is idempotent and created: false means the name was already registered (its inbox is shared).",
             )
-            .with_parameter(str_param("agent", "The exact roster name to claim")),
+            .with_parameter(str_param("agent", "The exact roster name to claim"))
+            .with_parameter(
+                ToolParameter::new("description", ToolParameterType::String).with_description(
+                    "One line on who you are and what you are working on (max 256 bytes); shown to peers in list_agents. Omit to keep the current one, empty string clears it",
+                ),
+            )
+            .with_parameter(
+                ToolParameter::new("exclusive", ToolParameterType::Boolean)
+                    .with_description("Fail with name_taken instead of joining a name that is already registered; pass true the first time you register")
+                    .with_default(json!(false)),
+            ),
         ),
         "deregister" => Some(
             ToolMetadata::new(
@@ -88,7 +99,7 @@ fn metadata_for(tool_name: &str) -> Option<ToolMetadata> {
         ),
         "list_agents" => Some(ToolMetadata::new(
             "list_agents",
-            "Names on the roster and when each was last seen.",
+            "Names on the roster, each with its description, when it was last seen, and how many messages are queued for it. Call before register and before send_message.",
         )),
         _ => None,
     }
@@ -153,12 +164,9 @@ impl ToolProtocol for MailboxProtocol {
 impl MailboxProtocol {
     async fn register(&self, params: &Value) -> Result<Value, MailboxError> {
         let agent = required_name(params, "agent")?;
-        let out = self.bus.register(&agent).await?;
-        Ok(json!({
-            "agent": out.agent,
-            "created": out.created,
-            "lastSeen": out.last_seen,
-        }))
+        let opts = parse_registration(params)?;
+        let out = self.bus.register_with(&agent, opts).await?;
+        Ok(serde_json::to_value(out).expect("RegisterOutcome is always serializable"))
     }
 
     async fn deregister(&self, params: &Value) -> Result<Value, MailboxError> {
@@ -198,6 +206,46 @@ impl MailboxProtocol {
 fn required_name(params: &Value, key: &str) -> Result<AgentName, MailboxError> {
     let raw = params.get(key).and_then(Value::as_str).unwrap_or("");
     AgentName::parse(raw)
+}
+
+/// The optional `description` and `exclusive` fields of a register call,
+/// shared by the tool and `POST /agents`.
+pub fn parse_registration(params: &Value) -> Result<Registration, MailboxError> {
+    Ok(Registration {
+        description: parse_description(params.get("description"))?,
+        exclusive: parse_flag(params.get("exclusive"))?,
+    })
+}
+
+/// Contract description semantics: absent/null -> keep the stored one; a
+/// string is trimmed, and empty clears it. Anything over
+/// [`MAX_DESCRIPTION_BYTES`] after trimming, containing control characters,
+/// or not a string -> `invalid_description`.
+pub fn parse_description(v: Option<&Value>) -> Result<Option<String>, MailboxError> {
+    match v {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => {
+            let s = s.trim();
+            if s.len() > MAX_DESCRIPTION_BYTES || s.chars().any(char::is_control) {
+                return Err(MailboxError::InvalidDescription);
+            }
+            Ok(Some(s.to_string()))
+        }
+        Some(_) => Err(MailboxError::InvalidDescription),
+    }
+}
+
+/// Optional boolean: absent/null -> false; `true`/`false` or the strings
+/// `"true"`/`"false"` (some clients stringify booleans) -> value; anything
+/// else -> `invalid_body`.
+fn parse_flag(v: Option<&Value>) -> Result<bool, MailboxError> {
+    match v {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(Value::String(s)) if s == "true" => Ok(true),
+        Some(Value::String(s)) if s == "false" => Ok(false),
+        Some(_) => Err(MailboxError::InvalidBody),
+    }
 }
 
 /// Contract wait_ms semantics: absent/null -> 0; integer or digit string in

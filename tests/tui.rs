@@ -24,6 +24,7 @@ fn dashboard() -> Dashboard {
 fn agent(name: &str, secs: i64, queued: i64) -> AgentOverview {
     AgentOverview {
         name: name.into(),
+        description: None,
         seen_secs_ago: secs,
         queued,
     }
@@ -191,8 +192,28 @@ fn the_view_never_mentions_waking() {
         .find(|l| l.contains("last seen"))
         .expect("table header");
     assert!(
-        header.contains("name") && header.contains("queued"),
+        header.contains("name") && header.contains("queued") && header.contains("description"),
         "{header}"
+    );
+}
+
+#[test]
+fn agent_table_shows_descriptions_without_control_characters() {
+    let mut dash = dashboard();
+    let mut reviewer = agent("claude_code", 3, 0);
+    reviewer.description = Some("reviews PRs\u{1b}[31m".into());
+    dash.update(vec![], overview(0, vec![reviewer, agent("grok", 5, 0)]));
+    let out = rendered(&mut dash, 100, 30);
+    let row = out
+        .lines()
+        .find(|l| l.contains("claude_code"))
+        .expect("agent row");
+    assert!(row.contains("reviews PRs?[31m"), "{row}");
+    assert!(!out.contains('\u{1b}'), "escape reached the screen");
+    let bare = out.lines().find(|l| l.contains("grok")).expect("agent row");
+    assert!(
+        bare.contains('—'),
+        "a missing description shows a dash: {bare}"
     );
 }
 

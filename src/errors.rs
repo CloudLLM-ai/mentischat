@@ -2,7 +2,7 @@
 //!
 //! Every variant serialises to the contract error body:
 //! `{"error": code, ...context}`. `known` (the sorted roster) appears on
-//! [`MailboxError::Unregistered`] only.
+//! [`MailboxError::Unregistered`] and [`MailboxError::NameTaken`] only.
 
 use std::fmt;
 
@@ -14,15 +14,21 @@ use serde_json::{json, Value};
 pub enum MailboxError {
     /// Name fails the roster regex.
     InvalidName { agent: String },
-    /// Missing / non-string / whitespace-only / oversized body, or a
-    /// malformed `ack_ids` array.
+    /// Missing / non-string / whitespace-only / oversized body, a body that
+    /// is not JSON, or a malformed flag such as `exclusive`.
     InvalidBody,
     /// `wait_ms` present but not an integer in `0..=30000`.
     InvalidWait,
+    /// `description` is not a string, is over
+    /// [`crate::bus::MAX_DESCRIPTION_BYTES`], or holds control characters.
+    InvalidDescription,
     /// The named agent is not on the roster. Carries the current roster so
     /// callers can self-correct.
     Unregistered { agent: String, known: Vec<String> },
-    /// That recipient already holds `MAX_PENDING_PER_AGENT` unacked rows.
+    /// An `exclusive` register named an agent that is already on the roster.
+    /// Carries the current roster so the caller can pick a free name.
+    NameTaken { agent: String, known: Vec<String> },
+    /// That recipient already holds `MAX_PENDING_PER_AGENT` unread messages.
     QueueFull { to: String, pending: i64 },
     /// Global row cap hit.
     StorageFull { pending: i64 },
@@ -45,7 +51,9 @@ impl MailboxError {
             Self::InvalidName { .. } => "invalid_name",
             Self::InvalidBody => "invalid_body",
             Self::InvalidWait => "invalid_wait",
+            Self::InvalidDescription => "invalid_description",
             Self::Unregistered { .. } => "unregistered",
+            Self::NameTaken { .. } => "name_taken",
             Self::QueueFull { .. } => "queue_full",
             Self::StorageFull { .. } => "storage_full",
             Self::StorageError => "storage_error",
@@ -60,13 +68,15 @@ impl MailboxError {
     pub fn http_status(&self) -> axum::http::StatusCode {
         use axum::http::StatusCode;
         match self {
-            Self::InvalidName { .. } | Self::InvalidBody | Self::InvalidWait => {
-                StatusCode::BAD_REQUEST
-            }
+            Self::InvalidName { .. }
+            | Self::InvalidBody
+            | Self::InvalidWait
+            | Self::InvalidDescription => StatusCode::BAD_REQUEST,
             Self::Unregistered { .. } | Self::NotFound => StatusCode::NOT_FOUND,
-            Self::QueueFull { .. } | Self::TooManyWaiters { .. } | Self::RosterFull { .. } => {
-                StatusCode::CONFLICT
-            }
+            Self::QueueFull { .. }
+            | Self::TooManyWaiters { .. }
+            | Self::RosterFull { .. }
+            | Self::NameTaken { .. } => StatusCode::CONFLICT,
             Self::StorageFull { .. } => StatusCode::INSUFFICIENT_STORAGE,
             Self::StorageError => StatusCode::INTERNAL_SERVER_ERROR,
             Self::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
@@ -77,8 +87,10 @@ impl MailboxError {
     pub fn to_json(&self) -> Value {
         match self {
             Self::InvalidName { agent } => json!({ "error": self.code(), "agent": agent }),
-            Self::InvalidBody | Self::InvalidWait => json!({ "error": self.code() }),
-            Self::Unregistered { agent, known } => {
+            Self::InvalidBody | Self::InvalidWait | Self::InvalidDescription => {
+                json!({ "error": self.code() })
+            }
+            Self::Unregistered { agent, known } | Self::NameTaken { agent, known } => {
                 json!({ "error": self.code(), "agent": agent, "known": known })
             }
             Self::QueueFull { to, pending } => {

@@ -1,8 +1,8 @@
-//! SQLite persistence: schema creation and pragmas only.
+//! SQLite persistence: opening, pragmas, schema and migrations.
 //!
-//! All mailbox logic lives in [`crate::bus`]; this module owns opening the
-//! database with the right on-disk permissions and providing parameterised
-//! SQL helpers over the two tables (`roster`, `messages`).
+//! All mailbox logic and SQL queries live in [`crate::bus`]; this module only
+//! opens the database with the right on-disk permissions and brings the two
+//! tables (`roster`, `messages`) up to the current schema.
 
 use std::fmt;
 use std::fs;
@@ -34,14 +34,22 @@ pub fn open(data_dir: &Path) -> Result<Connection, StoreError> {
         .map_err(StoreError::Sqlite)?;
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(StoreError::Sqlite)?;
+    // NORMAL: WAL keeps the file consistent through a crash; at worst the
+    // last commits roll back on power loss. Stronger durability buys nothing
+    // here, since startup wipes the mailbox unless MENTISCHAT_PERSIST=1.
     conn.pragma_update(None, "synchronous", "NORMAL")
+        .map_err(StoreError::Sqlite)?;
+    // Overwrite deleted content with zeros instead of leaving it in free
+    // pages: read and expired messages must not be recoverable from the file.
+    conn.pragma_update(None, "secure_delete", "ON")
         .map_err(StoreError::Sqlite)?;
 
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS roster (
           name TEXT PRIMARY KEY,
-          last_seen TEXT NOT NULL
+          last_seen TEXT NOT NULL,
+          description TEXT
         );
 
         CREATE TABLE IF NOT EXISTS messages (
@@ -50,21 +58,25 @@ pub fn open(data_dir: &Path) -> Result<Connection, StoreError> {
           recipient TEXT NOT NULL,
           body TEXT NOT NULL,
           created_at TEXT NOT NULL,
-          seq INTEGER NOT NULL,
-          state TEXT NOT NULL CHECK (state IN ('pending', 'in_flight'))
+          seq INTEGER NOT NULL
         );
-
-        CREATE INDEX IF NOT EXISTS idx_inbox ON messages (recipient, state, seq);
         "#,
     )
     .map_err(StoreError::Sqlite)?;
 
     migrate_roster(&conn).map_err(StoreError::Sqlite)?;
+    migrate_messages(&conn).map_err(StoreError::Sqlite)?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_inbox ON messages (recipient, seq);
+         CREATE INDEX IF NOT EXISTS idx_created ON messages (created_at);",
+    )
+    .map_err(StoreError::Sqlite)?;
     Ok(conn)
 }
 
 /// Brings a roster created by an older build up to the current shape: the
-/// wake/nudge columns and their index are dropped, keeping every row.
+/// wake/nudge columns and their index are dropped and the `description`
+/// column is added, keeping every row.
 fn migrate_roster(conn: &Connection) -> Result<(), rusqlite::Error> {
     let mut stmt = conn.prepare("PRAGMA table_info(roster)")?;
     let cols: Vec<String> = stmt
@@ -78,7 +90,42 @@ fn migrate_roster(conn: &Connection) -> Result<(), rusqlite::Error> {
             conn.execute(&format!("ALTER TABLE roster DROP COLUMN {retired}"), [])?;
         }
     }
+    if !cols.iter().any(|c| c == "description") {
+        conn.execute("ALTER TABLE roster ADD COLUMN description TEXT", [])?;
+    }
     Ok(())
+}
+
+/// Brings a `messages` table from the acknowledge-to-delete era up to the
+/// delete-on-read shape: the `state` column (and the index over it) goes,
+/// keeping every unread row. SQLite cannot drop a column a CHECK constraint
+/// names, so the table is rebuilt in one transaction.
+fn migrate_messages(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let has_state = conn
+        .prepare("PRAGMA table_info(messages)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .any(|c| c == "state");
+    if !has_state {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "BEGIN;
+         CREATE TABLE messages_new (
+           id TEXT PRIMARY KEY,
+           sender TEXT NOT NULL,
+           recipient TEXT NOT NULL,
+           body TEXT NOT NULL,
+           created_at TEXT NOT NULL,
+           seq INTEGER NOT NULL
+         );
+         INSERT INTO messages_new (id, sender, recipient, body, created_at, seq)
+           SELECT id, sender, recipient, body, created_at, seq FROM messages;
+         DROP TABLE messages;
+         ALTER TABLE messages_new RENAME TO messages;
+         COMMIT;",
+    )
 }
 
 /// Failure modes of opening/migrating the store.

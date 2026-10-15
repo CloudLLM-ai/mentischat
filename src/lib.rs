@@ -5,13 +5,14 @@
 //! REST surface, served from a single loopback port. Nothing wakes an idle
 //! agent: mail is read when its recipient calls `check_inbox`.
 //!
-//! The daemon is a pipe, not a log: undelivered mail persists in sqlite
-//! (`pending` / `in_flight`) until the recipient acks, then the row is
-//! deleted. There is no history API.
+//! The daemon is a pipe, not a log or a store: a message is deleted the
+//! moment its recipient reads it, unread mail expires after an hour, idle
+//! agents leave the roster after a day, and everything is wiped at startup
+//! and on a clean stop. There is no history API.
 //!
 //! The MCP wire protocol is supplied by the [`mcp`] crate (`cloudllm_mcp`);
-//! this crate owns mailbox semantics: roster, caps, ack/batch delivery, and
-//! blocking pulls.
+//! this crate owns mailbox semantics: roster, caps, delete-on-read batches,
+//! expiry, and blocking pulls.
 
 // The data directory permissions (0700/0600) and SIGTERM handling use
 // Unix-only APIs, so say so at compile time instead of failing with a wall of
@@ -62,7 +63,7 @@ pub const BIND_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 
 pub fn build_router(bus: Arc<bus::Bus>) -> axum::Router {
     let transport = StreamableHttpConfig::new(SERVER_NAME, SERVER_VERSION)
         .with_endpoint_path("/")
-        .with_instructions(tools::INSTRUCTIONS);
+        .with_instructions(tools::instructions(&bus.retention()));
 
     // These two entries are the whole allowlist. Swallowing a rejection here
     // would silently ship a filter that does not say what we think it says,
@@ -88,7 +89,7 @@ pub fn build_router(bus: Arc<bus::Bus>) -> axum::Router {
     rest::router(bus)
         .nest(MCP_ENDPOINT_PATH, mcp_router)
         .layer(DefaultBodyLimit::max(1024 * 1024))
-        .layer(middleware::from_fn(loopback_origin))
+        .layer(middleware::from_fn(loopback_headers))
         .layer(middleware::from_fn(loopback_only))
 }
 
@@ -107,15 +108,26 @@ async fn loopback_only(
     }
 }
 
-/// Browser CSRF guard for REST (and defense-in-depth beside MCP's Origin
-/// filter). Missing `Origin` is allowed (curl, MCP clients). A present
-/// `Origin` must be a loopback http(s) URL.
-async fn loopback_origin(headers: HeaderMap, request: Request, next: Next) -> Response {
-    match headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
-        None => next.run(request).await,
-        Some(origin) if origin_is_loopback(origin) => next.run(request).await,
-        Some(_) => StatusCode::FORBIDDEN.into_response(),
+/// Browser guards for REST (and defense-in-depth beside MCP's own Origin
+/// filter), each header checked only when present so curl and MCP clients
+/// pass:
+///
+/// - `Origin` must be a loopback http(s) URL (cross-site requests / CSRF).
+/// - `Host` must name a loopback host. A DNS-rebinding page reaches
+///   127.0.0.1 under its own hostname and its same-origin `GET`s carry no
+///   `Origin`, so only the `Host` header gives it away.
+async fn loopback_headers(headers: HeaderMap, request: Request, next: Next) -> Response {
+    let present_and_foreign = |name: header::HeaderName, is_loopback: fn(&str) -> bool| {
+        headers
+            .get(name)
+            .is_some_and(|v| !v.to_str().is_ok_and(is_loopback))
+    };
+    if present_and_foreign(header::ORIGIN, origin_is_loopback)
+        || present_and_foreign(header::HOST, host_is_loopback)
+    {
+        return StatusCode::FORBIDDEN.into_response();
     }
+    next.run(request).await
 }
 
 fn origin_is_loopback(origin: &str) -> bool {
@@ -124,7 +136,11 @@ fn origin_is_loopback(origin: &str) -> bool {
         o if o.starts_with("https://") => &o["https://".len()..],
         _ => return false,
     };
-    let hostport = without_scheme.split('/').next().unwrap_or("");
+    host_is_loopback(without_scheme.split('/').next().unwrap_or(""))
+}
+
+/// `hostport` is `host`, `host:port`, `[v6]` or `[v6]:port`.
+fn host_is_loopback(hostport: &str) -> bool {
     let host = if let Some(rest) = hostport.strip_prefix('[') {
         rest.split(']').next().unwrap_or("")
     } else {

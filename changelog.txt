@@ -1,5 +1,80 @@
 UNRELEASED
 
+  - feat(bus)!: read once, then gone. check_inbox deletes the batch it returns,
+    in the same transaction, so each message is delivered exactly once and
+    nothing is kept. The ack step is removed: the in_flight state, the
+    check_inbox ack_ids parameter and POST /inboxes/{agent}/ack are gone (old
+    databases are migrated, keeping unread rows). A truncated tool result or
+    a dropped connection after delivery now loses that batch instead of
+    redelivering it.
+
+  - feat(bus): short-lived mail. Unread messages expire after
+    MENTISCHAT_MESSAGE_TTL (default 1h) and agents idle past
+    MENTISCHAT_AGENT_TTL (default 24h) leave the roster with their unread mail
+    (never while a pull is parked); register, send_message and check_inbox
+    all count as activity. The daemon sweeps every minute. Values are
+    seconds or a number with s/m/h/d. The MCP instructions tell agents both
+    lifetimes.
+
+  - feat(store): nothing persists. The roster and all mail are wiped at
+    startup (clearing whatever a crashed run left) as well as on a clean stop;
+    MENTISCHAT_PERSIST=1 keeps them. Deleted text is overwritten
+    (secure_delete), the WAL is truncated after every read, deregister, sweep and wipe,
+    and a wipe compacts the file (VACUUM).
+
+  - fix(bus): a blocking pull that took a send's wake-up and was then
+    cancelled (client gone) swallowed it, leaving the other pulls parked
+    under that name asleep until their timeout with mail waiting; it now
+    hands the wake to the next live waiter. A woken pull that finds nothing
+    to deliver (another pull took it) parks again for the rest of wait_ms
+    instead of returning empty early.
+
+  - fix(bus): the 16 KiB batch cap counts each message's serialized JSON,
+    not its raw body, so heavily escaped bodies cannot blow past client
+    truncation limits. send takes delivery order from an in-memory counter
+    seeded at open instead of a MAX(seq) scan, and checks both queue caps in
+    one query.
+
+  - fix(http): a REST path or query axum cannot decode (/inboxes/%FF,
+    ?wait_ms=%FF) answered axum's plain-text 400; it now returns the typed
+    invalid_name / invalid_wait JSON like every other failure. invalid_name
+    echoes at most 64 characters of the rejected input.
+
+  - fix(security): requests whose Host header names a non-loopback host get
+    403, closing DNS rebinding: a rebound page reaches 127.0.0.1 under its own
+    hostname and its same-origin GETs (GET /inboxes/{agent}, GET /agents)
+    carry no Origin, so the Origin guard alone let it read mail. A missing
+    Host is still allowed.
+
+  - fix(bus): blocking pulls whose client disconnected stayed parked forever
+    and counted toward the 8-waiter cap, so after eight dropped connections
+    every blocking pull for that name failed too_many_waiters. Closed waiters
+    are now pruned before parking. Promoting a batch to in_flight runs in one
+    transaction; a pull writes last_seen once (and again when a park ends)
+    instead of twice; lastSeen and createdAt are stamped under the bus lock
+    so they cannot go backwards; deregister counts discarded rows from the
+    DELETE instead of a separate COUNT. The bus, not the transports, now
+    validates descriptions, so the library API enforces the same caps.
+
+  - fix(main): bind the port before opening the data directory, so a second
+    instance exits on the single-instance lock before it touches (or
+    migrates) the live instance's database.
+
+  - chore(ci): CI ran on pushes to main, but the default branch is master;
+    it now runs there, with a read-only token. make check/clippy/test/doc
+    pass --locked like CI.
+
+  - feat(roster): register takes an optional description (max 256 bytes,
+    trimmed, no control characters; omitted keeps the stored one, "" clears
+    it) and an optional exclusive flag. An exclusive register of a name that
+    is already on the roster fails name_taken (409) and leaves the holder's
+    description and last_seen alone, so two agents can no longer silently
+    share one inbox. list_agents returns each agent's description and queue
+    depth (queued); the terminal table gains a DESCRIPTION column. Older
+    databases gain the description column on open. The instructions and tool
+    descriptions say to call list_agents before register, to pass
+    exclusive: true on first registration, and what created: false means.
+
   - fix(security): REST/MCP Origin guard rejects non-loopback Origin (curl
     with no Origin still works); roster capped at 256 agents (roster_full);
     in_flight redelivery uses the same batch byte/count caps and remaining

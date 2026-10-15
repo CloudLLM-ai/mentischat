@@ -1,10 +1,12 @@
-//! Batch-and-ack delivery: promoting `pending` rows to `in_flight`,
-//! redelivering unacked rows within the same caps, and deleting acked rows.
+//! Delete-on-read delivery: a pull takes the oldest unread rows that fit the
+//! batch caps and deletes them in the same transaction that returns them.
+//! Nothing is kept once it has been read.
 
 use rusqlite::params;
 
 use super::{
-    now_rfc3339, sqlite_storage, InboxPage, Inner, MailErr, Message, MAX_BATCH, MAX_RETURN_BYTES,
+    now_rfc3339, sqlite_storage, truncate_wal, InboxPage, Inner, MailErr, Message, MAX_BATCH,
+    MAX_RETURN_BYTES,
 };
 
 pub(super) fn empty_page(name: &crate::names::AgentName) -> InboxPage {
@@ -15,35 +17,7 @@ pub(super) fn empty_page(name: &crate::names::AgentName) -> InboxPage {
     }
 }
 
-/// Deletes the `in_flight` rows named in `ack_ids` that `name` owns, in one
-/// transaction, and returns how many were removed. Unknown ids are ignored.
-pub(super) fn delete_acked(g: &mut Inner, name: &str, ack_ids: &[String]) -> Result<i64, MailErr> {
-    if ack_ids.is_empty() {
-        return Ok(0);
-    }
-    let tx = g.conn.transaction().map_err(sqlite_storage)?;
-    let mut acked = 0i64;
-    {
-        let mut stmt = tx
-            .prepare(
-                "DELETE FROM messages
-                 WHERE id = ?1 AND recipient = ?2 AND state = 'in_flight'",
-            )
-            .map_err(sqlite_storage)?;
-        for id in ack_ids {
-            acked += stmt.execute(params![id, name]).map_err(sqlite_storage)? as i64;
-        }
-    }
-    tx.commit().map_err(sqlite_storage)?;
-    Ok(acked)
-}
-
-pub(super) fn apply_acks(g: &mut Inner, name: &str, ack_ids: &[String]) -> Result<(), MailErr> {
-    delete_acked(g, name, ack_ids)?;
-    touch_last_seen(g, name)
-}
-
-fn touch_last_seen(g: &mut Inner, name: &str) -> Result<(), MailErr> {
+pub(super) fn touch_last_seen(g: &mut Inner, name: &str) -> Result<(), MailErr> {
     g.conn
         .execute(
             "UPDATE roster SET last_seen = ?2 WHERE name = ?1",
@@ -53,75 +27,74 @@ fn touch_last_seen(g: &mut Inner, name: &str) -> Result<(), MailErr> {
         .map(|_| ())
 }
 
-/// Deliver per batch+ack rules; `None` means both states are empty.
+/// Take the next batch for `name` and delete it; `None` when the inbox is
+/// empty.
 ///
-/// Redeliver unacked `in_flight` FIFO within the same batch caps as a fresh
-/// promote; else promote up to `MAX_BATCH` pending rows within
-/// `MAX_RETURN_BYTES` of body bytes (the first message always rides even when
-/// oversized — progress must be possible).
-pub(super) fn deliver_locked(g: &mut Inner, name: &str) -> Result<Option<InboxPage>, MailErr> {
-    let in_flight = load_rows(g, name, "in_flight", None)?;
-    if !in_flight.is_empty() {
-        let batch = take_batch(&in_flight);
-        return page(g, name, batch).map(Some);
-    }
-
-    let candidates = load_rows(g, name, "pending", Some(MAX_BATCH))?;
+/// Up to [`MAX_BATCH`] rows within [`MAX_RETURN_BYTES`] of serialized message
+/// JSON (the first message always rides even when oversized — progress must
+/// be possible). The rows are deleted before the page is returned, so a
+/// message is handed out exactly once.
+pub(super) fn take_locked(g: &mut Inner, name: &str) -> Result<Option<InboxPage>, MailErr> {
+    let candidates = load_rows(g, name, MAX_BATCH)?;
     if candidates.is_empty() {
         return Ok(None);
     }
-    let batch = take_batch(&candidates);
-    for msg in &batch {
-        g.conn
-            .execute(
-                "UPDATE messages SET state = 'in_flight' WHERE id = ?1",
-                params![msg.id],
-            )
+    let messages = take_batch(&candidates);
+    let tx = g.conn.transaction().map_err(sqlite_storage)?;
+    {
+        let mut stmt = tx
+            .prepare("DELETE FROM messages WHERE id = ?1")
             .map_err(sqlite_storage)?;
-    }
-    page(g, name, batch).map(Some)
-}
-
-/// Select a prefix of `candidates` (already seq-ordered) that fits
-/// [`MAX_BATCH`] and [`MAX_RETURN_BYTES`]. The first message is always kept.
-fn take_batch(candidates: &[Message]) -> Vec<Message> {
-    let mut take = 0usize;
-    let mut bytes = 0usize;
-    for msg in candidates.iter().take(MAX_BATCH as usize) {
-        if take > 0 && bytes + msg.body.len() > MAX_RETURN_BYTES {
-            break;
+        for msg in &messages {
+            stmt.execute(params![msg.id]).map_err(sqlite_storage)?;
         }
-        bytes += msg.body.len();
-        take += 1;
     }
-    candidates[..take].to_vec()
-}
-
-fn page(g: &mut Inner, name: &str, messages: Vec<Message>) -> Result<InboxPage, MailErr> {
-    // Unacked rows not in this page (leftover in_flight + still-pending).
-    let total: i64 = g
-        .conn
+    let remaining: i64 = tx
         .query_row(
             "SELECT COUNT(*) FROM messages WHERE recipient = ?1",
             params![name],
             |r| r.get(0),
         )
         .map_err(sqlite_storage)?;
-    let remaining = (total - messages.len() as i64).max(0);
-    touch_last_seen(g, name)?;
-    Ok(InboxPage {
+    tx.commit().map_err(sqlite_storage)?;
+    // The delivered text is gone from the tables (secure_delete zeroes it in
+    // the database pages); truncate the log so no copy stays in `-wal`.
+    truncate_wal(&g.conn);
+    Ok(Some(InboxPage {
         agent: name.to_string(),
         messages,
         remaining,
-    })
+    }))
 }
 
-fn load_rows(
-    g: &Inner,
-    name: &str,
-    state: &str,
-    limit: Option<i64>,
-) -> Result<Vec<Message>, MailErr> {
+/// Select a prefix of `candidates` (already seq-ordered) that fits
+/// [`MAX_BATCH`] and [`MAX_RETURN_BYTES`]. The first message is always kept.
+///
+/// Size is each message's serialized JSON, not its raw body: escaping can
+/// make a body several times longer on the wire (a control character becomes
+/// six bytes), and the wire size is what has to stay under client truncation
+/// limits.
+fn take_batch(candidates: &[Message]) -> Vec<Message> {
+    let mut take = 0usize;
+    let mut bytes = 0usize;
+    for msg in candidates.iter().take(MAX_BATCH as usize) {
+        let size = wire_len(msg);
+        if take > 0 && bytes + size > MAX_RETURN_BYTES {
+            break;
+        }
+        bytes += size;
+        take += 1;
+    }
+    candidates[..take].to_vec()
+}
+
+fn wire_len(msg: &Message) -> usize {
+    // Serializing plain strings cannot fail; fall back to the body length
+    // rather than panic if it ever did.
+    serde_json::to_vec(msg).map_or(msg.body.len(), |v| v.len())
+}
+
+fn load_rows(g: &Inner, name: &str, limit: i64) -> Result<Vec<Message>, MailErr> {
     let map = |r: &rusqlite::Row| {
         Ok(Message {
             id: r.get(0)?,
@@ -135,11 +108,11 @@ fn load_rows(
         .conn
         .prepare(
             "SELECT id, sender, body, created_at FROM messages
-             WHERE recipient = ?1 AND state = ?2 ORDER BY seq ASC LIMIT ?3",
+             WHERE recipient = ?1 ORDER BY seq ASC LIMIT ?2",
         )
         .map_err(sqlite_storage)?;
     let rows = stmt
-        .query_map(params![name, state, limit.unwrap_or(i64::MAX)], map)
+        .query_map(params![name, limit], map)
         .map_err(sqlite_storage)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(sqlite_storage)?;

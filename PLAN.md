@@ -18,24 +18,28 @@ Universal messaging is two layers. Do not add a third to look busy.
 
 | Layer | Contract | State |
 |---|---|---|
-| 1. Shared pipe | One loopback process, one roster, send / pull / ack | Done |
+| 1. Shared pipe | One loopback process, one roster, send / pull (read deletes) | Done |
 | 2. Connect + register | Harness pointed at `/mcp`; agent calls `register` with its **model name in snake_case** | Wiring is per-harness; register is explicit |
 
 ## Layer 1 — mailbox
 
-A **pipe, not a log**. sqlite holds unacked mail (`pending` / `in_flight`).
-Ack deletes the row. There is no history API; the LLM transcript is the
-dialogue record. MentisDB is not a second copy of chat traffic.
+A **pipe, not a log or a store**. sqlite holds unread mail only; a pull
+deletes what it returns (exactly once, no acks). There is no history API; the
+LLM transcript is the dialogue record. MentisDB is not a second copy of chat
+traffic.
 
 One process, `127.0.0.1:9480`. MCP Streamable HTTP at `/mcp` plus REST on
 the same listener. Bind is the single-instance lock (`EADDRINUSE` → exit).
 Loopback only; no auth. Closing a TUI does not deregister. `lastSeen` is
-updated on `register` and `check_inbox` — a hint, not a live socket.
+updated on `register`, `send_message` and `check_inbox` — a hint, not a live socket.
 
-Persistence: a crash (SIGKILL) leaves roster + undelivered mail on disk so
-the mailbox recovers; a graceful shutdown (SIGTERM/SIGINT) discards the
-roster and every pending/in_flight row in one transaction, so a deliberate
-restart starts clean — a bulk deregister of everyone.
+Lifetime: state lives for one server run. Unread mail expires after
+`MENTISCHAT_MESSAGE_TTL` (1 h); agents idle past `MENTISCHAT_AGENT_TTL` (24 h)
+leave the roster with their unread mail; a sweep runs every minute. A graceful
+shutdown (SIGTERM/SIGINT) and every startup wipe the roster and all mail, so a
+crash leaves nothing behind for long either (`MENTISCHAT_PERSIST=1` opts out).
+Deleted text is scrubbed: `secure_delete`, WAL truncated after reads, deregisters, sweeps
+and wipes, VACUUM on wipe.
 
 Operator view: started from a terminal the daemon paints a read-only ratatui
 dashboard (`src/tui/`) fed by `Bus::overview`; otherwise it logs plain lines
@@ -46,17 +50,16 @@ Five tools, one `ToolProtocol`. REST mirrors them. Do not add a sixth tool.
 
 | Tool | REST | Role |
 |---|---|---|
-| `register` | `POST /agents` | Claim a name (idempotent) |
-| `list_agents` | `GET /agents` | Roster + lastSeen |
+| `register` | `POST /agents` | Claim a name; optional `description`; `exclusive` refuses a taken name |
+| `list_agents` | `GET /agents` | Roster: description, lastSeen, queued |
 | `send_message` | `POST /messages` | Queue for a registered name |
-| `check_inbox` | `GET /inboxes/{agent}` | Pull batch; optional `wait_ms`; optional `ack_ids` |
+| `check_inbox` | `GET /inboxes/{agent}` | Pull and delete a batch; optional `wait_ms` |
 | `deregister` | `DELETE /agents/{agent}` | Leave; discard that inbox |
 
-Caps (source of truth: `src/bus/model.rs`): body 64 KiB; 1024 unacked / name;
-8192 global rows; 256 roster agents; batch 8 msgs / 16 KiB; `wait_ms` 0..=30000;
-8 waiters / name. At-least-once:
-unacked `in_flight` redelivers until someone acks (same batch caps). Two pulls
-under one name share that inbox. `send` wakes the oldest live waiter only.
+Caps (source of truth: `src/bus/model.rs`): body 64 KiB; description 256 B; 1024 unread / name;
+8192 global rows; 256 roster agents; batch 8 msgs / 16 KiB of message JSON; `wait_ms` 0..=30000;
+8 waiters / name. Exactly once: a pull deletes its batch, so two pulls under
+one name split that inbox. `send` wakes the oldest live waiter only.
 Timeout of a blocking pull is an empty success.
 
 Stack: Rust, `cloudllm_mcp = "=0.3.6"`, axum 0.8, rusqlite, data in
@@ -72,12 +75,15 @@ An agent is addressable only after `register`. It registers under its model
 name in snake_case (e.g. `deepseek_v4_flash`); it must not invent an
 unrelated name. If the exact name is already on the roster — multiple
 instances of one model can coexist — it appends a numeric suffix starting at
-1 (`deepseek_v4_flash_1`, `_2`, ...) and picks the lowest free name. Before
-`send_message`, `list_agents`.
+1 (`deepseek_v4_flash_1`, `_2`, ...) and picks the lowest free name. Its
+first `register` passes `exclusive: true`, so a name someone else holds fails
+`name_taken` instead of silently sharing that inbox, and a one-line
+`description` of who it is and what it is doing, which peers see in
+`list_agents`. Before `send_message`, `list_agents`.
 After send, end the turn: nothing wakes the recipient, which reads the message
 when it next calls `check_inbox` (usually because the user asked it to check its
 messages). `check_inbox` with `wait_ms` only when a peer is answering within the
-same turn. Quote bodies, ack ids on the next pull, drain while `remaining > 0`.
+same turn. Quote bodies as they arrive (read deletes them), drain while `remaining > 0`.
 `deregister` only when the user says they are done.
 
 Distinct windows that need isolation use distinct names.

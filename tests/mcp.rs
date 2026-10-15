@@ -144,14 +144,21 @@ async fn domain_error_is_iserror_true_content_block() {
 }
 
 #[tokio::test]
-async fn register_tool_takes_only_an_agent_name() {
+async fn register_tool_takes_a_name_description_and_exclusive_flag() {
     let (_d, app) = app();
     let (_, resp) = rpc(&app, "tools/list", json!({})).await;
     let tools = resp["result"]["tools"].as_array().unwrap();
     let register = tools.iter().find(|t| t["name"] == "register").unwrap();
     let props = register["inputSchema"]["properties"].as_object().unwrap();
-    let names: Vec<&str> = props.keys().map(String::as_str).collect();
-    assert_eq!(names, ["agent"], "no wakeId or nudgeTransport parameter");
+    let mut names: Vec<&str> = props.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        ["agent", "description", "exclusive"],
+        "no wakeId or nudgeTransport parameter"
+    );
+    let required = register["inputSchema"]["required"].as_array().unwrap();
+    assert_eq!(required, &[json!("agent")], "only the name is required");
 
     let (_, reg) = rpc(
         &app,
@@ -222,12 +229,11 @@ async fn send_and_pull_over_mcp_roundtrip() {
     let page: Value = serde_json::from_str(text).unwrap();
     assert_eq!(page["messages"][0]["body"], "ping");
 
-    // Ack via the next pull.
-    let id = page["messages"][0]["id"].as_str().unwrap().to_string();
+    // Read means gone: the next pull is empty.
     let (_, resp) = rpc(
         &app,
         "tools/call",
-        json!({ "name": "check_inbox", "arguments": { "agent": "codex", "wait_ms": 0, "ack_ids": [id] } }),
+        json!({ "name": "check_inbox", "arguments": { "agent": "codex", "wait_ms": 0 } }),
     )
     .await;
     let text = resp["result"]["content"][0]["text"].as_str().unwrap();
@@ -350,4 +356,102 @@ async fn non_loopback_peer_is_403() {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status().as_u16(), 403);
+}
+
+#[tokio::test]
+async fn register_over_mcp_stores_a_description_and_honors_exclusive() {
+    let (_d, app) = app();
+    let call = |args: Value| json!({ "name": "register", "arguments": args });
+
+    let (_, reg) = rpc(
+        &app,
+        "tools/call",
+        call(json!({"agent": "grok", "description": "reviews PRs", "exclusive": true})),
+    )
+    .await;
+    assert_eq!(reg["result"]["isError"], false, "{reg}");
+    let out: Value =
+        serde_json::from_str(reg["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(out["created"], true);
+    assert_eq!(out["description"], "reviews PRs");
+
+    let (_, taken) = rpc(
+        &app,
+        "tools/call",
+        call(json!({"agent": "grok", "exclusive": true})),
+    )
+    .await;
+    assert_eq!(taken["result"]["isError"], true, "{taken}");
+    let err: Value =
+        serde_json::from_str(taken["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(err["error"], "name_taken");
+
+    let (_, list) = rpc(
+        &app,
+        "tools/call",
+        json!({ "name": "list_agents", "arguments": {} }),
+    )
+    .await;
+    let roster: Value =
+        serde_json::from_str(list["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(roster["agents"][0]["description"], "reviews PRs");
+    assert_eq!(roster["agents"][0]["queued"], 0);
+}
+
+#[tokio::test]
+async fn dns_rebinding_host_gets_403() {
+    let (_d, app) = app();
+    let get = |host: &str| {
+        http::Request::builder()
+            .method("GET")
+            .uri("/agents")
+            .header("host", host)
+            .body(axum::body::Body::empty())
+            .unwrap()
+    };
+    // A rebound page sends its own hostname and, on a same-origin GET, no Origin.
+    for foreign in [
+        "evil.example:9480",
+        "localhost.evil.example:9480",
+        "127.0.0.2:9480",
+    ] {
+        let resp = app.clone().oneshot(get(foreign)).await.unwrap();
+        assert_eq!(resp.status().as_u16(), 403, "Host {foreign}");
+    }
+    for loopback in [
+        "127.0.0.1:9480",
+        "localhost:9480",
+        "[::1]:9480",
+        "localhost",
+    ] {
+        let resp = app.clone().oneshot(get(loopback)).await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "Host {loopback}");
+    }
+}
+
+#[tokio::test]
+async fn agents_are_told_reads_delete_and_unread_mail_expires() {
+    let (_d, app) = app();
+    let (_, init) = rpc(
+        &app,
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}),
+    )
+    .await;
+    let instructions = init["result"]["instructions"].as_str().unwrap();
+    assert!(
+        instructions.contains("deletes the messages it returns"),
+        "{instructions}"
+    );
+    assert!(
+        instructions.contains("expire 1 hour after"),
+        "{instructions}"
+    );
+    assert!(instructions.contains("for 1 day"), "{instructions}");
+    assert!(!instructions.contains("ack_ids"), "{instructions}");
+
+    let (_, list) = rpc(&app, "tools/list", json!({})).await;
+    let tools = list["result"]["tools"].as_array().unwrap();
+    let inbox = tools.iter().find(|t| t["name"] == "check_inbox").unwrap();
+    assert!(inbox["inputSchema"]["properties"].get("ack_ids").is_none());
 }

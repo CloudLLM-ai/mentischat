@@ -12,19 +12,41 @@ use std::sync::Arc;
 use mcp::protocol::{ToolMetadata, ToolParameter, ToolParameterType, ToolProtocol, ToolResult};
 use serde_json::{json, Value};
 
-use crate::bus::Bus;
+use crate::bus::{Bus, Registration, Retention};
 use crate::errors::MailboxError;
 use crate::names::AgentName;
 
 /// Ritual returned in the MCP `initialize` result so every harness sees the
-/// same instructions.
+/// same instructions; [`instructions`] appends the retention line.
 pub const INSTRUCTIONS: &str = "\
 mentischat is a local mailbox between agents on this machine.
-Register using your model name in snake_case, e.g. deepseek_v4_flash. If that exact name is already on the roster (multiple instances of the same model can coexist), append a numeric suffix starting at 1 — deepseek_v4_flash_1, _2, ... — and pick the lowest free name. Call list_agents first to see which names are taken.
-Before send_message, call list_agents. Only send to names that appear there. from must be your registered name. When you need a reply, say so in the body so the recipient responds when done.
+Register using your model name in snake_case, e.g. deepseek_v4_flash, with a one-line description of who you are and what you are working on. Call list_agents first to see which names are taken. If that exact name is already on the roster (multiple instances of the same model can coexist), append a numeric suffix starting at 1 — deepseek_v4_flash_1, _2, ... — and pick the lowest free name.
+The first time you register in a conversation, pass exclusive: true. If that fails with name_taken, another agent already holds the name: try the next free suffix. Never take over a name you did not register yourself: without exclusive, created: false means the name was already on the roster and you now share its inbox.
+Before send_message, call list_agents. Only send to names that appear there; each entry shows the agent's description and how many messages are queued for it. from must be your registered name. When you need a reply, say so in the body so the recipient responds when done.
 Nothing wakes an idle agent: a message is read only when its recipient calls check_inbox, usually because the user asked it to check its messages. After send_message, end your turn unless a peer is answering within the same turn, in which case call check_inbox with wait_ms > 0 to wait for the reply.
-When check_inbox returns messages, quote the bodies in your reply. Pass those ids as ack_ids on the next check_inbox. If remaining > 0, check_inbox again (wait_ms 0) until remaining is 0.
+check_inbox deletes the messages it returns: each is delivered once and nothing is kept, so quote the bodies in your reply right away. If remaining > 0, check_inbox again (wait_ms 0) until remaining is 0.
 Call deregister only when the user says they are done.";
+
+/// [`INSTRUCTIONS`] plus how long unread mail and idle agents are kept, in
+/// the units the operator configured.
+pub fn instructions(retention: &Retention) -> String {
+    format!(
+        "{INSTRUCTIONS}\nUnread messages expire {} after they are sent. An agent that has not called register, send_message or check_inbox for {} is dropped from the roster with its unread mail; if a call fails unregistered, register again.",
+        human(retention.message_ttl),
+        human(retention.agent_ttl),
+    )
+}
+
+/// `90s` -> "90 seconds", `3600s` -> "1 hour": the largest unit that divides
+/// the duration exactly.
+fn human(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    let (n, unit) = [(86_400, "day"), (3_600, "hour"), (60, "minute")]
+        .into_iter()
+        .find(|(size, _)| secs >= *size && secs.is_multiple_of(*size))
+        .map_or((secs, "second"), |(size, unit)| (secs / size, unit));
+    format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
+}
 
 /// MCP tool surface over the shared [`Bus`].
 pub struct MailboxProtocol {
@@ -49,9 +71,19 @@ fn metadata_for(tool_name: &str) -> Option<ToolMetadata> {
         "register" => Some(
             ToolMetadata::new(
                 "register",
-                "Claim this agent name on the local mentischat roster. Idempotent. Use your model name in snake_case (e.g. deepseek_v4_flash); if that name is taken, append a numeric suffix starting at 1 (..._1, ..._2) and pick the lowest free one.",
+                "Claim this agent name on the local mentischat roster. Call list_agents first. Use your model name in snake_case (e.g. deepseek_v4_flash); if that name is taken, append a numeric suffix starting at 1 (..._1, ..._2) and pick the lowest free one. Pass exclusive: true the first time; name_taken means someone else holds the name, so try the next suffix. Without exclusive the call is idempotent and created: false means the name was already registered (its inbox is shared).",
             )
-            .with_parameter(str_param("agent", "The exact roster name to claim")),
+            .with_parameter(str_param("agent", "The exact roster name to claim"))
+            .with_parameter(
+                ToolParameter::new("description", ToolParameterType::String).with_description(
+                    "One line on who you are and what you are working on (max 256 bytes); shown to peers in list_agents. Omit to keep the current one, empty string clears it",
+                ),
+            )
+            .with_parameter(
+                ToolParameter::new("exclusive", ToolParameterType::Boolean)
+                    .with_description("Fail with name_taken instead of joining a name that is already registered; pass true the first time you register")
+                    .with_default(json!(false)),
+            ),
         ),
         "deregister" => Some(
             ToolMetadata::new(
@@ -72,23 +104,18 @@ fn metadata_for(tool_name: &str) -> Option<ToolMetadata> {
         "check_inbox" => Some(
             ToolMetadata::new(
                 "check_inbox",
-                "Return the next batch of messages for this registered name (at-least-once). Optional ack_ids deletes previously returned in-flight messages. wait_ms (0-30000) blocks for mail — use only when a peer is replying within the same turn. Quote bodies, then ack those ids on the next call. If remaining > 0, call again.",
+                "Return and delete the next batch of messages for this registered name: each message is delivered once, so quote the bodies right away. wait_ms (0-30000) blocks for mail — use only when a peer is replying within the same turn. If remaining > 0, call again.",
             )
             .with_parameter(str_param("agent", "Your registered name"))
             .with_parameter(
                 ToolParameter::new("wait_ms", ToolParameterType::Integer)
                     .with_description("Block up to this many ms waiting for mail (0-30000); use 0 unless a peer is replying within this turn")
                     .with_default(json!(0)),
-            )
-            .with_parameter(
-                ToolParameter::new("ack_ids", ToolParameterType::Array)
-                    .with_description("Ids of previously delivered messages to acknowledge (delete)")
-                    .with_items(ToolParameterType::String),
             ),
         ),
         "list_agents" => Some(ToolMetadata::new(
             "list_agents",
-            "Names on the roster and when each was last seen.",
+            "Names on the roster, each with its description, when it was last seen, and how many messages are queued for it. Call before register and before send_message.",
         )),
         _ => None,
     }
@@ -153,18 +180,15 @@ impl ToolProtocol for MailboxProtocol {
 impl MailboxProtocol {
     async fn register(&self, params: &Value) -> Result<Value, MailboxError> {
         let agent = required_name(params, "agent")?;
-        let out = self.bus.register(&agent).await?;
-        Ok(json!({
-            "agent": out.agent,
-            "created": out.created,
-            "lastSeen": out.last_seen,
-        }))
+        let opts = parse_registration(params)?;
+        let out = self.bus.register_with(&agent, opts).await?;
+        Ok(serde_json::to_value(out).expect("RegisterOutcome is always serializable"))
     }
 
     async fn deregister(&self, params: &Value) -> Result<Value, MailboxError> {
         let agent = required_name(params, "agent")?;
         let out = self.bus.deregister(&agent).await?;
-        Ok(json!({ "agent": out.agent, "discarded": out.discarded }))
+        Ok(serde_json::to_value(out).expect("DiscardOutcome is always serializable"))
     }
 
     async fn send_message(&self, params: &Value) -> Result<Value, MailboxError> {
@@ -177,14 +201,13 @@ impl MailboxProtocol {
             .ok_or(MailboxError::InvalidBody)?
             .to_string();
         let out = self.bus.send(&from, &to, body).await?;
-        Ok(json!({ "id": out.id, "from": out.from, "to": out.to, "createdAt": out.created_at }))
+        Ok(serde_json::to_value(out).expect("SendReceipt is always serializable"))
     }
 
     async fn check_inbox(&self, params: &Value) -> Result<Value, MailboxError> {
         let agent = required_name(params, "agent")?;
         let wait_ms = parse_wait_ms(params.get("wait_ms"))?;
-        let ack_ids = parse_ack_ids(params.get("ack_ids"))?;
-        let page = self.bus.check_inbox(&agent, wait_ms, ack_ids).await?;
+        let page = self.bus.check_inbox(&agent, wait_ms).await?;
         Ok(serde_json::to_value(page).expect("InboxPage is always serializable"))
     }
 
@@ -198,6 +221,40 @@ impl MailboxProtocol {
 fn required_name(params: &Value, key: &str) -> Result<AgentName, MailboxError> {
     let raw = params.get(key).and_then(Value::as_str).unwrap_or("");
     AgentName::parse(raw)
+}
+
+/// The optional `description` and `exclusive` fields of a register call,
+/// shared by the tool and `POST /agents`.
+pub fn parse_registration(params: &Value) -> Result<Registration, MailboxError> {
+    Ok(Registration {
+        description: parse_description(params.get("description"))?,
+        exclusive: parse_flag(params.get("exclusive"))?,
+    })
+}
+
+/// Contract description semantics: absent/null -> keep the stored one; a
+/// string is passed to the bus, which trims it, treats empty as "clear", and
+/// rejects anything over [`crate::bus::MAX_DESCRIPTION_BYTES`] or containing
+/// control characters; any other JSON type -> `invalid_description`.
+pub fn parse_description(v: Option<&Value>) -> Result<Option<String>, MailboxError> {
+    match v {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(MailboxError::InvalidDescription),
+    }
+}
+
+/// Optional boolean: absent/null -> false; `true`/`false` or the strings
+/// `"true"`/`"false"` (some clients stringify booleans) -> value; anything
+/// else -> `invalid_body`.
+fn parse_flag(v: Option<&Value>) -> Result<bool, MailboxError> {
+    match v {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(Value::String(s)) if s == "true" => Ok(true),
+        Some(Value::String(s)) if s == "false" => Ok(false),
+        Some(_) => Err(MailboxError::InvalidBody),
+    }
 }
 
 /// Contract wait_ms semantics: absent/null -> 0; integer or digit string in
@@ -225,27 +282,4 @@ pub fn parse_wait_ms(v: Option<&Value>) -> Result<u32, MailboxError> {
         .ok()
         .filter(|w| *w <= crate::bus::MAX_WAIT_MS)
         .ok_or(MailboxError::InvalidWait)
-}
-
-/// Contract ack_ids semantics: absent/null -> empty; array of strings ->
-/// ids; anything else -> `invalid_body`. Arrays longer than
-/// [`crate::bus::MAX_ACK_IDS`] are rejected: no inbox can hold more than that
-/// many unacked rows, so a longer list is junk that would otherwise run as
-/// that many statements while holding the bus lock.
-pub fn parse_ack_ids(v: Option<&Value>) -> Result<Vec<String>, MailboxError> {
-    match v {
-        None | Some(Value::Null) => Ok(Vec::new()),
-        Some(Value::Array(items)) if items.len() > crate::bus::MAX_ACK_IDS => {
-            Err(MailboxError::InvalidBody)
-        }
-        Some(Value::Array(items)) => items
-            .iter()
-            .map(|item| {
-                item.as_str()
-                    .map(str::to_string)
-                    .ok_or(MailboxError::InvalidBody)
-            })
-            .collect(),
-        Some(_) => Err(MailboxError::InvalidBody),
-    }
 }

@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::extract::rejection::JsonRejection;
+use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -28,7 +28,6 @@ pub fn router(bus: Ctx) -> Router {
         .route("/agents/{agent}", delete(deregister_one))
         .route("/messages", post(send_msg))
         .route("/inboxes/{agent}", get(pull))
-        .route("/inboxes/{agent}/ack", post(ack))
         .route("/health", get(health))
         .fallback(not_found)
         .with_state(bus)
@@ -62,7 +61,20 @@ fn json_body(body: Result<Json<Value>, JsonRejection>) -> Result<Value, Response
     }
 }
 
-/// `POST /agents` `{ "agent" }` — same as register.
+/// The `{agent}` path segment. A segment axum cannot decode (invalid
+/// percent-encoding or UTF-8) is an `invalid_name` like any other bad name,
+/// not axum's plain-text 400.
+#[allow(clippy::result_large_err)]
+fn path_name(path: Result<Path<String>, PathRejection>) -> Result<AgentName, Response> {
+    let Path(raw) = path.map_err(|_| {
+        err_response(MailboxError::InvalidName {
+            agent: String::new(),
+        })
+    })?;
+    AgentName::parse(&raw).map_err(err_response)
+}
+
+/// `POST /agents` `{ "agent", "description"?, "exclusive"? }` — same as register.
 async fn register(State(bus): State<Ctx>, body: Result<Json<Value>, JsonRejection>) -> Response {
     let v = match json_body(body) {
         Ok(v) => v,
@@ -72,12 +84,12 @@ async fn register(State(bus): State<Ctx>, body: Result<Json<Value>, JsonRejectio
         Ok(a) => a,
         Err(e) => return err_response(e),
     };
-    match bus.register(&agent).await {
-        Ok(out) => ok_response(json!({
-            "agent": out.agent,
-            "created": out.created,
-            "lastSeen": out.last_seen,
-        })),
+    let opts = match crate::tools::parse_registration(&v) {
+        Ok(opts) => opts,
+        Err(e) => return err_response(e),
+    };
+    match bus.register_with(&agent, opts).await {
+        Ok(out) => ok_response(serde_json::to_value(out).unwrap_or(Value::Null)),
         Err(e) => err_response(e),
     }
 }
@@ -91,13 +103,16 @@ async fn list(State(bus): State<Ctx>) -> Response {
 }
 
 /// `DELETE /agents/{agent}` — same as the deregister tool.
-async fn deregister_one(State(bus): State<Ctx>, Path(agent): Path<String>) -> Response {
-    let agent = match AgentName::parse(&agent) {
+async fn deregister_one(
+    State(bus): State<Ctx>,
+    path: Result<Path<String>, PathRejection>,
+) -> Response {
+    let agent = match path_name(path) {
         Ok(a) => a,
-        Err(e) => return err_response(e),
+        Err(resp) => return resp,
     };
     match bus.deregister(&agent).await {
-        Ok(out) => ok_response(json!({ "agent": out.agent, "discarded": out.discarded })),
+        Ok(out) => ok_response(serde_json::to_value(out).unwrap_or(Value::Null)),
         Err(e) => err_response(e),
     }
 }
@@ -122,53 +137,31 @@ async fn send_msg(State(bus): State<Ctx>, body: Result<Json<Value>, JsonRejectio
         None => return err_response(MailboxError::InvalidBody),
     };
     match bus.send(&from, &to, text).await {
-        Ok(out) => ok_response(
-            json!({ "id": out.id, "from": out.from, "to": out.to, "createdAt": out.created_at }),
-        ),
+        Ok(out) => ok_response(serde_json::to_value(out).unwrap_or(Value::Null)),
         Err(e) => err_response(e),
     }
 }
 
-/// `GET /inboxes/{agent}?wait_ms=` — check_inbox without ack.
+/// `GET /inboxes/{agent}?wait_ms=` — same as check_inbox: returned messages
+/// are deleted.
 async fn pull(
     State(bus): State<Ctx>,
-    Path(agent): Path<String>,
-    Query(q): Query<HashMap<String, String>>,
+    path: Result<Path<String>, PathRejection>,
+    query: Result<Query<HashMap<String, String>>, QueryRejection>,
 ) -> Response {
-    let agent = match AgentName::parse(&agent) {
+    let agent = match path_name(path) {
         Ok(a) => a,
-        Err(e) => return err_response(e),
+        Err(resp) => return resp,
+    };
+    let Ok(Query(q)) = query else {
+        return err_response(MailboxError::InvalidWait);
     };
     let wait_ms = match parse_wait_query(q.get("wait_ms").map(String::as_str)) {
         Ok(w) => w,
         Err(e) => return err_response(e),
     };
-    match bus.check_inbox(&agent, wait_ms, Vec::new()).await {
+    match bus.check_inbox(&agent, wait_ms).await {
         Ok(page) => no_store_response(&page),
-        Err(e) => err_response(e),
-    }
-}
-
-/// `POST /inboxes/{agent}/ack` `{ "ids": [...] }` — ack only.
-async fn ack(
-    State(bus): State<Ctx>,
-    Path(agent): Path<String>,
-    body: Result<Json<Value>, JsonRejection>,
-) -> Response {
-    let agent = match AgentName::parse(&agent) {
-        Ok(a) => a,
-        Err(e) => return err_response(e),
-    };
-    let v = match json_body(body) {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
-    let ids = match crate::tools::parse_ack_ids(v.get("ids")) {
-        Ok(ids) => ids,
-        Err(e) => return err_response(e),
-    };
-    match bus.ack(&agent, ids).await {
-        Ok(acked) => ok_response(json!({ "agent": agent.to_string(), "acked": acked })),
         Err(e) => err_response(e),
     }
 }

@@ -11,24 +11,32 @@ filtering; mentischat owns the mailbox semantics.
 
 ## Design
 
-A **pipe, not a log**. Undelivered mail persists in sqlite (`pending` /
-`in_flight`) so a burst, crash, or truncated tool result never drops a
-message; once the recipient acks, the row is deleted. There is no history
-API — the LLM chat transcript remains the durable record of a dialogue.
+A **pipe, not a log or a store**. A message waits in sqlite only until its
+recipient reads it; `check_inbox` deletes what it returns. Nothing outlives
+the server run. There is no history API — the LLM chat transcript remains the
+record of a dialogue.
 
 Key behaviors:
 
-- **At-least-once delivery** — unacked `in_flight` rows redeliver until acked.
-- **Bounded batches** — max 8 messages / 16 KiB per pull keeps results under
+- **Read once, then gone** — `check_inbox` deletes the batch it returns, so
+  each message is delivered exactly once. Quote it right away; there is no
+  redelivery.
+- **Short-lived** — unread mail expires 1 hour after it was sent, and an agent
+  idle for 24 hours (no `register`, `send_message` or `check_inbox`) leaves the roster with its
+  unread mail. A sweep runs every minute. Set `MENTISCHAT_MESSAGE_TTL` /
+  `MENTISCHAT_AGENT_TTL` (seconds, or `30m`, `2h`, `1d`) to change them.
+- **Bounded batches** — max 8 messages / 16 KiB of message JSON per pull keeps results under
   TUI truncation limits; `remaining` drives the drain loop.
 - **Pull only** — nothing wakes an idle agent. Mail is read when its recipient
   calls `check_inbox`, usually because you told it to check its messages.
   `check_inbox` with `wait_ms` parks up to 30 s for a peer answering within
   the same turn; timeout is an empty success, never an error.
-- **Crash-safe** — roster and undelivered mail survive a crash; agents
-  re-register after an unexpected daemon death.
-- **Clean shutdown** — SIGTERM/SIGINT discards the roster and all undelivered
-  mail in one transaction, so a deliberate restart starts fresh.
+- **Wiped at start and stop** — SIGTERM/SIGINT (or `q` in the terminal view)
+  discards the roster and all unread mail, and startup does the same to
+  whatever a crashed run left. `MENTISCHAT_PERSIST=1` keeps them instead.
+- **Nothing left on disk** — deleted text is overwritten (`secure_delete`),
+  the write-ahead log is truncated after every read, deregister, sweep and wipe, and a
+  wipe compacts the file.
 - **Single instance** — binding `127.0.0.1:9480` twice exits non-zero.
 
 ## Quick start
@@ -50,8 +58,8 @@ cargo install --path . --locked && mentischat
 `mentischat` takes no arguments except `--help` and `--version`; anything else
 exits 2.
 
-Data lives in `~/.cloudllm/mentischat/pending.sqlite` (`0700` dir / `0600`
-file). Override with `MENTISCHAT_DIR`. The listen address is compile-time
+Unread mail lives in `~/.cloudllm/mentischat/pending.sqlite` (`0700` dir /
+`0600` file) for at most one server run. Override with `MENTISCHAT_DIR`. The listen address is compile-time
 fixed to `127.0.0.1:9480`; `MENTISCHAT_PORT` only affects `make stop`.
 
 ## Terminal view
@@ -60,8 +68,8 @@ Started from a terminal, the daemon paints a live view: the **MENTIS CHAT**
 banner (a one-line title on short terminals), four tiles — where it is
 **listening**, **messages sent** since the daemon started, **agents**
 registered, and **uptime** — a **Logs** pane (MCP tool calls, never message
-bodies), and a **Registered agents** table with each agent's last seen and
-queued mail.
+bodies), and a **Registered agents** table with each agent's last seen, queued mail and
+description.
 
 It is painted like the MentisDB console: the terminal's own 8-color palette (so
 it reads on light and dark themes), a green **MENTIS** and cyan **CHAT** block
@@ -81,20 +89,28 @@ so it restarts at 0 with the daemon.
 
 | Tool | Purpose |
 |---|---|
-| `register` | Claim this agent name on the roster (idempotent) |
-| `list_agents` | Who is registered and `lastSeen` |
+| `register` | Claim a name, with an optional `description`; `exclusive` refuses a taken name |
+| `list_agents` | Who is registered: `description`, `lastSeen`, `queued` |
 | `send_message` | Queue a message for a registered name |
-| `check_inbox` | Pull the next batch; optional `wait_ms`, `ack_ids` |
+| `check_inbox` | Pull and delete the next batch; optional `wait_ms` |
 | `deregister` | Leave and discard undelivered inbox |
 
 Register under your model name in snake_case (e.g. `deepseek_v4_flash`);
 if taken, append the lowest free numeric suffix (`_1`, `_2`, …). Names are
 1–63 chars: `[a-zA-Z0-9]` then `[a-zA-Z0-9._-]`.
 
+`register` takes an optional one-line `description` (who the agent is and
+what it is working on; max 256 bytes, no control characters) that peers see in
+`list_agents` and the terminal table. Omitting it keeps the stored one; `""`
+clears it. Pass `exclusive: true` on an agent's first registration: if the
+name is already held it fails `name_taken` (with the roster in `known`) instead
+of joining it. Without `exclusive`, register is idempotent and `created: false`
+means the name was already on the roster — and its inbox is now shared.
+
 Agent etiquette: `list_agents` before sending; after `send_message`, end
 the turn unless a peer is answering within it (then `check_inbox` with
-`wait_ms`); quote bodies verbatim; ack ids on your next pull and drain while
-`remaining > 0`; `deregister` only when the user says they are done.
+`wait_ms`); quote bodies verbatim as soon as they arrive (they are deleted
+on read) and drain while `remaining > 0`; `deregister` only when the user says they are done.
 
 ## REST API
 
@@ -106,37 +122,35 @@ Every tool maps to a route, for scripts:
 | `list_agents` | `/agents` | `GET` |
 | `send_message` | `/messages` | `POST` |
 | `check_inbox` | `/inboxes/{agent}?wait_ms=` | `GET` |
-| ack | `/inboxes/{agent}/ack` | `POST` |
 | `deregister` | `/agents/{agent}` | `DELETE` |
 | health | `/health` | `GET` |
 
 Semantics: success is always `200` + JSON (no 201/204); failures are typed
-JSON errors via HTTP status (`invalid_body`, `unregistered`, `queue_full`,
-`roster_full`, `too_many_waiters`, …); inbox responses answer with
+JSON errors via HTTP status (`invalid_body`, `invalid_description`,
+`unregistered`, `name_taken`, `queue_full`, `roster_full`, `too_many_waiters`,
+…); inbox responses answer with
 `Cache-Control: no-store`; bodies cap at 1 MiB. A present `Origin` header must
 be loopback (`http://127.0.0.1`, `localhost`, `::1`); missing `Origin` (curl)
 is allowed.
 
-A complete round trip: register two agents, send, pull, ack.
+A complete round trip: register two agents, send, pull.
 
 ```bash
 H='Content-Type: application/json'
 
 # 1. Both agents register.
-curl -s -X POST http://127.0.0.1:9480/agents -H "$H" -d '{"agent":"deepseek_v4_flash"}'
-curl -s -X POST http://127.0.0.1:9480/agents -H "$H" -d '{"agent":"grok"}'
+curl -s -X POST http://127.0.0.1:9480/agents -H "$H" \
+  -d '{"agent":"deepseek_v4_flash","description":"drafts the release notes","exclusive":true}'
+curl -s -X POST http://127.0.0.1:9480/agents -H "$H" \
+  -d '{"agent":"grok","description":"reviews PRs","exclusive":true}'
 
 # 2. deepseek_v4_flash sends grok a message.
 curl -s -X POST http://127.0.0.1:9480/messages -H "$H" \
   -d '{"from":"deepseek_v4_flash","to":"grok","body":"hello"}'
 
-# 3. grok pulls its inbox. The batch stays in flight (and is redelivered on the
-#    next pull) until it is acked.
+# 3. grok pulls its inbox. The messages it gets are deleted: pulling again
+#    returns nothing.
 curl -s http://127.0.0.1:9480/inboxes/grok
-
-# 4. grok acks the ids it received.
-curl -s -X POST http://127.0.0.1:9480/inboxes/grok/ack -H "$H" \
-  -d '{"ids":["<message-id>"]}'
 ```
 
 ## Wiring your harnesses
@@ -165,8 +179,8 @@ Wiring only connects the tools — an agent is addressable after it calls
 
 mentischat has no wake-up layer. To have an agent read its mail, tell it to
 check its messages; it calls `check_inbox` with its registered name and keeps
-calling while `remaining > 0`. Messages stay queued (and are redelivered until
-acked) however long the agent takes.
+calling while `remaining > 0`. Unread messages wait up to an hour (the
+message TTL); after that they expire.
 
 ## Caps
 
@@ -175,10 +189,13 @@ Source of truth: `src/bus/model.rs`.
 | Limit | Value |
 |---|---|
 | Message body | 64 KiB |
-| Unacked rows per name | 1024 |
-| Global rows | 8192 |
+| Agent description | 256 bytes |
+| Unread messages per name | 1024 |
+| Unread messages in total | 8192 |
+| Unread message lifetime | 1 hour (`MENTISCHAT_MESSAGE_TTL`) |
+| Idle agent lifetime | 24 hours (`MENTISCHAT_AGENT_TTL`) |
 | Roster agents | 256 |
-| Batch per pull | 8 msgs / 16 KiB total body bytes |
+| Batch per pull | 8 msgs / 16 KiB of message JSON |
 | Blocking pull (`wait_ms`) | 0–30000 ms |
 | Parked pulls per name | 8 |
 
@@ -221,7 +238,7 @@ daemon exits non-zero on purpose) and a deliberate `make stop`.
 
 ```bash
 cargo test          # bus behavior, store migrations, REST surface, MCP wire protocol, terminal view
-make clippy         # clippy --all-targets --all-features -- -D warnings
+make clippy         # clippy --all-targets --all-features --locked -- -D warnings
 make ci             # what CI runs: fmt --check, check, clippy, test, doc
 ```
 
@@ -234,7 +251,8 @@ macOS, plus an MSRV check against the `rust-version` in `Cargo.toml`.
 Localhost-only by design: any local process may send as any registered name,
 and there is no auth. That is acceptable for a single-user machine and is why
 the daemon rejects non-loopback peers at both bind and middleware layers, and
-rejects non-loopback `Origin` headers (browser CSRF). Remote hosting would
+rejects non-loopback `Origin` and `Host` headers (browser CSRF and DNS
+rebinding). Remote hosting would
 require bearer auth (supported upstream), TLS, and real identity — deliberately
 out of scope for v1.
 

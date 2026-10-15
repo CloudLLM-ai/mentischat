@@ -113,7 +113,7 @@ async fn wake_and_wrapper_routes_are_gone() {
 }
 
 #[tokio::test]
-async fn inbox_get_redelivers_until_rest_ack() {
+async fn inbox_get_deletes_what_it_returns() {
     let (_d, mut app) = app();
     register_two(&mut app).await;
     send(
@@ -124,21 +124,14 @@ async fn inbox_get_redelivers_until_rest_ack() {
 
     let (s, p1) = send(&mut app, req("GET", "/inboxes/b")).await;
     assert_eq!(s, 200);
-    let id = p1["messages"][0]["id"].as_str().unwrap().to_string();
+    assert_eq!(p1["messages"][0]["body"], "m1");
 
     let (_, p2) = send(&mut app, req("GET", "/inboxes/b")).await;
-    assert_eq!(
-        p2["messages"][0]["id"],
-        id.as_str(),
-        "redelivered until acked"
-    );
+    assert_eq!(p2["messages"].as_array().unwrap().len(), 0, "read once");
 
-    let ack_body = format!(r#"{{"ids":["{id}"]}}"#);
-    let (_, acked) = send(&mut app, post("/inboxes/b/ack", &ack_body)).await;
-    assert_eq!(acked["acked"], 1);
-
-    let (_, p3) = send(&mut app, req("GET", "/inboxes/b")).await;
-    assert_eq!(p3["messages"].as_array().unwrap().len(), 0);
+    // There is nothing to acknowledge any more.
+    let (s, v) = send(&mut app, post("/inboxes/b/ack", r#"{"ids":[]}"#)).await;
+    assert_eq!((s, v["error"].as_str()), (404, Some("not_found")));
 }
 
 #[tokio::test]
@@ -194,7 +187,7 @@ async fn overlapping_waits_one_post_one_delivery() {
     });
     let w2 = app.clone();
     let t2 = tokio::spawn(async move {
-        w2.oneshot(req("GET", "/inboxes/b?wait_ms=2000"))
+        w2.oneshot(req("GET", "/inboxes/b?wait_ms=500"))
             .await
             .unwrap()
     });
@@ -210,11 +203,11 @@ async fn overlapping_waits_one_post_one_delivery() {
         let page: Value = serde_json::from_slice(&bytes).unwrap();
         page["messages"][0]["id"].as_str().unwrap_or("").to_string()
     }
-    // Oldest waiter got the row; the second redelivers it (shared-name rule).
+    // The oldest waiter got the row and deleted it; the other times out empty.
     let id1 = first_msg_id(t1.await.unwrap()).await;
     let id2 = first_msg_id(t2.await.unwrap()).await;
-    assert_eq!(id1, id2);
     assert!(!id1.is_empty());
+    assert!(id2.is_empty(), "delivered once");
 }
 
 #[tokio::test]
@@ -267,30 +260,97 @@ async fn health_counts_rows_and_roster() {
     let (_, h) = send(&mut app, req("GET", "/health")).await;
     assert_eq!(h["ok"], true);
     assert_eq!(h["agents"], 2);
-    assert_eq!(h["pending"], 1, "unacked row counts; acked rows would not");
+    assert_eq!(h["pending"], 1, "unread mail counts");
+    send(&mut app, req("GET", "/inboxes/b")).await;
+    let (_, h) = send(&mut app, req("GET", "/health")).await;
+    assert_eq!(h["pending"], 0, "read mail is gone");
 }
 
 #[tokio::test]
-async fn oversized_ack_id_array_is_rejected() {
+async fn register_accepts_a_description_and_lists_it() {
     let (_d, mut app) = app();
-    register_two(&mut app).await;
+    let (s, v) = send(
+        &mut app,
+        post(
+            "/agents",
+            r#"{"agent":"grok","description":"  reviews PRs  "}"#,
+        ),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["description"], "reviews PRs", "stored trimmed");
 
-    let body = ack_body_with(mentischat::bus::MAX_ACK_IDS + 1);
-    let (s, v) = send(&mut app, post("/inboxes/b/ack", &body)).await;
-    assert_eq!(s, 400, "no inbox can hold that many unacked rows");
-    assert_eq!(v["error"], "invalid_body");
+    let (_, v) = send(&mut app, req("GET", "/agents")).await;
+    assert_eq!(v["agents"][0]["description"], "reviews PRs");
+    assert_eq!(v["agents"][0]["queued"], 0);
 
-    // The cap itself is still accepted.
-    let body = ack_body_with(mentischat::bus::MAX_ACK_IDS);
-    let (s, v) = send(&mut app, post("/inboxes/b/ack", &body)).await;
-    assert_eq!(s, 200);
-    assert_eq!(v["acked"], 0, "none of those ids exist");
+    let too_long = format!(r#"{{"agent":"grok","description":"{}"}}"#, "x".repeat(257));
+    let (s, v) = send(&mut app, post("/agents", &too_long)).await;
+    assert_eq!((s, v["error"].as_str()), (400, Some("invalid_description")));
+
+    let (s, v) = send(
+        &mut app,
+        post("/agents", r#"{"agent":"grok","description":7}"#),
+    )
+    .await;
+    assert_eq!((s, v["error"].as_str()), (400, Some("invalid_description")));
+
+    let (s, v) = send(
+        &mut app,
+        post("/agents", r#"{"agent":"grok","description":"line\nbreak"}"#),
+    )
+    .await;
+    assert_eq!((s, v["error"].as_str()), (400, Some("invalid_description")));
 }
 
-fn ack_body_with(count: usize) -> String {
-    let ids = (0..count)
-        .map(|_| format!(r#""{}""#, uuid::Uuid::new_v4()))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!(r#"{{"ids":[{ids}]}}"#)
+#[tokio::test]
+async fn exclusive_register_of_a_taken_name_is_a_conflict() {
+    let (_d, mut app) = app();
+    let (s, _) = send(
+        &mut app,
+        post("/agents", r#"{"agent":"grok","exclusive":true}"#),
+    )
+    .await;
+    assert_eq!(s, 200);
+    let (s, v) = send(
+        &mut app,
+        post("/agents", r#"{"agent":"grok","exclusive":true}"#),
+    )
+    .await;
+    assert_eq!(s, 409, "{v}");
+    assert_eq!(v["error"], "name_taken");
+    assert_eq!(v["known"], serde_json::json!(["grok"]));
+
+    let (s, v) = send(
+        &mut app,
+        post("/agents", r#"{"agent":"grok","exclusive":"yes"}"#),
+    )
+    .await;
+    assert_eq!((s, v["error"].as_str()), (400, Some("invalid_body")));
+}
+
+#[tokio::test]
+async fn undecodable_paths_and_queries_get_contract_errors() {
+    let (_d, mut app) = app();
+    register_two(&mut app).await;
+    let (s, v) = send(&mut app, req("GET", "/inboxes/%FF")).await;
+    assert_eq!((s, v["error"].as_str()), (400, Some("invalid_name")), "{v}");
+    let (s, v) = send(&mut app, req("DELETE", "/agents/%FF%FE")).await;
+    assert_eq!((s, v["error"].as_str()), (400, Some("invalid_name")), "{v}");
+    let (s, v) = send(&mut app, req("GET", "/inboxes/b?wait_ms=%FF")).await;
+    assert_eq!((s, v["error"].as_str()), (400, Some("invalid_wait")), "{v}");
+}
+
+#[tokio::test]
+async fn invalid_name_echo_is_capped() {
+    let (_d, mut app) = app();
+    let huge = format!(r#"{{"agent":"-{}"}}"#, "x".repeat(100_000));
+    let (s, v) = send(&mut app, post("/agents", &huge)).await;
+    assert_eq!(s, 400);
+    assert_eq!(v["error"], "invalid_name");
+    assert!(
+        v["agent"].as_str().unwrap().chars().count() <= 65,
+        "{}",
+        v["agent"]
+    );
 }

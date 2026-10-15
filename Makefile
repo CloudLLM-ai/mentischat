@@ -34,19 +34,19 @@ fmt-check: ## Fail if anything is unformatted
 
 # Check for errors without building. --all-targets covers bins, tests and benches.
 check: ## Run cargo check to analyze the code without compiling
-	${CARGO_CMD} check --all-targets --all-features
+	${CARGO_CMD} check --all-targets --all-features --locked
 
 # Strict linter, fails on warnings and suggests fixes
 clippy: ## Run clippy and fail on warnings
-	${CARGO_CMD} clippy --all-targets --all-features -- -D warnings
+	${CARGO_CMD} clippy --all-targets --all-features --locked -- -D warnings
 
 # Run tests
 test: ## Run all tests using cargo test
-	${CARGO_CMD} test --all-features
+	${CARGO_CMD} test --all-features --locked
 
 # Generate documentation. Broken intra-doc links fail the build.
 doc: ## Generate project documentation using cargo doc
-	RUSTDOCFLAGS="-D warnings" ${CARGO_CMD} doc --all-features --no-deps
+	RUSTDOCFLAGS="-D warnings" ${CARGO_CMD} doc --all-features --no-deps --locked
 
 # Publish to crates.io
 publish: ## Publish mentischat to crates.io

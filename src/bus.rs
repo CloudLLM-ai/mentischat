@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::params;
 use serde::Serialize;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{oneshot, Mutex, MutexGuard};
 
 pub use crate::store::StoreError;
 
@@ -183,6 +183,16 @@ impl Bus {
         })
     }
 
+    /// Locks the bus, failing `shutting_down` once it has been closed.
+    async fn lock_open(&self) -> Result<MutexGuard<'_, Inner>, MailErr> {
+        let g = self.inner.lock().await;
+        if g.closed {
+            Err(MailErr::ShuttingDown)
+        } else {
+            Ok(g)
+        }
+    }
+
     /// Claim `name` on the roster. Idempotent: refreshes `last_seen` and keeps
     /// any pending queue.
     ///
@@ -195,10 +205,7 @@ impl Bus {
         name: &crate::names::AgentName,
     ) -> Result<RegisterOutcome, MailErr> {
         let now = now_rfc3339();
-        let g = self.inner.lock().await;
-        if g.closed {
-            return Err(MailErr::ShuttingDown);
-        }
+        let g = self.lock_open().await?;
         let exists: bool = g
             .conn
             .query_row(
@@ -244,10 +251,7 @@ impl Bus {
         &self,
         name: &crate::names::AgentName,
     ) -> Result<DiscardOutcome, MailErr> {
-        let mut g = self.inner.lock().await;
-        if g.closed {
-            return Err(MailErr::ShuttingDown);
-        }
+        let mut g = self.lock_open().await?;
         ensure_registered(&g, name.as_str())?;
         let discarded: i64 = g
             .conn
@@ -279,10 +283,7 @@ impl Bus {
 
     /// Current roster sorted by name ascending.
     pub async fn list_agents(&self) -> Result<Vec<RosterEntry>, MailErr> {
-        let g = self.inner.lock().await;
-        if g.closed {
-            return Err(MailErr::ShuttingDown);
-        }
+        let g = self.lock_open().await?;
         let mut stmt = g
             .conn
             .prepare("SELECT name, last_seen FROM roster ORDER BY name ASC")
@@ -313,10 +314,7 @@ impl Bus {
     /// `shutting_down` once the bus is closed; `storage_error` on a sqlite
     /// failure.
     pub async fn overview(&self) -> Result<Overview, MailErr> {
-        let g = self.inner.lock().await;
-        if g.closed {
-            return Err(MailErr::ShuttingDown);
-        }
+        let g = self.lock_open().await?;
         let mut stmt = g
             .conn
             .prepare(
@@ -357,10 +355,7 @@ impl Bus {
             return Err(MailErr::InvalidBody);
         }
         let created_at = now_rfc3339();
-        let mut g = self.inner.lock().await;
-        if g.closed {
-            return Err(MailErr::ShuttingDown);
-        }
+        let mut g = self.lock_open().await?;
         ensure_registered(&g, from.as_str())?;
         ensure_registered(&g, to.as_str())?;
 
@@ -428,10 +423,7 @@ impl Bus {
         wait_ms: u32,
         ack_ids: Vec<String>,
     ) -> Result<InboxPage, MailErr> {
-        let mut g = self.inner.lock().await;
-        if g.closed {
-            return Err(MailErr::ShuttingDown);
-        }
+        let mut g = self.lock_open().await?;
         ensure_registered(&g, name.as_str())?;
         apply_acks(&mut g, name.as_str(), &ack_ids)?;
 
@@ -467,40 +459,15 @@ impl Bus {
         name: &crate::names::AgentName,
         ack_ids: Vec<String>,
     ) -> Result<i64, MailErr> {
-        let mut g = self.inner.lock().await;
-        if g.closed {
-            return Err(MailErr::ShuttingDown);
-        }
+        let mut g = self.lock_open().await?;
         ensure_registered(&g, name.as_str())?;
-        if ack_ids.is_empty() {
-            return Ok(0);
-        }
-        let mut acked = 0i64;
-        let tx = g.conn.transaction().map_err(sqlite_storage)?;
-        {
-            let mut stmt = tx
-                .prepare(
-                    "DELETE FROM messages
-                     WHERE id = ?1 AND recipient = ?2 AND state = 'in_flight'",
-                )
-                .map_err(sqlite_storage)?;
-            for id in &ack_ids {
-                acked += stmt
-                    .execute(params![id, name.as_str()])
-                    .map_err(sqlite_storage)? as i64;
-            }
-        }
-        tx.commit().map_err(sqlite_storage)?;
-        Ok(acked)
+        delete_acked(&mut g, name.as_str(), &ack_ids)
     }
 
     /// Roster size and total message row count (both states), for `/health`.
     /// Does not promote, ack, or touch `last_seen`.
     pub async fn stats(&self) -> Result<(i64, i64), MailErr> {
-        let g = self.inner.lock().await;
-        if g.closed {
-            return Err(MailErr::ShuttingDown);
-        }
+        let g = self.lock_open().await?;
         let agents: i64 = g
             .conn
             .query_row("SELECT COUNT(*) FROM roster", [], |r| r.get(0))
@@ -628,22 +595,31 @@ fn roster_sorted(g: &Inner) -> Result<Vec<String>, MailErr> {
     Ok(names)
 }
 
-fn apply_acks(g: &mut Inner, name: &str, ack_ids: &[String]) -> Result<(), MailErr> {
-    if !ack_ids.is_empty() {
-        let tx = g.conn.transaction().map_err(sqlite_storage)?;
-        {
-            let mut stmt = tx
-                .prepare(
-                    "DELETE FROM messages
-                     WHERE id = ?1 AND recipient = ?2 AND state = 'in_flight'",
-                )
-                .map_err(sqlite_storage)?;
-            for id in ack_ids {
-                stmt.execute(params![id, name]).map_err(sqlite_storage)?;
-            }
-        }
-        tx.commit().map_err(sqlite_storage)?;
+/// Deletes the `in_flight` rows named in `ack_ids` that `name` owns, in one
+/// transaction, and returns how many were removed. Unknown ids are ignored.
+fn delete_acked(g: &mut Inner, name: &str, ack_ids: &[String]) -> Result<i64, MailErr> {
+    if ack_ids.is_empty() {
+        return Ok(0);
     }
+    let tx = g.conn.transaction().map_err(sqlite_storage)?;
+    let mut acked = 0i64;
+    {
+        let mut stmt = tx
+            .prepare(
+                "DELETE FROM messages
+                 WHERE id = ?1 AND recipient = ?2 AND state = 'in_flight'",
+            )
+            .map_err(sqlite_storage)?;
+        for id in ack_ids {
+            acked += stmt.execute(params![id, name]).map_err(sqlite_storage)? as i64;
+        }
+    }
+    tx.commit().map_err(sqlite_storage)?;
+    Ok(acked)
+}
+
+fn apply_acks(g: &mut Inner, name: &str, ack_ids: &[String]) -> Result<(), MailErr> {
+    delete_acked(g, name, ack_ids)?;
     touch_last_seen(g, name)
 }
 

@@ -304,29 +304,61 @@ async fn register_accepts_a_description_and_lists_it() {
 }
 
 #[tokio::test]
-async fn exclusive_register_of_a_taken_name_is_a_conflict() {
+async fn register_by_provider_assigns_numbered_names() {
     let (_d, mut app) = app();
+    for expected in ["claude_code_1", "claude_code_2"] {
+        let (s, v) = send(
+            &mut app,
+            post(
+                "/agents",
+                r#"{"provider":"claude_code","description":"cli"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(v["agent"], expected);
+        assert_eq!(v["created"], true);
+    }
+
+    let (s, v) = send(&mut app, post("/agents", r#"{"agent":"claude_code_2"}"#)).await;
+    assert_eq!((s, v["created"].as_bool()), (200, Some(false)));
+
+    for (body, error) in [
+        (r#"{}"#, "invalid_body"),
+        (r#"{"provider":"-cursor"}"#, "invalid_name"),
+        (
+            r#"{"provider":"cursor","description":"a\nb"}"#,
+            "invalid_description",
+        ),
+    ] {
+        let (s, v) = send(&mut app, post("/agents", body)).await;
+        assert_eq!((s, v["error"].as_str()), (400, Some(error)), "{body}");
+    }
+}
+
+#[tokio::test]
+async fn wrong_methods_get_a_json_405_and_head_does_not_drain() {
+    let (_d, mut app) = app();
+    register_two(&mut app).await;
     let (s, _) = send(
         &mut app,
-        post("/agents", r#"{"agent":"grok","exclusive":true}"#),
+        post("/messages", r#"{"from":"a","to":"b","body":"still here"}"#),
     )
     .await;
     assert_eq!(s, 200);
-    let (s, v) = send(
-        &mut app,
-        post("/agents", r#"{"agent":"grok","exclusive":true}"#),
-    )
-    .await;
-    assert_eq!(s, 409, "{v}");
-    assert_eq!(v["error"], "name_taken");
-    assert_eq!(v["known"], serde_json::json!(["grok"]));
 
-    let (s, v) = send(
-        &mut app,
-        post("/agents", r#"{"agent":"grok","exclusive":"yes"}"#),
-    )
-    .await;
-    assert_eq!((s, v["error"].as_str()), (400, Some("invalid_body")));
+    let (s, v) = send(&mut app, req("GET", "/messages")).await;
+    assert_eq!((s, v["error"].as_str()), (405, Some("method_not_allowed")));
+    let (s, v) = send(&mut app, req("PUT", "/agents")).await;
+    assert_eq!((s, v["error"].as_str()), (405, Some("method_not_allowed")));
+
+    let (s, _) = send(&mut app, req("HEAD", "/inboxes/b")).await;
+    assert_eq!(s, 405);
+    let (_, page) = send(&mut app, req("GET", "/inboxes/b")).await;
+    assert_eq!(
+        page["messages"][0]["body"], "still here",
+        "HEAD deleted nothing"
+    );
 }
 
 #[tokio::test]

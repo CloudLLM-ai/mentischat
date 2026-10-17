@@ -2,7 +2,7 @@
 //!
 //! Every variant serialises to the contract error body:
 //! `{"error": code, ...context}`. `known` (the sorted roster) appears on
-//! [`MailboxError::Unregistered`] and [`MailboxError::NameTaken`] only.
+//! [`MailboxError::Unregistered`] only.
 
 use std::fmt;
 
@@ -15,7 +15,8 @@ pub enum MailboxError {
     /// Name fails the roster regex.
     InvalidName { agent: String },
     /// Missing / non-string / whitespace-only / oversized body, a body that
-    /// is not JSON, or a malformed flag such as `exclusive`.
+    /// is not JSON, a name field that is not a string, or a register naming
+    /// neither `provider` nor `agent`.
     InvalidBody,
     /// `wait_ms` present but not an integer in `0..=30000`.
     InvalidWait,
@@ -25,9 +26,6 @@ pub enum MailboxError {
     /// The named agent is not on the roster. Carries the current roster so
     /// callers can self-correct.
     Unregistered { agent: String, known: Vec<String> },
-    /// An `exclusive` register named an agent that is already on the roster.
-    /// Carries the current roster so the caller can pick a free name.
-    NameTaken { agent: String, known: Vec<String> },
     /// That recipient already holds `MAX_PENDING_PER_AGENT` unread messages.
     QueueFull { to: String, pending: i64 },
     /// Global row cap hit.
@@ -40,6 +38,8 @@ pub enum MailboxError {
     TooManyWaiters { agent: String, waiting: usize },
     /// REST path that is not a known route.
     NotFound,
+    /// Known REST path, HTTP method it does not serve.
+    MethodNotAllowed,
     /// Waiter aborted because the process is closing.
     ShuttingDown,
 }
@@ -53,13 +53,13 @@ impl MailboxError {
             Self::InvalidWait => "invalid_wait",
             Self::InvalidDescription => "invalid_description",
             Self::Unregistered { .. } => "unregistered",
-            Self::NameTaken { .. } => "name_taken",
             Self::QueueFull { .. } => "queue_full",
             Self::StorageFull { .. } => "storage_full",
             Self::StorageError => "storage_error",
             Self::RosterFull { .. } => "roster_full",
             Self::TooManyWaiters { .. } => "too_many_waiters",
             Self::NotFound => "not_found",
+            Self::MethodNotAllowed => "method_not_allowed",
             Self::ShuttingDown => "shutting_down",
         }
     }
@@ -73,10 +73,10 @@ impl MailboxError {
             | Self::InvalidWait
             | Self::InvalidDescription => StatusCode::BAD_REQUEST,
             Self::Unregistered { .. } | Self::NotFound => StatusCode::NOT_FOUND,
-            Self::QueueFull { .. }
-            | Self::TooManyWaiters { .. }
-            | Self::RosterFull { .. }
-            | Self::NameTaken { .. } => StatusCode::CONFLICT,
+            Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
+            Self::QueueFull { .. } | Self::TooManyWaiters { .. } | Self::RosterFull { .. } => {
+                StatusCode::CONFLICT
+            }
             Self::StorageFull { .. } => StatusCode::INSUFFICIENT_STORAGE,
             Self::StorageError => StatusCode::INTERNAL_SERVER_ERROR,
             Self::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
@@ -90,7 +90,7 @@ impl MailboxError {
             Self::InvalidBody | Self::InvalidWait | Self::InvalidDescription => {
                 json!({ "error": self.code() })
             }
-            Self::Unregistered { agent, known } | Self::NameTaken { agent, known } => {
+            Self::Unregistered { agent, known } => {
                 json!({ "error": self.code(), "agent": agent, "known": known })
             }
             Self::QueueFull { to, pending } => {
@@ -102,7 +102,7 @@ impl MailboxError {
             Self::TooManyWaiters { agent, waiting } => {
                 json!({ "error": self.code(), "agent": agent, "waiting": waiting })
             }
-            Self::NotFound => json!({ "error": self.code() }),
+            Self::NotFound | Self::MethodNotAllowed => json!({ "error": self.code() }),
             Self::ShuttingDown => json!({ "error": self.code() }),
         }
     }

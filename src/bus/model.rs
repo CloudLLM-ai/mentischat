@@ -23,14 +23,14 @@ pub const MAX_WAITERS_PER_AGENT: usize = 8;
 /// Cap on roster rows — bounds the number of parked pulls (8 per name).
 pub const MAX_ROSTER: i64 = 256;
 /// Default time an unread message is kept before it expires.
-pub const DEFAULT_MESSAGE_TTL: Duration = Duration::from_secs(60 * 60);
+const DEFAULT_MESSAGE_TTL: Duration = Duration::from_secs(60 * 60);
 /// Default time an agent stays on the roster without a `register` or
 /// `check_inbox`.
-pub const DEFAULT_AGENT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const DEFAULT_AGENT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Maximum UTF-8 byte length of an agent's roster description.
 pub const MAX_DESCRIPTION_BYTES: usize = 256;
 
-/// How a `register` call treats the roster entry it names.
+/// Options of a `register` call.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Registration {
     /// `None` keeps the stored description, `Some("")` clears it, and any
@@ -38,9 +38,6 @@ pub struct Registration {
     /// [`MAX_DESCRIPTION_BYTES`] or holding control characters with
     /// `invalid_description`.
     pub description: Option<String>,
-    /// Fail `name_taken` instead of joining a name that is already on the
-    /// roster, so two agents cannot silently share one inbox.
-    pub exclusive: bool,
 }
 
 /// A delivered or queued mail row (wire shape).

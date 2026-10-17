@@ -5,11 +5,11 @@
   absolute path below is the one per-machine value launchd cannot expand
   itself.
 
-  KeepAlive is a dict on purpose. `<true/>` restarts the daemon after *any*
-  exit, which turns two predictable cases into respawn loops: the port already
-  being owned by another instance (the daemon exits 1 by design) and a
-  deliberate `make stop` (SIGTERM, exit 0). Restarting only on a crash keeps
-  supervision without fighting the operator.
+  KeepAlive restarts the daemon after any non-zero exit (a panic, a server
+  error) or a crash, but not after a clean exit, so a deliberate `make stop`
+  (SIGTERM, exit 0) stays stopped. While another instance owns the port the
+  daemon exits 1, and launchd retries every ThrottleInterval (30 s) until the
+  port is free.
 -->
 <plist version="1.0">
 <dict>
@@ -19,6 +19,8 @@
     <true/>
     <key>KeepAlive</key>
     <dict>
+        <key>SuccessfulExit</key>
+        <false/>
         <key>Crashed</key>
         <true/>
     </dict>

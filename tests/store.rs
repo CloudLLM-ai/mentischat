@@ -1,22 +1,11 @@
-//! Store migration tests: databases written by older builds, including ones
-//! left mid-migration, must open cleanly and keep their rows.
+//! Store tests: the schema a fresh database gets, and that reopening keeps it.
 
 use rusqlite::Connection;
 
-const MESSAGES_TABLE: &str = r#"
-    CREATE TABLE messages (
-      id TEXT PRIMARY KEY,
-      sender TEXT NOT NULL,
-      recipient TEXT NOT NULL,
-      body TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      seq INTEGER NOT NULL,
-      state TEXT NOT NULL CHECK (state IN ('pending', 'in_flight'))
-    );
-"#;
-
-fn roster_columns(conn: &Connection) -> Vec<String> {
-    let mut stmt = conn.prepare("PRAGMA table_info(roster)").unwrap();
+fn columns(conn: &Connection, table: &str) -> Vec<String> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .unwrap();
     stmt.query_map([], |r| r.get::<_, String>(1))
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
@@ -32,190 +21,66 @@ fn index_count(conn: &Connection, name: &str) -> i64 {
     .unwrap()
 }
 
-/// Seeds `pending.sqlite` under a fresh temp dir with `schema`, returning the
-/// data dir to hand to `store::open`.
-fn seeded(tag: &str, schema: &str) -> (tempfile::TempDir, std::path::PathBuf) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let data = dir.path().join(tag);
-    std::fs::create_dir_all(&data).expect("dir");
-    let conn = Connection::open(data.join("pending.sqlite")).expect("raw open");
-    conn.execute_batch(schema).expect("seed legacy schema");
-    (dir, data)
-}
-
 #[test]
-fn a_fresh_database_has_name_last_seen_and_description() {
+fn a_fresh_database_has_the_roster_and_messages_schema() {
     let dir = tempfile::tempdir().expect("tempdir");
     let data = dir.path().join("fresh");
     drop(mentischat::store::open(&data).expect("open"));
 
     let conn = Connection::open(data.join("pending.sqlite")).expect("reopen");
-    assert_eq!(roster_columns(&conn), ["name", "last_seen", "description"]);
-}
-
-#[test]
-fn wake_columns_and_their_index_are_dropped_keeping_rows() {
-    let schema = format!(
-        r#"
-        CREATE TABLE roster (
-          name TEXT PRIMARY KEY,
-          last_seen TEXT NOT NULL,
-          nudge_transport TEXT NOT NULL DEFAULT 'none',
-          wake_id TEXT
-        );
-        CREATE UNIQUE INDEX idx_roster_wake_id ON roster (wake_id)
-          WHERE wake_id IS NOT NULL AND length(trim(wake_id)) > 0;
-        {MESSAGES_TABLE}
-        INSERT INTO roster (name, last_seen, nudge_transport, wake_id)
-          VALUES ('legacy', '2026-01-01T00:00:00.000Z', 'wrapper',
-                  '11111111-1111-4111-8111-111111111111'),
-                 ('plain', '2026-01-01T00:00:00.000Z', 'none', NULL);
-        INSERT INTO messages VALUES
-          ('m1', 'plain', 'legacy', 'queued before upgrade',
-           '2026-01-01T00:00:00.000Z', 1, 'pending');
-        "#
-    );
-    let (_dir, data) = seeded("wake", &schema);
-
-    mentischat::store::open(&data).expect("open migrates");
-
-    let conn = Connection::open(data.join("pending.sqlite")).expect("reopen");
-    assert_eq!(roster_columns(&conn), ["name", "last_seen", "description"]);
-    assert_eq!(index_count(&conn, "idx_roster_wake_id"), 0);
-    let names: Vec<String> = conn
-        .prepare("SELECT name FROM roster ORDER BY name")
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
-    assert_eq!(names, ["legacy", "plain"], "roster rows survive");
-    let body: String = conn
-        .query_row("SELECT body FROM messages WHERE id = 'm1'", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert_eq!(body, "queued before upgrade", "queued mail survives");
-}
-
-#[test]
-fn a_column_dropped_but_index_left_behind_still_opens() {
-    let schema = format!(
-        r#"
-        CREATE TABLE roster (
-          name TEXT PRIMARY KEY,
-          last_seen TEXT NOT NULL,
-          wake_id TEXT
-        );
-        CREATE UNIQUE INDEX idx_roster_wake_id ON roster (wake_id);
-        {MESSAGES_TABLE}
-        INSERT INTO roster (name, last_seen) VALUES ('legacy', '2026-01-01T00:00:00.000Z');
-        "#
-    );
-    let (_dir, data) = seeded("partial", &schema);
-
-    mentischat::store::open(&data).expect("index is dropped before its column");
-
-    let conn = Connection::open(data.join("pending.sqlite")).expect("reopen");
-    assert_eq!(roster_columns(&conn), ["name", "last_seen", "description"]);
-}
-
-#[test]
-fn v1_window_title_column_is_retired() {
-    let schema = format!(
-        r#"
-        CREATE TABLE roster (
-          name TEXT PRIMARY KEY,
-          last_seen TEXT NOT NULL,
-          window_title_match TEXT
-        );
-        {MESSAGES_TABLE}
-        INSERT INTO roster (name, last_seen, window_title_match)
-          VALUES ('legacy', '2026-01-01T00:00:00.000Z', 'Terminal — grok');
-        "#
-    );
-    let (_dir, data) = seeded("v1", &schema);
-
-    mentischat::store::open(&data).expect("open migrates a v1 database");
-
-    let conn = Connection::open(data.join("pending.sqlite")).expect("reopen");
-    assert_eq!(roster_columns(&conn), ["name", "last_seen", "description"]);
-}
-
-#[test]
-fn a_roster_without_descriptions_gains_the_column_keeping_rows() {
-    let schema = format!(
-        r#"
-        CREATE TABLE roster (
-          name TEXT PRIMARY KEY,
-          last_seen TEXT NOT NULL
-        );
-        {MESSAGES_TABLE}
-        INSERT INTO roster (name, last_seen) VALUES ('legacy', '2026-01-01T00:00:00.000Z');
-        "#
-    );
-    let (_dir, data) = seeded("pre_description", &schema);
-
-    mentischat::store::open(&data).expect("open adds the description column");
-
-    let conn = Connection::open(data.join("pending.sqlite")).expect("reopen");
-    assert_eq!(roster_columns(&conn), ["name", "last_seen", "description"]);
-    let description: Option<String> = conn
-        .query_row(
-            "SELECT description FROM roster WHERE name = 'legacy'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
     assert_eq!(
-        description, None,
-        "existing agents start with no description"
+        columns(&conn, "roster"),
+        ["name", "last_seen", "description"]
     );
-}
-
-#[test]
-fn fully_migrated_db_reopens_without_error() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let data = dir.path().join("roundtrip");
-    drop(mentischat::store::open(&data).expect("first open"));
-    mentischat::store::open(&data).expect("second open is a no-op migration");
-}
-
-#[test]
-fn messages_lose_the_ack_state_column_keeping_unread_rows() {
-    let schema = format!(
-        r#"
-        CREATE TABLE roster (name TEXT PRIMARY KEY, last_seen TEXT NOT NULL);
-        {MESSAGES_TABLE}
-        CREATE INDEX idx_inbox ON messages (recipient, state, seq);
-        INSERT INTO messages VALUES
-          ('m1', 'a', 'b', 'was in flight', '2026-01-01T00:00:00.000Z', 1, 'in_flight'),
-          ('m2', 'a', 'b', 'was pending', '2026-01-01T00:00:01.000Z', 2, 'pending');
-        "#
-    );
-    let (_dir, data) = seeded("ack_era", &schema);
-
-    mentischat::store::open(&data).expect("open rebuilds messages");
-
-    let conn = Connection::open(data.join("pending.sqlite")).expect("reopen");
-    let cols: Vec<String> = conn
-        .prepare("PRAGMA table_info(messages)")
-        .unwrap()
-        .query_map([], |r| r.get(1))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
     assert_eq!(
-        cols,
+        columns(&conn, "messages"),
         ["id", "sender", "recipient", "body", "created_at", "seq"]
     );
-    let bodies: Vec<String> = conn
-        .prepare("SELECT body FROM messages ORDER BY seq")
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .collect::<Result<_, _>>()
+    for index in ["idx_inbox", "idx_created"] {
+        assert_eq!(index_count(&conn, index), 1, "{index}");
+    }
+}
+
+#[test]
+fn reopening_an_existing_database_keeps_its_rows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data = dir.path().join("reopen");
+    let conn = mentischat::store::open(&data).expect("first open");
+    conn.execute(
+        "INSERT INTO roster (name, last_seen, description) VALUES ('a', 't', 'd')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let conn = mentischat::store::open(&data).expect("second open");
+    let kept: i64 = conn
+        .query_row("SELECT COUNT(*) FROM roster", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(bodies, ["was in flight", "was pending"]);
-    assert_eq!(index_count(&conn, "idx_inbox"), 1, "index rebuilt");
+    assert_eq!(kept, 1);
+}
+
+#[test]
+fn an_older_table_shape_is_refused_and_reset_clears_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data = dir.path().join("old");
+    std::fs::create_dir_all(&data).unwrap();
+    Connection::open(data.join("pending.sqlite"))
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE roster (name TEXT PRIMARY KEY, last_seen TEXT NOT NULL, wake_id TEXT);",
+        )
+        .unwrap();
+
+    match mentischat::store::open(&data) {
+        Err(mentischat::store::StoreError::Schema { table, found }) => {
+            assert_eq!(table, "roster");
+            assert_eq!(found, ["name", "last_seen", "wake_id"]);
+        }
+        other => panic!("expected a schema error, got {:?}", other.map(|_| ())),
+    }
+
+    mentischat::store::reset(&data).expect("reset");
+    mentischat::store::reset(&data).expect("reset of missing files is fine");
+    drop(mentischat::store::open(&data).expect("fresh open after reset"));
 }

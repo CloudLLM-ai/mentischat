@@ -9,19 +9,21 @@
 
 use std::sync::Arc;
 
-use mcp::protocol::{ToolMetadata, ToolParameter, ToolParameterType, ToolProtocol, ToolResult};
+use mcp::protocol::{
+    ToolError, ToolMetadata, ToolParameter, ToolParameterType, ToolProtocol, ToolResult,
+};
+use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::bus::{Bus, Registration, Retention};
 use crate::errors::MailboxError;
-use crate::names::AgentName;
+use crate::names::{AgentName, Provider};
 
 /// Ritual returned in the MCP `initialize` result so every harness sees the
 /// same instructions; [`instructions`] appends the retention line.
 pub const INSTRUCTIONS: &str = "\
 mentischat is a local mailbox between agents on this machine.
-Register using your model name in snake_case, e.g. deepseek_v4_flash, with a one-line description of who you are and what you are working on. Call list_agents first to see which names are taken. If that exact name is already on the roster (multiple instances of the same model can coexist), append a numeric suffix starting at 1 — deepseek_v4_flash_1, _2, ... — and pick the lowest free name.
-The first time you register in a conversation, pass exclusive: true. If that fails with name_taken, another agent already holds the name: try the next free suffix. Never take over a name you did not register yourself: without exclusive, created: false means the name was already on the roster and you now share its inbox.
+Register with provider set to where you are running, the harness or app (claude_code, claude_desktop, cursor, codex, grok_build, grok_desktop), and description set to your model, e.g. claude sonnet 5.5 or grok 4.6. The server assigns your name: the next {provider}_{n}, e.g. claude_code_1, then claude_code_2 for a second instance; numbers are not reused while the server runs. Use the agent field in the reply as your name for every later call. Pass agent (a name of your choosing) only when the user asks for a specific name.
 Before send_message, call list_agents. Only send to names that appear there; each entry shows the agent's description and how many messages are queued for it. from must be your registered name. When you need a reply, say so in the body so the recipient responds when done.
 Nothing wakes an idle agent: a message is read only when its recipient calls check_inbox, usually because the user asked it to check its messages. After send_message, end your turn unless a peer is answering within the same turn, in which case call check_inbox with wait_ms > 0 to wait for the reply.
 check_inbox deletes the messages it returns: each is delivered once and nothing is kept, so quote the bodies in your reply right away. If remaining > 0, check_inbox again (wait_ms 0) until remaining is 0.
@@ -31,7 +33,7 @@ Call deregister only when the user says they are done.";
 /// the units the operator configured.
 pub fn instructions(retention: &Retention) -> String {
     format!(
-        "{INSTRUCTIONS}\nUnread messages expire {} after they are sent. An agent that has not called register, send_message or check_inbox for {} is dropped from the roster with its unread mail; if a call fails unregistered, register again.",
+        "{INSTRUCTIONS}\nUnread messages expire {} after they are sent. An agent that has not called register, send_message or check_inbox for {} is dropped from the roster with its unread mail; if a call fails unregistered, register again and use the name it returns.",
         human(retention.message_ttl),
         human(retention.agent_ttl),
     )
@@ -71,18 +73,22 @@ fn metadata_for(tool_name: &str) -> Option<ToolMetadata> {
         "register" => Some(
             ToolMetadata::new(
                 "register",
-                "Claim this agent name on the local mentischat roster. Call list_agents first. Use your model name in snake_case (e.g. deepseek_v4_flash); if that name is taken, append a numeric suffix starting at 1 (..._1, ..._2) and pick the lowest free one. Pass exclusive: true the first time; name_taken means someone else holds the name, so try the next suffix. Without exclusive the call is idempotent and created: false means the name was already registered (its inbox is shared).",
+                "Join the local mentischat roster. Pass provider, where you are running (claude_code, claude_desktop, cursor, codex, grok_build, grok_desktop), and description, your model (e.g. claude sonnet 5.5). The server assigns the next {provider}_{n}, e.g. claude_code_1, and returns it in agent. Use that name for every later call. Pass agent only when the user asks for a specific name: it claims that exact name, or refreshes it if it exists, and anyone else using it shares its inbox.",
             )
-            .with_parameter(str_param("agent", "The exact roster name to claim"))
             .with_parameter(
-                ToolParameter::new("description", ToolParameterType::String).with_description(
-                    "One line on who you are and what you are working on (max 256 bytes); shown to peers in list_agents. Omit to keep the current one, empty string clears it",
+                ToolParameter::new("provider", ToolParameterType::String).with_description(
+                    "The harness or app you are running in, e.g. claude_code, grok_build, claude_desktop; the server appends the number. Required unless agent is given",
                 ),
             )
             .with_parameter(
-                ToolParameter::new("exclusive", ToolParameterType::Boolean)
-                    .with_description("Fail with name_taken instead of joining a name that is already registered; pass true the first time you register")
-                    .with_default(json!(false)),
+                ToolParameter::new("agent", ToolParameterType::String).with_description(
+                    "A name the user asked you to use; omit it to get the default {provider}_{n}",
+                ),
+            )
+            .with_parameter(
+                ToolParameter::new("description", ToolParameterType::String).with_description(
+                    "Your model, e.g. claude sonnet 5.5 or grok 4.6 (max 256 bytes); shown to peers in list_agents. Omit to keep the current one, empty string clears it",
+                ),
             ),
         ),
         "deregister" => Some(
@@ -136,15 +142,16 @@ impl ToolProtocol for MailboxProtocol {
         tool_name: &str,
         parameters: Value,
     ) -> Result<ToolResult, Box<dyn std::error::Error + Send + Sync>> {
-        tracing::info!(tool = tool_name, "mcp tool");
         let outcome: Result<Value, MailboxError> = match tool_name {
             "register" => self.register(&parameters).await,
             "deregister" => self.deregister(&parameters).await,
             "send_message" => self.send_message(&parameters).await,
             "check_inbox" => self.check_inbox(&parameters).await,
             "list_agents" => self.list_agents().await,
-            other => return Err(format!("unknown tool: {other}").into()),
+            other => return Err(unknown_tool(other)),
         };
+        // Logged after the match, so only the five known names reach the log.
+        tracing::info!(tool = tool_name, "mcp tool");
         Ok(match outcome {
             Ok(value) => ToolResult::success(value),
             Err(e) => ToolResult::failure(e.to_json_string()),
@@ -169,7 +176,7 @@ impl ToolProtocol for MailboxProtocol {
         &self,
         tool_name: &str,
     ) -> Result<ToolMetadata, Box<dyn std::error::Error + Send + Sync>> {
-        metadata_for(tool_name).ok_or_else(|| format!("unknown tool: {tool_name}").into())
+        metadata_for(tool_name).ok_or_else(|| unknown_tool(tool_name))
     }
 
     fn protocol_name(&self) -> &str {
@@ -179,36 +186,24 @@ impl ToolProtocol for MailboxProtocol {
 
 impl MailboxProtocol {
     async fn register(&self, params: &Value) -> Result<Value, MailboxError> {
-        let agent = required_name(params, "agent")?;
-        let opts = parse_registration(params)?;
-        let out = self.bus.register_with(&agent, opts).await?;
-        Ok(serde_json::to_value(out).expect("RegisterOutcome is always serializable"))
+        register_agent(&self.bus, params).await
     }
 
     async fn deregister(&self, params: &Value) -> Result<Value, MailboxError> {
         let agent = required_name(params, "agent")?;
         let out = self.bus.deregister(&agent).await?;
-        Ok(serde_json::to_value(out).expect("DiscardOutcome is always serializable"))
+        Ok(to_wire(out))
     }
 
     async fn send_message(&self, params: &Value) -> Result<Value, MailboxError> {
-        // Validate from before to: when both are bad the error names from.
-        let from = required_name(params, "from")?;
-        let to = required_name(params, "to")?;
-        let body = params
-            .get("body")
-            .and_then(Value::as_str)
-            .ok_or(MailboxError::InvalidBody)?
-            .to_string();
-        let out = self.bus.send(&from, &to, body).await?;
-        Ok(serde_json::to_value(out).expect("SendReceipt is always serializable"))
+        send_message(&self.bus, params).await
     }
 
     async fn check_inbox(&self, params: &Value) -> Result<Value, MailboxError> {
         let agent = required_name(params, "agent")?;
         let wait_ms = parse_wait_ms(params.get("wait_ms"))?;
         let page = self.bus.check_inbox(&agent, wait_ms).await?;
-        Ok(serde_json::to_value(page).expect("InboxPage is always serializable"))
+        Ok(to_wire(page))
     }
 
     async fn list_agents(&self) -> Result<Value, MailboxError> {
@@ -217,19 +212,62 @@ impl MailboxProtocol {
     }
 }
 
-/// Pull a required string field and validate it as an [`AgentName`].
+/// Pull a required name field: missing or empty is `invalid_name`, a
+/// non-string value is `invalid_body`.
 fn required_name(params: &Value, key: &str) -> Result<AgentName, MailboxError> {
-    let raw = params.get(key).and_then(Value::as_str).unwrap_or("");
-    AgentName::parse(raw)
+    match params.get(key) {
+        None | Some(Value::Null) => AgentName::parse(""),
+        Some(Value::String(raw)) => AgentName::parse(raw),
+        Some(_) => Err(MailboxError::InvalidBody),
+    }
 }
 
-/// The optional `description` and `exclusive` fields of a register call,
-/// shared by the tool and `POST /agents`.
-pub fn parse_registration(params: &Value) -> Result<Registration, MailboxError> {
-    Ok(Registration {
+/// The error for a tool name this server does not have: upstream maps
+/// [`ToolError::NotFound`] to JSON-RPC `-32602`. The name is shortened, so a
+/// huge one is not echoed back in full.
+fn unknown_tool(name: &str) -> Box<dyn std::error::Error + Send + Sync> {
+    Box::new(ToolError::NotFound(crate::names::echo(name)))
+}
+
+/// Register per the tool and `POST /agents` contract: a non-null `agent`
+/// claims or refreshes that exact name; otherwise `provider` is assigned the
+/// next `{provider}_{n}`. Neither is `invalid_body`.
+pub async fn register_agent(bus: &Bus, params: &Value) -> Result<Value, MailboxError> {
+    let opts = Registration {
         description: parse_description(params.get("description"))?,
-        exclusive: parse_flag(params.get("exclusive"))?,
-    })
+    };
+    let present = |key: &str| params.get(key).is_some_and(|v| !v.is_null());
+    let out = if present("agent") {
+        bus.register_with(&required_name(params, "agent")?, opts)
+            .await?
+    } else if present("provider") {
+        let raw = params
+            .get("provider")
+            .and_then(Value::as_str)
+            .ok_or(MailboxError::InvalidBody)?;
+        bus.register_provider(&Provider::parse(raw)?, opts).await?
+    } else {
+        return Err(MailboxError::InvalidBody);
+    };
+    Ok(to_wire(out))
+}
+
+/// Queue a message per the tool and `POST /messages` contract. `from` is
+/// validated before `to`, so when both are bad the error names `from`.
+pub async fn send_message(bus: &Bus, params: &Value) -> Result<Value, MailboxError> {
+    let from = required_name(params, "from")?;
+    let to = required_name(params, "to")?;
+    let body = params
+        .get("body")
+        .and_then(Value::as_str)
+        .ok_or(MailboxError::InvalidBody)?
+        .to_string();
+    Ok(to_wire(bus.send(&from, &to, body).await?))
+}
+
+/// A bus result as its JSON wire shape.
+pub(crate) fn to_wire(value: impl Serialize) -> Value {
+    serde_json::to_value(value).expect("wire types are always serializable")
 }
 
 /// Contract description semantics: absent/null -> keep the stored one; a
@@ -241,19 +279,6 @@ pub fn parse_description(v: Option<&Value>) -> Result<Option<String>, MailboxErr
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(s)) => Ok(Some(s.clone())),
         Some(_) => Err(MailboxError::InvalidDescription),
-    }
-}
-
-/// Optional boolean: absent/null -> false; `true`/`false` or the strings
-/// `"true"`/`"false"` (some clients stringify booleans) -> value; anything
-/// else -> `invalid_body`.
-fn parse_flag(v: Option<&Value>) -> Result<bool, MailboxError> {
-    match v {
-        None | Some(Value::Null) => Ok(false),
-        Some(Value::Bool(b)) => Ok(*b),
-        Some(Value::String(s)) if s == "true" => Ok(true),
-        Some(Value::String(s)) if s == "false" => Ok(false),
-        Some(_) => Err(MailboxError::InvalidBody),
     }
 }
 

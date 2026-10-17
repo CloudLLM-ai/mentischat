@@ -3,7 +3,12 @@
 
 use std::{
     io,
-    sync::atomic::{AtomicBool, Ordering},
+    panic::PanicHookInfo,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread::ThreadId,
     time::{Duration, Instant},
 };
 
@@ -37,7 +42,17 @@ pub fn run(
     running: &AtomicBool,
 ) -> io::Result<bool> {
     let mut dash = Dashboard::new(info);
+    // ratatui's hook restores the terminal on a panic on *any* thread; the
+    // view keeps drawing after a request handler panics, so scope it to this
+    // thread and give every other thread the hook that was there before.
+    let previous: Arc<PanicHook> = Arc::from(std::panic::take_hook());
+    std::panic::set_hook(forward(previous.clone()));
     let mut terminal = ratatui::init();
+    std::panic::set_hook(scoped_panic_hook(
+        std::thread::current().id(),
+        std::panic::take_hook(),
+        previous.clone(),
+    ));
     let result = (|| {
         let mut latest = Overview::default();
         let mut last_refresh: Option<Instant> = None;
@@ -61,7 +76,32 @@ pub fn run(
         Ok(false)
     })();
     ratatui::restore();
+    std::panic::set_hook(forward(previous));
     result
+}
+
+/// A panic hook, as [`std::panic::set_hook`] takes it.
+pub type PanicHook = dyn Fn(&PanicHookInfo<'_>) + Sync + Send + 'static;
+
+/// A panic hook that runs `on_view` for panics on thread `view` and
+/// `elsewhere` for every other thread. [`run`] installs one so only a panic in
+/// the terminal view restores the terminal.
+pub fn scoped_panic_hook(
+    view: ThreadId,
+    on_view: Box<PanicHook>,
+    elsewhere: Arc<PanicHook>,
+) -> Box<PanicHook> {
+    Box::new(move |info| {
+        if std::thread::current().id() == view {
+            on_view(info);
+        } else {
+            elsewhere(info);
+        }
+    })
+}
+
+fn forward(hook: Arc<PanicHook>) -> Box<PanicHook> {
+    Box::new(move |info| hook(info))
 }
 
 /// Runs `view` and stops the server when the view ends on its own: the user

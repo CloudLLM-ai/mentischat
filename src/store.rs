@@ -1,8 +1,10 @@
-//! SQLite persistence: opening, pragmas, schema and migrations.
+//! SQLite persistence: opening, pragmas and schema.
 //!
 //! All mailbox logic and SQL queries live in [`crate::bus`]; this module only
-//! opens the database with the right on-disk permissions and brings the two
-//! tables (`roster`, `messages`) up to the current schema.
+//! opens the database with the right on-disk permissions and creates the two
+//! tables (`roster`, `messages`) if they are missing. A database whose tables
+//! have a different shape is refused with [`StoreError::Schema`], never
+//! upgraded; [`reset`] deletes it.
 
 use std::fmt;
 use std::fs;
@@ -22,7 +24,7 @@ pub fn open(data_dir: &Path) -> Result<Connection, StoreError> {
         fs::set_permissions(data_dir, fs::Permissions::from_mode(0o700)).map_err(StoreError::Io)?;
     }
 
-    let db_path = data_dir.join("pending.sqlite");
+    let db_path = data_dir.join(DB_FILE);
     let conn = Connection::open(&db_path).map_err(StoreError::Sqlite)?;
     #[cfg(unix)]
     {
@@ -64,8 +66,12 @@ pub fn open(data_dir: &Path) -> Result<Connection, StoreError> {
     )
     .map_err(StoreError::Sqlite)?;
 
-    migrate_roster(&conn).map_err(StoreError::Sqlite)?;
-    migrate_messages(&conn).map_err(StoreError::Sqlite)?;
+    for (table, expected) in SCHEMA {
+        let found = columns(&conn, table).map_err(StoreError::Sqlite)?;
+        if found != *expected {
+            return Err(StoreError::Schema { table, found });
+        }
+    }
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_inbox ON messages (recipient, seq);
          CREATE INDEX IF NOT EXISTS idx_created ON messages (created_at);",
@@ -74,67 +80,63 @@ pub fn open(data_dir: &Path) -> Result<Connection, StoreError> {
     Ok(conn)
 }
 
-/// Brings a roster created by an older build up to the current shape: the
-/// wake/nudge columns and their index are dropped and the `description`
-/// column is added, keeping every row.
-fn migrate_roster(conn: &Connection) -> Result<(), rusqlite::Error> {
-    let mut stmt = conn.prepare("PRAGMA table_info(roster)")?;
-    let cols: Vec<String> = stmt
+/// The columns each table must have, in order.
+const SCHEMA: [(&str, &[&str]); 2] = [
+    ("roster", &["name", "last_seen", "description"]),
+    (
+        "messages",
+        &["id", "sender", "recipient", "body", "created_at", "seq"],
+    ),
+];
+
+fn columns(conn: &Connection, table: &str) -> Result<Vec<String>, rusqlite::Error> {
+    conn.prepare(&format!("PRAGMA table_info({table})"))?
         .query_map([], |r| r.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?;
-    // The unique index must go before the column it covers. (DROP COLUMN needs
-    // SQLite >= 3.35; the bundled build is well past that.)
-    conn.execute("DROP INDEX IF EXISTS idx_roster_wake_id", [])?;
-    for retired in ["window_title_match", "nudge_transport", "wake_id"] {
-        if cols.iter().any(|c| c == retired) {
-            conn.execute(&format!("ALTER TABLE roster DROP COLUMN {retired}"), [])?;
+        .collect()
+}
+
+/// Open a second connection to the database [`open`] created, for work that
+/// runs outside the bus lock (truncating the write-ahead log).
+pub fn open_side(data_dir: &Path) -> Result<Connection, StoreError> {
+    let conn = Connection::open(data_dir.join(DB_FILE)).map_err(StoreError::Sqlite)?;
+    conn.busy_timeout(std::time::Duration::from_millis(5000))
+        .map_err(StoreError::Sqlite)?;
+    Ok(conn)
+}
+
+/// Delete the database and its `-wal` and `-shm` files under `data_dir`, so
+/// the next [`open`] starts empty. Files that do not exist are skipped.
+///
+/// # Errors
+///
+/// Any filesystem error other than a missing file.
+pub fn reset(data_dir: &Path) -> Result<(), StoreError> {
+    for suffix in ["", "-wal", "-shm"] {
+        match fs::remove_file(data_dir.join(format!("{DB_FILE}{suffix}"))) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(StoreError::Io(e)),
+            _ => {}
         }
-    }
-    if !cols.iter().any(|c| c == "description") {
-        conn.execute("ALTER TABLE roster ADD COLUMN description TEXT", [])?;
     }
     Ok(())
 }
 
-/// Brings a `messages` table from the acknowledge-to-delete era up to the
-/// delete-on-read shape: the `state` column (and the index over it) goes,
-/// keeping every unread row. SQLite cannot drop a column a CHECK constraint
-/// names, so the table is rebuilt in one transaction.
-fn migrate_messages(conn: &Connection) -> Result<(), rusqlite::Error> {
-    let has_state = conn
-        .prepare("PRAGMA table_info(messages)")?
-        .query_map([], |r| r.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?
-        .iter()
-        .any(|c| c == "state");
-    if !has_state {
-        return Ok(());
-    }
-    conn.execute_batch(
-        "BEGIN;
-         CREATE TABLE messages_new (
-           id TEXT PRIMARY KEY,
-           sender TEXT NOT NULL,
-           recipient TEXT NOT NULL,
-           body TEXT NOT NULL,
-           created_at TEXT NOT NULL,
-           seq INTEGER NOT NULL
-         );
-         INSERT INTO messages_new (id, sender, recipient, body, created_at, seq)
-           SELECT id, sender, recipient, body, created_at, seq FROM messages;
-         DROP TABLE messages;
-         ALTER TABLE messages_new RENAME TO messages;
-         COMMIT;",
-    )
-}
+const DB_FILE: &str = "pending.sqlite";
 
-/// Failure modes of opening/migrating the store.
+/// Failure modes of opening the store.
 #[derive(Debug)]
 pub enum StoreError {
     /// Filesystem error creating directories or setting permissions.
     Io(io::Error),
-    /// SQLite open/migration failure.
+    /// SQLite open or schema failure.
     Sqlite(rusqlite::Error),
+    /// A table exists with columns other than the current ones, usually a
+    /// database written by an older build.
+    Schema {
+        /// The table whose columns differ.
+        table: &'static str,
+        /// Its columns as found.
+        found: Vec<String>,
+    },
 }
 
 impl fmt::Display for StoreError {
@@ -142,6 +144,11 @@ impl fmt::Display for StoreError {
         match self {
             Self::Io(e) => write!(f, "data dir: {e}"),
             Self::Sqlite(e) => write!(f, "sqlite: {e}"),
+            Self::Schema { table, found } => write!(
+                f,
+                "{DB_FILE} has an older `{table}` table ({}); delete {DB_FILE} and its -wal and -shm files",
+                found.join(", ")
+            ),
         }
     }
 }
@@ -151,6 +158,7 @@ impl std::error::Error for StoreError {
         match self {
             Self::Io(e) => Some(e),
             Self::Sqlite(e) => Some(e),
+            Self::Schema { .. } => None,
         }
     }
 }

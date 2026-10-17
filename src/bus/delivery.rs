@@ -5,8 +5,7 @@
 use rusqlite::params;
 
 use super::{
-    now_rfc3339, sqlite_storage, truncate_wal, InboxPage, Inner, MailErr, Message, MAX_BATCH,
-    MAX_RETURN_BYTES,
+    now_rfc3339, sqlite_storage, InboxPage, Inner, MailErr, Message, MAX_BATCH, MAX_RETURN_BYTES,
 };
 
 pub(super) fn empty_page(name: &crate::names::AgentName) -> InboxPage {
@@ -33,7 +32,8 @@ pub(super) fn touch_last_seen(g: &mut Inner, name: &str) -> Result<(), MailErr> 
 /// Up to [`MAX_BATCH`] rows within [`MAX_RETURN_BYTES`] of serialized message
 /// JSON (the first message always rides even when oversized — progress must
 /// be possible). The rows are deleted before the page is returned, so a
-/// message is handed out exactly once.
+/// message is handed out exactly once; the caller truncates the write-ahead
+/// log after releasing the lock.
 pub(super) fn take_locked(g: &mut Inner, name: &str) -> Result<Option<InboxPage>, MailErr> {
     let candidates = load_rows(g, name, MAX_BATCH)?;
     if candidates.is_empty() {
@@ -57,9 +57,6 @@ pub(super) fn take_locked(g: &mut Inner, name: &str) -> Result<Option<InboxPage>
         )
         .map_err(sqlite_storage)?;
     tx.commit().map_err(sqlite_storage)?;
-    // The delivered text is gone from the tables (secure_delete zeroes it in
-    // the database pages); truncate the log so no copy stays in `-wal`.
-    truncate_wal(&g.conn);
     Ok(Some(InboxPage {
         agent: name.to_string(),
         messages,

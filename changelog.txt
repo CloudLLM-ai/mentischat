@@ -1,10 +1,71 @@
 UNRELEASED
 
+  - fix(security): a page on another site could delete an agent's unread mail
+    by loading http://127.0.0.1:9480/inboxes/{agent} as an image (loopback
+    Host, no Origin), or with a HEAD request. Requests whose Sec-Fetch-Site
+    is cross-site or same-site are now refused (403) on every route; curl and
+    agents do not send the header. HEAD on an inbox returns 405 instead of
+    deleting mail with no body.
+
+  - fix(bus): send stores the message and refreshes the sender's last_seen in
+    one transaction. A failure in the second step used to report
+    storage_error with the message already queued, so a retry duplicated it
+    and the next message reused its sequence number.
+
+  - fix(mcp): an unknown tool name returns JSON-RPC -32602 (HTTP 400), not
+    -32603 (500), and is echoed at most 64 characters long; tool calls are
+    logged only after the name matches a known tool, so a huge name no longer
+    reaches the terminal view or the launchd log. A name field (agent,
+    provider, from, to) that is not a string is invalid_body, not
+    invalid_name with an empty agent.
+
+  - fix(rest): a known route called with the wrong method returns 405 with the
+    JSON error body method_not_allowed, not an empty 405.
+
+  - fix(tui): a panic on any thread used to restore the terminal (ratatui's
+    hook is process-wide) while the view kept drawing, garbling the screen.
+    The hook now restores it only for a panic on the view thread.
+
+  - fix(launchd): KeepAlive also restarts the daemon after a non-zero exit
+    (a panic in main, a server error), not only after a signal crash. A clean
+    stop (exit 0) stays down; a second instance retries every 30 s until the
+    port is free.
+
+  - perf(bus): the write-ahead log is truncated on a blocking thread over a
+    second connection, after the bus lock is released, so its disk sync no
+    longer stalls every other operation or ties up an async worker. Pulls,
+    deregister and sweep still wait for it, so deleted text is off disk
+    before they return.
+
+  - chore(store)!: the migrations for databases written by earlier builds are
+    removed (the wake/nudge roster columns, the roster description column, the
+    messages state column). store::open checks both tables' columns and
+    refuses a different shape with StoreError::Schema instead of opening a
+    database every write would fail on. The daemon replaces such a database
+    at startup (store::reset), since it would be wiped anyway; under
+    MENTISCHAT_PERSIST=1 it refuses to start and names the files to delete.
+
+  - feat(roster)!: register assigns the name, as agent_chat does. Pass
+    provider (where it runs, the harness or app: claude_code, claude_desktop,
+    cursor, codex, grok_build, grok_desktop) and description (its model, e.g.
+    claude sonnet 5.5) and the server picks the next {provider}_{n} under the
+    roster lock, returning it as agent; concurrent registers cannot get the
+    same name, and a number is never reused within a run, so a client still
+    holding a freed name fails unregistered instead of reading the next
+    agent's mail. Providers are at most 42 characters, leaving room for any
+    u64 suffix. agent remains as the alternative, for
+    when the user asks for a specific name: it claims or refreshes that exact
+    name; neither is invalid_body. The exclusive
+    flag and the name_taken error (409) are gone: provider cannot collide, and
+    agent is idempotent (created: false means the inbox is shared). Neither
+    parameter is schema-required. The instructions, tool descriptions, README
+    and PLAN describe provider registration and no longer ask agents to pick
+    a model-name suffix or call list_agents first.
+
   - feat(bus)!: read once, then gone. check_inbox deletes the batch it returns,
     in the same transaction, so each message is delivered exactly once and
     nothing is kept. The ack step is removed: the in_flight state, the
-    check_inbox ack_ids parameter and POST /inboxes/{agent}/ack are gone (old
-    databases are migrated, keeping unread rows). A truncated tool result or
+    check_inbox ack_ids parameter and POST /inboxes/{agent}/ack are gone. A truncated tool result or
     a dropped connection after delivery now loses that batch instead of
     redelivering it.
 
@@ -57,8 +118,8 @@ UNRELEASED
     validates descriptions, so the library API enforces the same caps.
 
   - fix(main): bind the port before opening the data directory, so a second
-    instance exits on the single-instance lock before it touches (or
-    migrates) the live instance's database.
+    instance exits on the single-instance lock before it touches the
+    live instance's database.
 
   - chore(ci): CI ran on pushes to main, but the default branch is master;
     it now runs there, with a read-only token. make check/clippy/test/doc
@@ -205,3 +266,11 @@ UNRELEASED
   - docs(skills): add skills/ folder — rust-engineer (merged MentisDB
     rust-engineer + DiarioBitcoin rust-backend-engineer house style) and
     rust-performance-reviewer (Abseil performance-hints review method).
+
+  - docs(readme): documents every response shape (register, list_agents,
+    send_message, check_inbox, deregister, /health), the request bodies, all
+    twelve error codes with their HTTP status and context, the instructions
+    the server sends agents on connect, the terminal view's j/k and Shift+Tab
+    keys, the MENTISCHAT_BIN launchd override, parked pulls exempting an agent
+    from the idle drop, and use as a library. The sweep interval is described
+    as a quarter of the shorter TTL (1 to 60 seconds), not always a minute.

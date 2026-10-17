@@ -45,9 +45,49 @@ impl AgentName {
     }
 }
 
+/// The product an agent runs in (`claude_code`, `cursor`), lowercased: the
+/// stem of the name the roster assigns it, `{provider}_{n}`.
+///
+/// At most [`MAX_PROVIDER_LEN`] characters, so the assigned name with any
+/// numeric suffix still fits the 63-character name limit.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Provider(String);
+
+/// Longest provider: leaves room for `_` and a 20-digit (`u64`) suffix under
+/// the 63-character name limit.
+pub const MAX_PROVIDER_LEN: usize = 42;
+
+impl Provider {
+    /// Lowercase and validate a raw provider, or fail with
+    /// [`MailboxError::InvalidName`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mentischat::names::Provider;
+    ///
+    /// assert_eq!(Provider::parse("Claude_Code").unwrap().as_str(), "claude_code");
+    /// assert!(Provider::parse("").is_err());
+    /// assert!(Provider::parse("-cursor").is_err());
+    /// assert!(Provider::parse(&"x".repeat(43)).is_err());
+    /// ```
+    pub fn parse(raw: &str) -> Result<Self, MailboxError> {
+        let lower = raw.to_ascii_lowercase();
+        match AgentName::parse(&lower) {
+            Ok(_) if lower.len() <= MAX_PROVIDER_LEN => Ok(Self(lower)),
+            _ => Err(MailboxError::InvalidName { agent: echo(raw) }),
+        }
+    }
+
+    /// The validated, lowercased provider.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// The rejected input as echoed in `invalid_name`: at most 64 characters, so
 /// a megabyte "name" is not sent straight back.
-fn echo(raw: &str) -> String {
+pub(crate) fn echo(raw: &str) -> String {
     const MAX_ECHO_CHARS: usize = 64;
     match raw.char_indices().nth(MAX_ECHO_CHARS) {
         Some((cut, _)) => format!("{}…", &raw[..cut]),

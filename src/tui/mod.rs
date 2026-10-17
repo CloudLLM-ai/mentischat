@@ -30,7 +30,7 @@ mod log_buffer;
 mod terminal;
 
 pub use log_buffer::LogBuffer;
-pub use terminal::{run, run_guarded};
+pub use terminal::{run, run_guarded, scoped_panic_hook, PanicHook};
 
 use banner::{banner_width, BANNER_ROWS, CHAT_PART, MENTIS_PART, TITLE};
 

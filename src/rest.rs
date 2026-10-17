@@ -27,9 +27,12 @@ pub fn router(bus: Ctx) -> Router {
         .route("/agents", post(register).get(list))
         .route("/agents/{agent}", delete(deregister_one))
         .route("/messages", post(send_msg))
-        .route("/inboxes/{agent}", get(pull))
+        // A pull deletes mail, so HEAD (which axum would otherwise send to
+        // the GET handler) is refused rather than deleting without a body.
+        .route("/inboxes/{agent}", get(pull).head(method_not_allowed))
         .route("/health", get(health))
         .fallback(not_found)
+        .method_not_allowed_fallback(method_not_allowed)
         .with_state(bus)
 }
 
@@ -41,10 +44,14 @@ fn ok_response(value: Value) -> Response {
     (StatusCode::OK, Json(value)).into_response()
 }
 
+fn respond(result: Result<Value, MailboxError>) -> Response {
+    result.map_or_else(err_response, ok_response)
+}
+
 /// Serialise a pull result with `Cache-Control: no-store` — it mutates live
 /// state and must never be cached.
-fn no_store_response<T: serde::Serialize>(value: &T) -> Response {
-    let mut resp = Json(serde_json::to_value(value).unwrap_or(Value::Null)).into_response();
+fn no_store_response(value: impl serde::Serialize) -> Response {
+    let mut resp = Json(crate::tools::to_wire(value)).into_response();
     resp.headers_mut().insert(
         header::CACHE_CONTROL,
         header::HeaderValue::from_static("no-store"),
@@ -74,24 +81,13 @@ fn path_name(path: Result<Path<String>, PathRejection>) -> Result<AgentName, Res
     AgentName::parse(&raw).map_err(err_response)
 }
 
-/// `POST /agents` `{ "agent", "description"?, "exclusive"? }` — same as register.
+/// `POST /agents` `{ "provider" | "agent", "description"? }` — same as register.
 async fn register(State(bus): State<Ctx>, body: Result<Json<Value>, JsonRejection>) -> Response {
     let v = match json_body(body) {
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    let agent = match AgentName::parse(v.get("agent").and_then(Value::as_str).unwrap_or("")) {
-        Ok(a) => a,
-        Err(e) => return err_response(e),
-    };
-    let opts = match crate::tools::parse_registration(&v) {
-        Ok(opts) => opts,
-        Err(e) => return err_response(e),
-    };
-    match bus.register_with(&agent, opts).await {
-        Ok(out) => ok_response(serde_json::to_value(out).unwrap_or(Value::Null)),
-        Err(e) => err_response(e),
-    }
+    respond(crate::tools::register_agent(&bus, &v).await)
 }
 
 /// `GET /agents` — roster sorted by name ascending.
@@ -111,10 +107,7 @@ async fn deregister_one(
         Ok(a) => a,
         Err(resp) => return resp,
     };
-    match bus.deregister(&agent).await {
-        Ok(out) => ok_response(serde_json::to_value(out).unwrap_or(Value::Null)),
-        Err(e) => err_response(e),
-    }
+    respond(bus.deregister(&agent).await.map(crate::tools::to_wire))
 }
 
 /// `POST /messages` `{ "from", "to", "body" }` — same as send_message.
@@ -123,23 +116,7 @@ async fn send_msg(State(bus): State<Ctx>, body: Result<Json<Value>, JsonRejectio
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    // Validate from before to: when both are bad the error names from.
-    let from = match AgentName::parse(v.get("from").and_then(Value::as_str).unwrap_or("")) {
-        Ok(a) => a,
-        Err(e) => return err_response(e),
-    };
-    let to = match AgentName::parse(v.get("to").and_then(Value::as_str).unwrap_or("")) {
-        Ok(a) => a,
-        Err(e) => return err_response(e),
-    };
-    let text = match v.get("body").and_then(Value::as_str) {
-        Some(t) => t.to_string(),
-        None => return err_response(MailboxError::InvalidBody),
-    };
-    match bus.send(&from, &to, text).await {
-        Ok(out) => ok_response(serde_json::to_value(out).unwrap_or(Value::Null)),
-        Err(e) => err_response(e),
-    }
+    respond(crate::tools::send_message(&bus, &v).await)
 }
 
 /// `GET /inboxes/{agent}?wait_ms=` — same as check_inbox: returned messages
@@ -161,7 +138,7 @@ async fn pull(
         Err(e) => return err_response(e),
     };
     match bus.check_inbox(&agent, wait_ms).await {
-        Ok(page) => no_store_response(&page),
+        Ok(page) => no_store_response(page),
         Err(e) => err_response(e),
     }
 }
@@ -179,6 +156,11 @@ async fn health(State(bus): State<Ctx>) -> Response {
 /// Unknown REST path.
 async fn not_found() -> Response {
     err_response(MailboxError::NotFound)
+}
+
+/// Known REST path, method it does not serve.
+async fn method_not_allowed() -> Response {
+    err_response(MailboxError::MethodNotAllowed)
 }
 
 /// Contract wait_ms query semantics: absent/empty -> 0; digit string within

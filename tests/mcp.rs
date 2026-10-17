@@ -144,7 +144,7 @@ async fn domain_error_is_iserror_true_content_block() {
 }
 
 #[tokio::test]
-async fn register_tool_takes_a_name_description_and_exclusive_flag() {
+async fn register_tool_takes_a_provider_or_name_and_a_description() {
     let (_d, app) = app();
     let (_, resp) = rpc(&app, "tools/list", json!({})).await;
     let tools = resp["result"]["tools"].as_array().unwrap();
@@ -154,11 +154,15 @@ async fn register_tool_takes_a_name_description_and_exclusive_flag() {
     names.sort_unstable();
     assert_eq!(
         names,
-        ["agent", "description", "exclusive"],
+        ["agent", "description", "provider"],
         "no wakeId or nudgeTransport parameter"
     );
-    let required = register["inputSchema"]["required"].as_array().unwrap();
-    assert_eq!(required, &[json!("agent")], "only the name is required");
+    assert!(
+        register["inputSchema"]["required"]
+            .as_array()
+            .is_none_or(|r| r.is_empty()),
+        "provider and agent are alternatives, so neither is schema-required"
+    );
 
     let (_, reg) = rpc(
         &app,
@@ -359,32 +363,47 @@ async fn non_loopback_peer_is_403() {
 }
 
 #[tokio::test]
-async fn register_over_mcp_stores_a_description_and_honors_exclusive() {
+async fn register_over_mcp_assigns_a_numbered_name_for_a_provider() {
     let (_d, app) = app();
     let call = |args: Value| json!({ "name": "register", "arguments": args });
+    let out = |resp: &Value| -> Value {
+        serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+    };
 
-    let (_, reg) = rpc(
+    let (_, one) = rpc(
         &app,
         "tools/call",
-        call(json!({"agent": "grok", "description": "reviews PRs", "exclusive": true})),
+        call(json!({"provider": "claude_code", "description": "reviews PRs"})),
     )
     .await;
-    assert_eq!(reg["result"]["isError"], false, "{reg}");
-    let out: Value =
-        serde_json::from_str(reg["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-    assert_eq!(out["created"], true);
-    assert_eq!(out["description"], "reviews PRs");
+    assert_eq!(one["result"]["isError"], false, "{one}");
+    assert_eq!(out(&one)["agent"], "claude_code_1");
+    assert_eq!(out(&one)["created"], true);
+    assert_eq!(out(&one)["description"], "reviews PRs");
 
-    let (_, taken) = rpc(
-        &app,
-        "tools/call",
-        call(json!({"agent": "grok", "exclusive": true})),
-    )
-    .await;
-    assert_eq!(taken["result"]["isError"], true, "{taken}");
-    let err: Value =
-        serde_json::from_str(taken["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-    assert_eq!(err["error"], "name_taken");
+    let (_, two) = rpc(&app, "tools/call", call(json!({"provider": "Claude_Code"}))).await;
+    assert_eq!(
+        out(&two)["agent"],
+        "claude_code_2",
+        "provider is lowercased"
+    );
+
+    let (_, again) = rpc(&app, "tools/call", call(json!({"agent": "claude_code_1"}))).await;
+    assert_eq!(out(&again)["agent"], "claude_code_1");
+    assert_eq!(out(&again)["created"], false, "agent refreshes a held name");
+    assert_eq!(
+        out(&again)["description"],
+        "reviews PRs",
+        "a refresh without a description keeps the stored one"
+    );
+
+    for bad in [json!({}), json!({"provider": null})] {
+        let (_, resp) = rpc(&app, "tools/call", call(bad)).await;
+        assert_eq!(resp["result"]["isError"], true, "{resp}");
+        assert_eq!(out(&resp)["error"], "invalid_body");
+    }
+    let (_, resp) = rpc(&app, "tools/call", call(json!({"provider": "-cursor"}))).await;
+    assert_eq!(out(&resp)["error"], "invalid_name");
 
     let (_, list) = rpc(
         &app,
@@ -454,4 +473,82 @@ async fn agents_are_told_reads_delete_and_unread_mail_expires() {
     let tools = list["result"]["tools"].as_array().unwrap();
     let inbox = tools.iter().find(|t| t["name"] == "check_inbox").unwrap();
     assert!(inbox["inputSchema"]["properties"].get("ack_ids").is_none());
+}
+
+#[tokio::test]
+async fn a_cross_site_page_cannot_drain_an_inbox() {
+    let (_d, mut app) = app();
+    rest_post(&mut app, "/agents", r#"{"agent":"a"}"#).await;
+    rest_post(&mut app, "/agents", r#"{"agent":"b"}"#).await;
+    rest_post(
+        &mut app,
+        "/messages",
+        r#"{"from":"a","to":"b","body":"keep me"}"#,
+    )
+    .await;
+
+    // What an <img src> on another site sends: loopback Host, no Origin.
+    for site in ["cross-site", "same-site"] {
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("/inboxes/b")
+            .header("host", "127.0.0.1:9480")
+            .header("sec-fetch-site", site)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status().as_u16(), 403, "{site}");
+    }
+
+    // Typed into the address bar, and curl (no header), still work.
+    let req = http::Request::builder()
+        .method("GET")
+        .uri("/health")
+        .header("sec-fetch-site", "none")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status().as_u16(),
+        200
+    );
+    let req = http::Request::builder()
+        .uri("/inboxes/b")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let bytes = BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+    let page: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(page["messages"][0]["body"], "keep me", "the mail survived");
+}
+
+#[tokio::test]
+async fn an_unknown_tool_is_a_parameter_error_with_a_short_echo() {
+    let (_d, app) = app();
+    let long = "x".repeat(10_000);
+    let (status, resp) = rpc(&app, "tools/call", json!({"name": long, "arguments": {}})).await;
+    assert_eq!(status, 400, "{resp}");
+    assert_eq!(resp["error"]["code"], -32602, "{resp}");
+    let message = resp["error"]["message"].as_str().unwrap();
+    assert!(
+        message.len() < 200,
+        "the name is not echoed in full: {} bytes",
+        message.len()
+    );
+}
+
+#[tokio::test]
+async fn a_non_string_name_is_invalid_body() {
+    let (_d, app) = app();
+    let call = |name: &str, args: Value| json!({ "name": name, "arguments": args });
+    for (tool, args) in [
+        ("register", json!({"provider": 5})),
+        ("register", json!({"agent": ["a"]})),
+        ("send_message", json!({"from": 1, "to": "b", "body": "x"})),
+        ("check_inbox", json!({"agent": true})),
+    ] {
+        let (_, resp) = rpc(&app, "tools/call", call(tool, args.clone())).await;
+        let err: Value =
+            serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(err["error"], "invalid_body", "{tool} {args}");
+    }
 }

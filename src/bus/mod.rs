@@ -23,9 +23,9 @@ pub use crate::store::StoreError;
 pub use clock::{now_rfc3339, rfc3339};
 pub use model::{
     parse_duration, AgentOverview, DiscardOutcome, InboxPage, Message, Overview, RegisterOutcome,
-    Registration, Retention, RosterEntry, SendReceipt, SweepOutcome, DEFAULT_AGENT_TTL,
-    DEFAULT_MESSAGE_TTL, MAX_BATCH, MAX_BODY_BYTES, MAX_DESCRIPTION_BYTES, MAX_PENDING_PER_AGENT,
-    MAX_RETURN_BYTES, MAX_ROSTER, MAX_TOTAL_MESSAGES, MAX_WAITERS_PER_AGENT, MAX_WAIT_MS,
+    Registration, Retention, RosterEntry, SendReceipt, SweepOutcome, MAX_BATCH, MAX_BODY_BYTES,
+    MAX_DESCRIPTION_BYTES, MAX_PENDING_PER_AGENT, MAX_RETURN_BYTES, MAX_ROSTER, MAX_TOTAL_MESSAGES,
+    MAX_WAITERS_PER_AGENT, MAX_WAIT_MS,
 };
 
 use delivery::{empty_page, take_locked, touch_last_seen};
@@ -41,6 +41,10 @@ struct Inner {
     /// of the process, seeded past every row already on disk.
     next_seq: i64,
     messages_sent: u64,
+    /// Highest `{provider}_{n}` number registered this run, per provider.
+    /// Provider registration never goes back below it, so a freed name is
+    /// not handed to a new agent while its old client may still use it.
+    issued: HashMap<String, u64>,
     closed: bool,
 }
 
@@ -48,6 +52,9 @@ struct Inner {
 pub struct Bus {
     // Arc so a parked pull dropped mid-wait can settle its waiter from Drop.
     inner: Arc<Mutex<Inner>>,
+    /// A second connection that truncates the write-ahead log on a blocking
+    /// thread, outside the bus lock.
+    wal: Arc<std::sync::Mutex<rusqlite::Connection>>,
     retention: Retention,
 }
 
@@ -72,6 +79,7 @@ impl Bus {
     /// per `retention` whenever [`sweep`](Self::sweep) runs.
     pub fn with_retention(data_dir: &Path, retention: Retention) -> Result<Self, StoreError> {
         let conn = crate::store::open(data_dir)?;
+        let wal = crate::store::open_side(data_dir)?;
         let next_seq: i64 = conn
             .query_row("SELECT COALESCE(MAX(seq), 0) + 1 FROM messages", [], |r| {
                 r.get(0)
@@ -84,8 +92,10 @@ impl Bus {
                 next_waiter_id: 0,
                 next_seq,
                 messages_sent: 0,
+                issued: HashMap::new(),
                 closed: false,
             })),
+            wal: Arc::new(std::sync::Mutex::new(wal)),
             retention,
         })
     }
@@ -93,6 +103,24 @@ impl Bus {
     /// How long unread mail and idle agents are kept.
     pub fn retention(&self) -> Retention {
         self.retention
+    }
+
+    /// Truncate the write-ahead log over the second connection on a blocking
+    /// thread, so its disk sync runs neither on an async worker nor under the
+    /// bus lock. Callers await it, so deleted text is off disk before they
+    /// return.
+    async fn scrub_wal(&self) {
+        let wal = self.wal.clone();
+        let done = tokio::task::spawn_blocking(move || {
+            truncate_wal(
+                &wal.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+        })
+        .await;
+        if let Err(e) = done {
+            tracing::warn!(error = %e, "could not run the write-ahead log truncation");
+        }
     }
 
     /// Locks the bus, failing `shutting_down` once it has been closed.
@@ -106,8 +134,7 @@ impl Bus {
     }
 
     /// Claim `name` on the roster with default options: keep any stored
-    /// description and join the name if it is already registered. See
-    /// [`register_with`](Self::register_with).
+    /// description. See [`register_with`](Self::register_with).
     pub async fn register(
         &self,
         name: &crate::names::AgentName,
@@ -115,34 +142,27 @@ impl Bus {
         self.register_with(name, Registration::default()).await
     }
 
-    /// Claim `name` on the roster. Idempotent unless `opts.exclusive`:
-    /// refreshes `last_seen`, applies `opts.description`, and keeps any
-    /// pending queue.
+    /// Claim `name` on the roster. Idempotent: an existing name has its
+    /// `last_seen` refreshed and `opts.description` applied, and keeps any
+    /// pending queue (so a second caller of the same name shares its inbox).
     ///
     /// # Errors
     ///
-    /// `shutting_down` once the bus is closed; `name_taken` when
-    /// `opts.exclusive` and the name is already on the roster; `roster_full`
-    /// when a new name would exceed [`MAX_ROSTER`]; `storage_error` on a sqlite
-    /// failure.
+    /// `shutting_down` once the bus is closed; `roster_full` when a new name
+    /// would exceed [`MAX_ROSTER`]; `invalid_description`; `storage_error` on
+    /// a sqlite failure.
     pub async fn register_with(
         &self,
         name: &crate::names::AgentName,
         opts: Registration,
     ) -> Result<RegisterOutcome, MailErr> {
         let description = opts.description.map(validate_description).transpose()?;
-        let g = self.lock_open().await?;
+        let mut g = self.lock_open().await?;
         // Stamped under the lock so concurrent registers cannot write last_seen
         // out of order.
         let now = now_rfc3339();
         let exists = is_registered(&g, name.as_str())?;
         let description: Option<String> = if exists {
-            if opts.exclusive {
-                return Err(MailErr::NameTaken {
-                    agent: name.to_string(),
-                    known: roster_sorted(&g)?,
-                });
-            }
             // A NULL ?3 keeps the stored description; '' clears it.
             g.conn
                 .query_row(
@@ -157,27 +177,47 @@ impl Bus {
                 )
                 .map_err(sqlite_storage)?
         } else {
-            let agents: i64 = g
-                .conn
-                .query_row("SELECT COUNT(*) FROM roster", [], |r| r.get(0))
-                .map_err(sqlite_storage)?;
-            if agents >= MAX_ROSTER {
-                return Err(MailErr::RosterFull { agents });
-            }
-            g.conn
-                .query_row(
-                    "INSERT INTO roster (name, last_seen, description)
-                     VALUES (?1, ?2, NULLIF(?3, ''))
-                     RETURNING description",
-                    params![name.as_str(), now, description],
-                    |r| r.get(0),
-                )
-                .map_err(sqlite_storage)?
+            insert_agent(&mut g, name.as_str(), &now, description)?
         };
         drop(g);
         Ok(RegisterOutcome {
             agent: name.to_string(),
             created: !exists,
+            last_seen: now,
+            description,
+        })
+    }
+
+    /// Claim the next `{provider}_{n}` (`claude_code_1`, then `_2`, ...) as a
+    /// new roster entry: one past the highest number registered for that
+    /// provider this run or on the roster. Numbers are not reused within a
+    /// run, so a client still holding a freed name fails `unregistered`
+    /// instead of reading a new agent's inbox. The name is chosen under the
+    /// roster lock, so concurrent callers always get distinct names.
+    ///
+    /// # Errors
+    ///
+    /// `shutting_down` once the bus is closed; `roster_full` at
+    /// [`MAX_ROSTER`] agents; `invalid_description`; `invalid_name` when the
+    /// provider's numbers are exhausted (an explicit `{provider}_{u64::MAX}`
+    /// was registered); `storage_error` on a sqlite failure.
+    pub async fn register_provider(
+        &self,
+        provider: &crate::names::Provider,
+        opts: Registration,
+    ) -> Result<RegisterOutcome, MailErr> {
+        let description = opts.description.map(validate_description).transpose()?;
+        let mut g = self.lock_open().await?;
+        let now = now_rfc3339();
+        let name = next_provider_name(&roster_sorted(&g)?, provider.as_str(), &g.issued)
+            .ok_or_else(|| MailErr::InvalidName {
+                agent: provider.as_str().to_string(),
+            })?;
+        let description = insert_agent(&mut g, &name, &now, description)?;
+        drop(g);
+        Ok(RegisterOutcome {
+            agent: name,
+            created: true,
             last_seen: now,
             description,
         })
@@ -205,12 +245,13 @@ impl Bus {
             tx.commit().map_err(sqlite_storage)?;
             discarded as i64
         };
-        if discarded > 0 {
-            truncate_wal(&g.conn);
-        }
         // Dropping senders wakes those pulls; they re-lock, see the name is
         // gone, and fail unregistered.
         g.waiters.remove(name.as_str());
+        drop(g);
+        if discarded > 0 {
+            self.scrub_wal().await;
+        }
         Ok(DiscardOutcome {
             agent: name.to_string(),
             discarded,
@@ -304,17 +345,23 @@ impl Bus {
 
         let id = uuid::Uuid::new_v4().to_string();
         let seq = g.next_seq;
-        g.conn
-            .execute(
-                "INSERT INTO messages (id, sender, recipient, body, created_at, seq)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![id, from.as_str(), to.as_str(), body, created_at, seq],
-            )
-            .map_err(sqlite_storage)?;
-
+        // One transaction: a failure stores nothing, so the caller's error is
+        // the whole truth and a retry cannot duplicate the message.
+        let tx = g.conn.transaction().map_err(sqlite_storage)?;
+        tx.execute(
+            "INSERT INTO messages (id, sender, recipient, body, created_at, seq)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, from.as_str(), to.as_str(), body, created_at, seq],
+        )
+        .map_err(sqlite_storage)?;
         // Sending is activity too: an agent that only sends must not age off
         // the roster.
-        touch_last_seen(&mut g, from.as_str())?;
+        tx.execute(
+            "UPDATE roster SET last_seen = ?2 WHERE name = ?1",
+            params![from.as_str(), created_at],
+        )
+        .map_err(sqlite_storage)?;
+        tx.commit().map_err(sqlite_storage)?;
         g.next_seq += 1;
         g.messages_sent += 1;
         if let Some(q) = g.waiters.get_mut(to.as_str()) {
@@ -330,7 +377,8 @@ impl Bus {
     }
 
     /// Pull (and optionally block for) the next batch for `name`. Returned
-    /// messages are deleted: each is handed out once and nothing is kept.
+    /// messages are deleted, and the write-ahead log is truncated before this
+    /// returns, so their text is off disk by the time the caller has it.
     ///
     /// Parks only when the inbox is empty and `wait_ms > 0`; timeout is an
     /// empty success.
@@ -338,6 +386,19 @@ impl Bus {
     /// Fails [`crate::errors::MailboxError::TooManyWaiters`] when
     /// [`MAX_WAITERS_PER_AGENT`] pulls are already parked for this name.
     pub async fn check_inbox(
+        &self,
+        name: &crate::names::AgentName,
+        wait_ms: u32,
+    ) -> Result<InboxPage, MailErr> {
+        let page = self.pull(name, wait_ms).await?;
+        if !page.messages.is_empty() {
+            self.scrub_wal().await;
+        }
+        Ok(page)
+    }
+
+    /// [`check_inbox`](Self::check_inbox) without the log truncation.
+    async fn pull(
         &self,
         name: &crate::names::AgentName,
         wait_ms: u32,
@@ -423,22 +484,25 @@ impl Bus {
             .filter(|n| !has_live_waiter(&g.waiters, n))
             .collect();
 
-        let tx = g.conn.transaction().map_err(sqlite_storage)?;
-        let expired = tx
-            .execute(
-                "DELETE FROM messages WHERE created_at < ?1",
-                params![message_cutoff],
-            )
-            .map_err(sqlite_storage)? as i64;
-        let mut discarded = 0i64;
-        for name in &dropped {
-            discarded += tx
-                .execute("DELETE FROM messages WHERE recipient = ?1", params![name])
+        let (expired, discarded) = {
+            let tx = g.conn.transaction().map_err(sqlite_storage)?;
+            let expired = tx
+                .execute(
+                    "DELETE FROM messages WHERE created_at < ?1",
+                    params![message_cutoff],
+                )
                 .map_err(sqlite_storage)? as i64;
-            tx.execute("DELETE FROM roster WHERE name = ?1", params![name])
-                .map_err(sqlite_storage)?;
-        }
-        tx.commit().map_err(sqlite_storage)?;
+            let mut discarded = 0i64;
+            for name in &dropped {
+                discarded += tx
+                    .execute("DELETE FROM messages WHERE recipient = ?1", params![name])
+                    .map_err(sqlite_storage)? as i64;
+                tx.execute("DELETE FROM roster WHERE name = ?1", params![name])
+                    .map_err(sqlite_storage)?;
+            }
+            tx.commit().map_err(sqlite_storage)?;
+            (expired, discarded)
+        };
         for name in &dropped {
             g.waiters.remove(name);
         }
@@ -447,8 +511,9 @@ impl Bus {
             discarded,
             dropped_agents: dropped,
         };
+        drop(g);
         if !out.is_empty() {
-            truncate_wal(&g.conn);
+            self.scrub_wal().await;
         }
         Ok(out)
     }
@@ -556,6 +621,65 @@ fn is_registered(g: &Inner, name: &str) -> Result<bool, MailErr> {
             |r| r.get(0),
         )
         .map_err(sqlite_storage)
+}
+
+/// Insert a new roster row, refusing past [`MAX_ROSTER`], and record its
+/// number if it has the `{provider}_{n}` shape; returns the stored
+/// description (`None` for an empty one).
+fn insert_agent(
+    g: &mut Inner,
+    name: &str,
+    now: &str,
+    description: Option<String>,
+) -> Result<Option<String>, MailErr> {
+    let agents: i64 = g
+        .conn
+        .query_row("SELECT COUNT(*) FROM roster", [], |r| r.get(0))
+        .map_err(sqlite_storage)?;
+    if agents >= MAX_ROSTER {
+        return Err(MailErr::RosterFull { agents });
+    }
+    let stored = g
+        .conn
+        .query_row(
+            "INSERT INTO roster (name, last_seen, description)
+             VALUES (?1, ?2, NULLIF(?3, ''))
+             RETURNING description",
+            params![name, now, description],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_storage)?;
+    if let Some((stem, n)) = numbered(name) {
+        let high = g.issued.entry(stem.to_string()).or_default();
+        *high = (*high).max(n);
+    }
+    Ok(stored)
+}
+
+/// `{provider}_{n}` one past the highest `n` in `issued` or on the roster
+/// for `provider`; `None` when that would overflow `u64`.
+fn next_provider_name(
+    roster: &[String],
+    provider: &str,
+    issued: &HashMap<String, u64>,
+) -> Option<String> {
+    let highest = roster
+        .iter()
+        .filter_map(|name| numbered(name))
+        .filter(|(stem, _)| *stem == provider)
+        .map(|(_, n)| n)
+        .chain(issued.get(provider).copied())
+        .max()
+        .unwrap_or(0);
+    Some(format!("{provider}_{}", highest.checked_add(1)?))
+}
+
+/// Split `claude_code_3` into (`claude_code`, 3). Only a canonical positive
+/// suffix counts: `claude_code_01` and `claude_code_0` do not.
+fn numbered(name: &str) -> Option<(&str, u64)> {
+    let (stem, suffix) = name.rsplit_once('_')?;
+    let n: u64 = suffix.parse().ok()?;
+    (n > 0 && n.to_string() == suffix).then_some((stem, n))
 }
 
 fn ensure_registered(g: &Inner, name: &str) -> Result<(), MailErr> {

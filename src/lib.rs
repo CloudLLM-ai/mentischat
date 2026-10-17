@@ -116,6 +116,10 @@ async fn loopback_only(
 /// - `Host` must name a loopback host. A DNS-rebinding page reaches
 ///   127.0.0.1 under its own hostname and its same-origin `GET`s carry no
 ///   `Origin`, so only the `Host` header gives it away.
+/// - `Sec-Fetch-Site`, when present, must be `same-origin` or `none`. A page
+///   on another site that loads `http://127.0.0.1:9480/inboxes/...` as an
+///   image sends a loopback `Host` and no `Origin`, but a `cross-site` fetch
+///   site; without this it would delete that inbox.
 async fn loopback_headers(headers: HeaderMap, request: Request, next: Next) -> Response {
     let present_and_foreign = |name: header::HeaderName, is_loopback: fn(&str) -> bool| {
         headers
@@ -124,10 +128,22 @@ async fn loopback_headers(headers: HeaderMap, request: Request, next: Next) -> R
     };
     if present_and_foreign(header::ORIGIN, origin_is_loopback)
         || present_and_foreign(header::HOST, host_is_loopback)
+        || present_and_foreign(SEC_FETCH_SITE, fetch_site_is_local)
     {
         return StatusCode::FORBIDDEN.into_response();
     }
     next.run(request).await
+}
+
+/// Set by browsers on every request. A page on another site can make a GET
+/// with no `Origin` (an `<img>`, a link), so this is what tells such a request
+/// apart; curl and agents do not send it.
+const SEC_FETCH_SITE: header::HeaderName = header::HeaderName::from_static("sec-fetch-site");
+
+/// `same-origin` (a page served by this daemon) and `none` (typed into the
+/// address bar) are local; `cross-site` and `same-site` come from another page.
+fn fetch_site_is_local(value: &str) -> bool {
+    matches!(value, "same-origin" | "none")
 }
 
 fn origin_is_loopback(origin: &str) -> bool {

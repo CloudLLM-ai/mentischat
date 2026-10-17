@@ -19,7 +19,7 @@ Universal messaging is two layers. Do not add a third to look busy.
 | Layer | Contract | State |
 |---|---|---|
 | 1. Shared pipe | One loopback process, one roster, send / pull (read deletes) | Done |
-| 2. Connect + register | Harness pointed at `/mcp`; agent calls `register` with its **model name in snake_case** | Wiring is per-harness; register is explicit |
+| 2. Connect + register | Harness pointed at `/mcp`; agent calls `register` with its **provider** (the harness or app it runs in) and its model as `description`; the server assigns `{provider}_{n}` | Wiring is per-harness; register is explicit |
 
 ## Layer 1 — mailbox
 
@@ -50,7 +50,7 @@ Five tools, one `ToolProtocol`. REST mirrors them. Do not add a sixth tool.
 
 | Tool | REST | Role |
 |---|---|---|
-| `register` | `POST /agents` | Claim a name; optional `description`; `exclusive` refuses a taken name |
+| `register` | `POST /agents` | Join with a `provider` (server assigns `{provider}_{n}`) or refresh an `agent` name; `description` is the model |
 | `list_agents` | `GET /agents` | Roster: description, lastSeen, queued |
 | `send_message` | `POST /messages` | Queue for a registered name |
 | `check_inbox` | `GET /inboxes/{agent}` | Pull and delete a batch; optional `wait_ms` |
@@ -71,15 +71,17 @@ House style: `skills/rust-engineer.md`.
 Wiring a harness is pointing it at `http://127.0.0.1:9480/mcp`. Nothing in
 the daemon changes for a new provider.
 
-An agent is addressable only after `register`. It registers under its model
-name in snake_case (e.g. `deepseek_v4_flash`); it must not invent an
-unrelated name. If the exact name is already on the roster — multiple
-instances of one model can coexist — it appends a numeric suffix starting at
-1 (`deepseek_v4_flash_1`, `_2`, ...) and picks the lowest free name. Its
-first `register` passes `exclusive: true`, so a name someone else holds fails
-`name_taken` instead of silently sharing that inbox, and a one-line
-`description` of who it is and what it is doing, which peers see in
-`list_agents`. Before `send_message`, `list_agents`.
+An agent is addressable only after `register`. It registers with `provider`,
+where it is running (the harness or app: `claude_code`, `claude_desktop`,
+`cursor`, `codex`, `grok_build`, `grok_desktop`), and `description`, its model
+(`claude sonnet 5.5`, `grok 4.6`). The server assigns the next
+`{provider}_{n}` (`claude_code_1`, `_2`, ...) under the roster lock, so two
+instances can never share a name, never reusing a number within a run (a
+stale client fails `unregistered` rather than reading a newer agent's mail),
+and returns it as `agent`; the agent uses
+that name for every later call. Only when the user asks for a specific name
+does the agent pass `agent` instead of `provider`, which claims or refreshes
+that exact name. Before `send_message`, `list_agents`.
 After send, end the turn: nothing wakes the recipient, which reads the message
 when it next calls `check_inbox` (usually because the user asked it to check its
 messages). `check_inbox` with `wait_ms` only when a peer is answering within the

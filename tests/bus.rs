@@ -602,7 +602,6 @@ async fn description_is_set_kept_and_cleared_by_register() {
     let (_d, bus) = fresh_bus("describe");
     let set = |d: &str| Registration {
         description: Some(d.into()),
-        exclusive: false,
     };
 
     let out = bus
@@ -630,54 +629,205 @@ async fn description_is_set_kept_and_cleared_by_register() {
     assert_eq!(bus.list_agents().await.unwrap()[0].description, None);
 }
 
+fn provider(raw: &str) -> mentischat::names::Provider {
+    mentischat::names::Provider::parse(raw).unwrap()
+}
+
 #[tokio::test]
-async fn exclusive_register_refuses_a_taken_name_without_touching_it() {
+async fn provider_register_assigns_increasing_numbers_and_never_reuses_one() {
     use mentischat::bus::Registration;
-    let (_d, bus) = fresh_bus("exclusive");
-    let first = Registration {
-        description: Some("first holder".into()),
-        exclusive: true,
-    };
-    assert!(
-        bus.register_with(&name("claude"), first)
-            .await
-            .unwrap()
-            .created
-    );
+    let (_d, bus) = fresh_bus("provider_numbers");
+    let claude = provider("claude_code");
 
-    let before = bus.list_agents().await.unwrap();
-    let second = Registration {
-        description: Some("impostor".into()),
-        exclusive: true,
-    };
-    match bus
-        .register_with(&name("claude"), second)
+    let first = bus
+        .register_provider(
+            &claude,
+            Registration {
+                description: Some("claude code".into()),
+            },
+        )
         .await
-        .unwrap_err()
-    {
-        MailboxError::NameTaken { agent, known } => {
-            assert_eq!(agent, "claude");
-            assert_eq!(known, ["claude"]);
-        }
-        other => panic!("expected name_taken, got {other:?}"),
-    }
-    let after = bus.list_agents().await.unwrap();
-    assert_eq!(
-        after[0].description.as_deref(),
-        Some("first holder"),
-        "a refused claim must not overwrite the holder's description"
-    );
-    assert_eq!(after[0].last_seen, before[0].last_seen, "nor its last_seen");
+        .unwrap();
+    assert_eq!(first.agent, "claude_code_1");
+    assert!(first.created);
+    assert_eq!(first.description.as_deref(), Some("claude code"));
 
-    let next = Registration {
-        description: None,
-        exclusive: true,
-    };
-    assert!(
-        bus.register_with(&name("claude_1"), next)
+    let second = bus
+        .register_provider(&claude, Registration::default())
+        .await
+        .unwrap();
+    assert_eq!(second.agent, "claude_code_2");
+
+    let other = bus
+        .register_provider(&provider("cursor"), Registration::default())
+        .await
+        .unwrap();
+    assert_eq!(other.agent, "cursor_1", "numbering is per provider");
+
+    bus.deregister(&name("claude_code_1")).await.unwrap();
+    let refill = bus
+        .register_provider(&claude, Registration::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        refill.agent, "claude_code_3",
+        "a freed number is not reused"
+    );
+
+    bus.register(&name("claude_code_7")).await.unwrap();
+    bus.deregister(&name("claude_code_7")).await.unwrap();
+    let after_explicit = bus
+        .register_provider(&claude, Registration::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        after_explicit.agent, "claude_code_8",
+        "an explicitly registered number counts too, even once freed"
+    );
+}
+
+#[tokio::test]
+async fn a_client_holding_a_freed_name_cannot_read_the_next_agents_mail() {
+    use mentischat::bus::Registration;
+    let (_d, bus) = fresh_bus("provider_stale");
+    let claude = provider("claude_code");
+    let stale = bus
+        .register_provider(&claude, Registration::default())
+        .await
+        .unwrap()
+        .agent;
+    bus.deregister(&name(&stale)).await.unwrap();
+
+    let fresh = bus
+        .register_provider(&claude, Registration::default())
+        .await
+        .unwrap()
+        .agent;
+    bus.register(&name("peer")).await.unwrap();
+    bus.send(&name("peer"), &name(&fresh), "for the new agent".into())
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        bus.check_inbox(&name(&stale), 0).await,
+        Err(MailboxError::Unregistered { .. })
+    ));
+    let page = bus.check_inbox(&name(&fresh), 0).await.unwrap();
+    assert_eq!(page.messages.len(), 1, "the new agent still has its mail");
+}
+
+#[tokio::test]
+async fn provider_register_reports_an_exhausted_number_space() {
+    use mentischat::bus::Registration;
+    let (_d, bus) = fresh_bus("provider_exhausted");
+    bus.register(&name(&format!("cursor_{}", u64::MAX)))
+        .await
+        .unwrap();
+    assert!(matches!(
+        bus.register_provider(&provider("cursor"), Registration::default())
+            .await,
+        Err(MailboxError::InvalidName { .. })
+    ));
+}
+
+#[tokio::test]
+async fn provider_numbering_ignores_names_that_only_look_numbered() {
+    use mentischat::bus::Registration;
+    let (_d, bus) = fresh_bus("provider_lookalikes");
+    for taken in [
+        "claude_code_01",
+        "claude_code_x",
+        "claude_code_1_2",
+        "claude",
+    ] {
+        bus.register(&name(taken)).await.unwrap();
+    }
+    let out = bus
+        .register_provider(&provider("claude_code"), Registration::default())
+        .await
+        .unwrap();
+    assert_eq!(out.agent, "claude_code_1");
+}
+
+#[tokio::test]
+async fn concurrent_provider_registers_get_distinct_names() {
+    use mentischat::bus::Registration;
+    let (_d, bus) = fresh_bus("provider_race");
+    let bus = std::sync::Arc::new(bus);
+    let handles: Vec<_> = (0..16)
+        .map(|_| {
+            let bus = bus.clone();
+            tokio::spawn(async move {
+                bus.register_provider(&provider("codex"), Registration::default())
+                    .await
+                    .unwrap()
+                    .agent
+            })
+        })
+        .collect();
+    let mut names = Vec::new();
+    for h in handles {
+        names.push(h.await.unwrap());
+    }
+    names.sort_by_key(|n| n.trim_start_matches("codex_").parse::<u32>().unwrap());
+    let expected: Vec<String> = (1..=16).map(|n| format!("codex_{n}")).collect();
+    assert_eq!(names, expected);
+}
+
+#[tokio::test]
+async fn provider_register_stops_at_the_roster_cap() {
+    use mentischat::bus::{Registration, MAX_ROSTER};
+    let (_d, bus) = fresh_bus("provider_cap");
+    for _ in 0..MAX_ROSTER {
+        bus.register_provider(&provider("grok_build"), Registration::default())
             .await
-            .unwrap()
-            .created
+            .unwrap();
+    }
+    assert!(matches!(
+        bus.register_provider(&provider("grok_build"), Registration::default())
+            .await,
+        Err(MailboxError::RosterFull { .. })
+    ));
+}
+
+#[tokio::test]
+async fn provider_register_rejects_a_bad_description_without_registering() {
+    use mentischat::bus::Registration;
+    let (_d, bus) = fresh_bus("provider_bad_description");
+    let bad = Registration {
+        description: Some("line\nbreak".into()),
+    };
+    assert!(matches!(
+        bus.register_provider(&provider("cursor"), bad).await,
+        Err(MailboxError::InvalidDescription)
+    ));
+    assert!(bus.list_agents().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_send_that_fails_stores_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("atomic_send");
+    let bus = Bus::new(&data).unwrap();
+    bus.register(&name("a")).await.unwrap();
+    bus.register(&name("b")).await.unwrap();
+    // Fail the sender's last_seen update, which runs after the insert.
+    rusqlite::Connection::open(data.join("pending.sqlite"))
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_touch BEFORE UPDATE ON roster
+             BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+        )
+        .unwrap();
+
+    assert!(matches!(
+        bus.send(&name("a"), &name("b"), "lost?".into()).await,
+        Err(MailboxError::StorageError)
+    ));
+    assert_eq!(
+        bus.stats().await.unwrap(),
+        (2, 0),
+        "the failed send left no message behind"
     );
 }
 

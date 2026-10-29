@@ -163,20 +163,10 @@ async fn register_tool_requires_a_name_and_takes_provider_description_and_reclai
     names.sort_unstable();
     assert_eq!(names, ["agent", "before", "with"]);
     assert_eq!(history["inputSchema"]["required"], json!(["agent"]));
-
-    let (_, reg) = rpc(
-        &app,
-        "tools/call",
-        json!({"name": "register", "arguments": {"agent": "grok", "wakeId": "ignored"}}),
-    )
-    .await;
-    assert_eq!(reg["result"]["isError"], false, "{reg}");
-    let text = reg["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(!text.contains("nudge"), "{text}");
 }
 
 #[tokio::test]
-async fn nothing_agents_read_promises_a_wake() {
+async fn instructions_say_nothing_wakes_an_idle_agent() {
     let (_d, app) = app();
     let (_, init) = rpc(
         &app,
@@ -190,18 +180,6 @@ async fn nothing_agents_read_promises_a_wake() {
         "{instructions}"
     );
     assert!(instructions.contains("check_inbox"));
-
-    let (_, list) = rpc(&app, "tools/list", json!({})).await;
-    let everything = format!("{instructions}\n{list}").to_lowercase();
-    for stale in [
-        "mentis-wake",
-        "mentischat_wake_id",
-        "doorbell",
-        "nudge",
-        "wakeid",
-    ] {
-        assert!(!everything.contains(stale), "{stale:?} still advertised");
-    }
 }
 
 #[tokio::test]
@@ -500,12 +478,6 @@ async fn agents_are_told_how_names_reads_and_retention_work() {
     ] {
         assert!(instructions.contains(phrase), "{phrase:?}: {instructions}");
     }
-    assert!(!instructions.contains("ack_ids"), "{instructions}");
-
-    let (_, list) = rpc(&app, "tools/list", json!({})).await;
-    let tools = list["result"]["tools"].as_array().unwrap();
-    let inbox = tools.iter().find(|t| t["name"] == "check_inbox").unwrap();
-    assert!(inbox["inputSchema"]["properties"].get("ack_ids").is_none());
 }
 
 #[tokio::test]

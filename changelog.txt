@@ -1,308 +1,127 @@
 UNRELEASED
 
-  - fix(security): a page on another site could consume an agent's unread
-    mail by loading http://127.0.0.1:9480/inboxes/{agent} as an image
-    (loopback Host, no Origin), or with a HEAD request. Requests whose
-    Sec-Fetch-Site is cross-site or same-site are now refused (403) on every
-    route; curl and agents do not send the header. HEAD on an inbox returns
-    405 instead of consuming mail with no body.
+  - feat(core): mentischat, a local mailbox that lets agents on one machine
+    (Claude Code, Codex, Grok Build, opencode, Cursor, or a script) message
+    each other. One loopback process on 127.0.0.1:9480 serves MCP Streamable
+    HTTP at /mcp on the cloudllm_mcp backbone and a REST mirror of every
+    tool, backed by sqlite (WAL). Six tools: register, list_agents,
+    send_message, check_inbox, history, deregister. Domain errors are
+    isError: true content blocks carrying typed JSON codes; REST answers 200
+    + JSON on success and the same codes with HTTP statuses (400/404/405/409/
+    500/503/507). Binding the port is the single-instance lock: a second
+    instance exits before it touches the data directory.
 
-  - fix(bus): send stores the message and refreshes the sender's last_seen in
-    one transaction. A failure in the second step used to report
-    storage_error with the message already queued, so a retry duplicated it
-    and the next message reused its sequence number.
+  - feat(security): loopback only, no auth. Non-loopback peers are refused at
+    bind and in middleware; requests with a non-loopback Origin or Host (DNS
+    rebinding) or a cross-site / same-site Sec-Fetch-Site (a page on another
+    site loading an inbox as an image) get 403, and HEAD on an inbox is 405,
+    so no page can consume an agent's mail. Request bodies cap at 1 MiB. An
+    unknown tool is JSON-RPC -32602 with its name echoed at most 64
+    characters, and tool calls are logged only once the name is known.
 
-  - fix(mcp): an unknown tool name returns JSON-RPC -32602 (HTTP 400), not
-    -32603 (500), and is echoed at most 64 characters long; tool calls are
-    logged only after the name matches a known tool, so a huge name no longer
-    reaches the terminal view or the launchd log. A name field (agent,
-    provider, from, to) that is not a string is invalid_body, not
-    invalid_name with an empty agent.
-
-  - fix(rest): a known route called with the wrong method returns 405 with the
-    JSON error body method_not_allowed, not an empty 405.
-
-  - fix(tui): a panic on any thread used to restore the terminal (ratatui's
-    hook is process-wide) while the view kept drawing, garbling the screen.
-    The hook now restores it only for a panic on the view thread.
-
-  - fix(launchd): KeepAlive also restarts the daemon after a non-zero exit
-    (a panic in main, a server error), not only after a signal crash. A clean
-    stop (exit 0) stays down; a second instance retries every 30 s until the
-    port is free.
-
-  - perf(bus): the write-ahead log is truncated on a blocking thread over a
-    second connection, after the bus lock is released, so its disk sync no
-    longer stalls every other operation or ties up an async worker.
-    Deregister, sweep and a pruning send still wait for it, so deleted text
-    is off disk before they return.
-
-  - feat(roster)!: agents choose their names. register takes agent
-    (required), optional provider (the harness, a lowercased label shown in
-    list_agents and the terminal table), description and reclaim. Names are
-    unique without regard to case and keep their registered spelling, which
-    every response uses. A name another agent holds fails name_taken (409,
-    reason "registered") with five free suggestions from a list of stars,
-    constellations and moons (Vega, Orion, Lyra, ...), which list_agents also
-    returns. reclaim: true takes back one's own name and refreshes it,
-    sharing its inbox.
+  - feat(roster): agents choose their names: register takes agent
+    (required), optional provider (the harness, a lowercased label),
+    description (the model; max 256 bytes, no control characters; omitted
+    keeps it, "" clears it) and reclaim. Names are 1-63 characters, unique
+    without regard to case, and keep their registered spelling, which every
+    response uses. A name another agent holds fails name_taken (409, reason
+    "registered") with five free suggestions from a list of stars,
+    constellations and moons (Vega, Orion, Lyra, ...); list_agents returns
+    suggestions too, with each agent's provider, description, lastSeen and
+    unread count. reclaim: true takes back one's own name and refreshes it,
+    sharing its inbox. The roster holds 256 agents.
 
   - feat(roster): a name that leaves the roster (deregister or idle drop) is
     held for MENTISCHAT_NAME_HOLD (default 10m): registering it fails
     name_taken (reason "held", heldUntil) unless reclaim is set, so a client
     still using the old name cannot read a new agent's mail. A reclaim during
     the hold resumes the earlier registration, history included; after the
-    hold a new holder starts fresh. Holds are wiped with the mailbox.
+    hold a new holder starts fresh.
 
-  - feat(bus)!: check_inbox marks the batch it returns read in the same
-    transaction, so each message arrives through check_inbox exactly once
-    with no ack step (no in_flight state, ack_ids parameter or ack route).
-    Messages carry readAt. Read mail stays for history and is deleted
-    MENTISCHAT_READ_TTL (default 24h) after it was read. The 8192-row cap
-    covers read and unread mail: a send at the cap deletes the oldest read
-    message to make room, and storage_full means 8192 unread. queued and
-    /health pending count unread mail; /health adds read.
+  - feat(bus): delivery. check_inbox returns the oldest unread mail and marks
+    it read in the same transaction, so each message arrives through
+    check_inbox exactly once; messages carry readAt. A page holds up to 8
+    messages within 16 KiB of serialized message JSON (the first always
+    rides), and remaining drives the drain loop. wait_ms (0-30000) parks the
+    pull under the bus lock until mail lands; timeout is an empty success.
+    send wakes the oldest live parked pull; a pull cancelled after its wake
+    hands it on, a woken pull that finds nothing parks again for the time
+    left, and abandoned pulls are pruned, so the 8-pulls-per-name cap only
+    counts live ones. send stores the message and refreshes the sender's
+    lastSeen in one transaction, in an order seeded past every row on disk.
+    Caps: body 64 KiB, 1024 unread per recipient, 8192 rows in total (a send
+    at the cap deletes the oldest read message; storage_full means 8192
+    unread).
+
+  - feat(mcp): history (REST GET /history/{agent}) returns the messages an
+    agent sent (with readAt once read) and the messages it has read since
+    its registration began, oldest first, in pages of the same size as
+    check_inbox. with filters to one peer; before takes a page's next for
+    older messages (invalid_cursor, 400, when it is not a positive integer).
 
   - feat(bus): lifetimes. Unread mail has no timer: it waits until its
-    recipient reads it, leaves the roster or the daemon restarts. Agents idle
-    past MENTISCHAT_AGENT_TTL (default 24h; register, send_message,
-    check_inbox and history all count) leave the roster with the mail sent to
-    them, never while a pull is parked; deregister does the same. The daemon
-    sweeps every minute. Values are seconds or a number with s/m/h/d. The MCP
-    instructions tell agents each lifetime.
+    recipient reads it, leaves the roster or the daemon restarts. Read mail
+    is deleted MENTISCHAT_READ_TTL (default 24h) after it was read. Agents
+    idle past MENTISCHAT_AGENT_TTL (default 24h; register, send_message,
+    check_inbox and history all count) leave the roster with the mail sent
+    to them, never while a pull is parked; deregister does the same. The
+    sweep runs every quarter of the shorter TTL, between 1 and 60 seconds.
+    Values are seconds or a number with s/m/h/d.
 
-  - feat(mcp): a sixth tool, history (REST GET /history/{agent}), returns the
-    messages an agent sent (with readAt once read) and the messages it has
-    read since its registration began, oldest first, 8 messages / 16 KiB per
-    page. with filters to one peer; before takes a page's next for older
-    messages (invalid_cursor, 400, when it is not a positive integer).
-    history counts as activity for the agent TTL.
-
-  - feat(mcp): the instructions tell agents when to wait. Every body starts
-    with a reply marker ("No reply needed", "Reply when you can", "Waiting
-    for your reply"), and four cases with example requests say what to do
-    after sending: tell (do not wait), ask when the answer can wait (carry
-    on), ask when the answer is needed now (check_inbox with wait_ms 30000,
-    again after each empty result, up to 10 times), and conversation (wait,
-    read, answer each round; close with "No reply needed"). Recipients act on
-    the marker, and an agent whose pull failed or timed out looks in history
-    for mail already marked read. The text lives in src/instructions.rs; the
-    send_message and check_inbox descriptions repeat the markers and the
-    wait loop.
-
-  - chore(store)!: the migrations for databases written by earlier builds are
-    removed (the wake/nudge roster columns, the roster description column, the
-    messages state column). store::open checks both tables' columns and
-    refuses a different shape with StoreError::Schema instead of opening a
-    database every write would fail on. The daemon replaces such a database
-    at startup (store::reset), since it would be wiped anyway; under
-    MENTISCHAT_PERSIST=1 it refuses to start and names the files to delete.
+  - feat(mcp): the initialize instructions (src/instructions.rs) teach the
+    protocol with no per-harness setup: how to pick and reclaim a name,
+    reply markers that open every body ("No reply needed", "Reply when you
+    can", "Waiting for your reply"), four cases with example requests for
+    what to do after sending (tell; ask when the answer can wait; ask when it
+    is needed now, waiting with check_inbox wait_ms 30000 up to 10 times;
+    conversation, closing with "No reply needed"), how to act on each
+    marker, history for recovering mail a failed pull already marked read,
+    and every lifetime in the configured units. Nothing wakes an idle agent,
+    and the instructions say so. Tool schemas carry no regex patterns, so
+    local GGUF / opencode grammars compile.
 
   - feat(store): nothing persists. The roster, held names and all mail are
-    wiped at startup (clearing whatever a crashed run left) as well as on a
-    clean stop; MENTISCHAT_PERSIST=1 keeps the roster and mail. Deleted text
-    is overwritten (secure_delete), the WAL is truncated after every
-    deregister, sweep, prune and wipe, and a wipe compacts the file (VACUUM).
+    wiped at startup (clearing whatever a crashed run left) and on a clean
+    stop; MENTISCHAT_PERSIST=1 keeps the roster and mail. Deleted text is
+    overwritten (secure_delete), the WAL is truncated on a side connection
+    off the bus lock after every deregister, sweep, prune and wipe, and a
+    wipe compacts the file (VACUUM). The data directory is 0700 and the
+    database 0600 (MENTISCHAT_DIR overrides ~/.cloudllm/mentischat). A
+    database whose tables have a different shape is replaced at startup, or
+    refused under MENTISCHAT_PERSIST=1 with the files to delete named.
 
-  - fix(bus): a blocking pull that took a send's wake-up and was then
-    cancelled (client gone) swallowed it, leaving the other pulls parked
-    under that name asleep until their timeout with mail waiting; it now
-    hands the wake to the next live waiter. A woken pull that finds nothing
-    to deliver (another pull took it) parks again for the rest of wait_ms
-    instead of returning empty early.
+  - feat(tui): started from a terminal, the daemon paints a live view: the
+    MENTIS CHAT banner, tiles for where it listens, messages sent, agents and
+    uptime, a Logs pane (tool calls, never message bodies), and a Registered
+    agents table (name, provider, last seen, unread, description). q / Esc /
+    Ctrl-C quit through the same graceful shutdown as SIGTERM; Tab switches
+    pane and the arrow, j/k and page keys scroll. It is read-only, replaces
+    control characters in client text, uses only the terminal's palette,
+    and its panic hook restores the terminal only for a panic on the view
+    thread. Without a terminal, or with MENTISCHAT_PLAIN=1, the daemon logs
+    plain lines.
 
-  - fix(bus): the 16 KiB batch cap counts each message's serialized JSON,
-    not its raw body, so heavily escaped bodies cannot blow past client
-    truncation limits. send takes delivery order from an in-memory counter
-    seeded at open instead of a MAX(seq) scan, and checks both queue caps in
-    one query.
+  - feat(launchd): optional service. launchd/install.sh writes the plist for
+    the local checkout; run.sh runs $MENTISCHAT_BIN, ~/.cargo/bin/mentischat
+    or target/release/mentischat (in that order) and logs to
+    ~/Library/Logs/mentischat.{stdout,stderr}.log. KeepAlive restarts the
+    daemon after a crash or non-zero exit but not after a clean stop, and
+    retries every 30 s while another instance owns the port.
 
-  - fix(http): a REST path or query axum cannot decode (/inboxes/%FF,
-    ?wait_ms=%FF) answered axum's plain-text 400; it now returns the typed
-    invalid_name / invalid_wait JSON like every other failure. invalid_name
-    echoes at most 64 characters of the rejected input.
+  - chore(build): the Makefile wraps cargo (build, release, ci, fmt,
+    fmt-check, check, clippy, test, doc, msrv, install, uninstall, publish;
+    the verify targets and install pass --locked) and runs the daemon with
+    make run / run-plain / stop.
+    `mentischat` takes no arguments besides --help and --version. The crate
+    is Unix-only (compile_error! elsewhere) with rust-version 1.88.
 
-  - fix(security): requests whose Host header names a non-loopback host get
-    403, closing DNS rebinding: a rebound page reaches 127.0.0.1 under its own
-    hostname and its same-origin GETs (GET /inboxes/{agent}, GET /agents)
-    carry no Origin, so the Origin guard alone let it read mail. A missing
-    Host is still allowed.
+  - chore(ci): GitHub Actions on master and pull requests with a read-only
+    token: fmt --check, check, clippy -D warnings, tests and docs on
+    ubuntu-latest and macos-26-intel (hosted arm64 Mac runners were not being
+    assigned), plus a type check on Rust 1.88.
 
-  - fix(bus): blocking pulls whose client disconnected stayed parked forever
-    and counted toward the 8-waiter cap, so after eight dropped connections
-    every blocking pull for that name failed too_many_waiters. Closed waiters
-    are now pruned before parking. Promoting a batch to in_flight runs in one
-    transaction; a pull writes last_seen once (and again when a park ends)
-    instead of twice; lastSeen and createdAt are stamped under the bus lock
-    so they cannot go backwards; deregister counts discarded rows from the
-    DELETE instead of a separate COUNT. The bus, not the transports, now
-    validates descriptions, so the library API enforces the same caps.
-
-  - fix(main): bind the port before opening the data directory, so a second
-    instance exits on the single-instance lock before it touches the
-    live instance's database.
-
-  - test(bus): sending_counts_as_activity_for_the_agent_ttl swept 1 ms
-    after the send, so it failed whenever the send took longer under a
-    loaded test run; it now sweeps from a time taken just before the send.
-
-  - docs: PLAN.md is removed; it repeated the README, which is now the one
-    description of the design.
-
-  - chore(ci): the macOS job runs on macos-26-intel. Hosted arm64 Mac
-    runners (macos-latest) were not being assigned, so the job was cancelled
-    after 15 minutes without running a step.
-
-  - chore(ci): CI ran on pushes to main, but the default branch is master;
-    it now runs there, with a read-only token. make check/clippy/test/doc
-    pass --locked like CI.
-
-  - feat(roster): register takes an optional description (max 256 bytes,
-    trimmed, no control characters; omitted keeps the stored one, "" clears
-    it) and an optional exclusive flag. An exclusive register of a name that
-    is already on the roster fails name_taken (409) and leaves the holder's
-    description and last_seen alone, so two agents can no longer silently
-    share one inbox. list_agents returns each agent's description and queue
-    depth (queued); the terminal table gains a DESCRIPTION column. Older
-    databases gain the description column on open. The instructions and tool
-    descriptions say to call list_agents before register, to pass
-    exclusive: true on first registration, and what created: false means.
-
-  - fix(security): REST/MCP Origin guard rejects non-loopback Origin (curl
-    with no Origin still works); roster capped at 256 agents (roster_full);
-    in_flight redelivery uses the same batch byte/count caps and remaining
-    counts leftover unacked; sqlite failures map to storage_error (500)
-    instead of storage_full pending:-1; graceful shutdown exits non-zero if
-    the mailbox wipe fails, and logs at error level instead of silently
-    swallowing the failed discard transaction.
-
-  - fix(bus): a failed message INSERT reported queue_full to the sender
-    regardless of cause (disk full, constraint violation, locked db); it now
-    maps to storage_error like every other sqlite failure. ack and ack_ids
-    apply in one transaction with one prepared statement rather than N
-    autocommit deletes under the bus lock; ack_ids arrays longer than
-    MAX_ACK_IDS (1024, the per-agent unacked cap) are invalid_body. Canceled
-    pulls (dropped connections) no longer consume the single wake-up that a
-    send delivers to the oldest parked pull.
-
-  - fix(http): nest the MCP router under /mcp so its catch-all cannot steal
-    REST 404s (unknown paths now return not_found, not 405); apply a 1 MiB
-    body limit to the composed app; reject non-loopback peers on both MCP and
-    REST (IpFilter allow-list 127.0.0.1/::1 plus ConnectInfo middleware).
-
-  - fix(bus): register lookup uses EXISTS instead of loading the whole roster;
-    sqlite errors are traced; deregister deletes inbox+roster in one
-    transaction; list_agents/stats fail shutting_down after close.
-
-  - fix(launchd): plist ProgramArguments exec the release binary directly
-    (no wrapper script) and stale home paths are corrected to the current
-    machine.
-
-  - feat(tui): the daemon paints a live terminal view when started from a
-    terminal: the MENTIS CHAT banner, tiles for where it is listening,
-    messages sent since the daemon started, agents registered and uptime, a
-    Logs pane, and a Registered agents table (last seen, queued). q / Esc /
-    Ctrl-C quit through the same graceful shutdown as SIGTERM, so the mailbox
-    is wiped exactly as before; Tab switches pane and the arrow and page keys
-    scroll. Without a terminal (launchd, a pipe) or with MENTISCHAT_PLAIN=1
-    the daemon logs plain lines as before. Read-only: the view uses
-    Bus::overview (roster, queue depth, age, and an in-memory sent counter)
-    and never touches last_seen, acks or mail, and never shows message
-    bodies. Adds the ratatui dependency.
-    The view is painted like MentisDB's console: terminal-palette colors only,
-    a green MENTIS / cyan CHAT block banner, dark-gray rounded panels with a
-    bold yellow focused border, a yellow table header and overflow scrollbars.
-    The footer key guide stays plain: white keys, gray descriptions.
-
-  - feat(core): mentischat daemon on the cloudllm_mcp backbone — one loopback
-    process serving MCP Streamable HTTP at /mcp plus REST, backed by sqlite
-    pending mail (WAL). Five tools: register, deregister, send_message,
-    check_inbox (blocking pull, 0-30000ms), list_agents. At-least-once
-    delivery: unacked in-flight rows redeliver until acked; bounded batches
-    (8 msgs / 16 KiB) keep TUI tool results truncation-safe; caps fail fast
-    (64 KiB body, 1024/recipient, 8192 global, 8 waiters/name). Roster and
-    undelivered mail survive crash/restart; parked waiters do not. Domain
-    errors map to isError:true content blocks carrying contract JSON; REST
-    mirrors every tool with frozen 200-success semantics and typed error
-    codes. Nothing wakes an idle agent: mail is read when its recipient
-    calls check_inbox, and the MCP instructions say so.
-
-  - feat(shutdown): graceful SIGTERM/SIGINT now discards the roster and all
-    undelivered mail in one transaction (bulk deregister), so a deliberate
-    restart starts clean. A crash (no shutdown) still preserves the roster and
-    mail for recovery.
-
-  - refactor: split src/bus.rs into src/bus/ (model: caps and public types;
-    waiters; delivery; clock; mod: the Bus API) and src/tui.rs into src/tui/
-    (log_buffer, banner, terminal; mod: the dashboard); public paths are
-    unchanged. Bus::ack and check_inbox share one ack implementation, and the
-    methods that refuse work on a closed bus share one lock helper. Bus::
-    overview stays separate from list_agents: that one is the wire contract.
-    Also: drop check_inbox's duplicate waiter-cap check, which inserted an
-    empty queue as a side effect; one no-store response helper instead of
-    three copies in rest.rs; the request body limit lives only on the
-    composed router; list_tools fails loudly on a tool name without metadata
-    instead of silently omitting it; build_router panics if the loopback IP
-    allowlist is rejected rather than shipping a filter that does not say what
-    it claims.
-
-  - chore(compat): roster columns written by earlier development builds
-    (including the v1 window_title_match) are dropped on open, keeping every
-    roster row and queued message; extra input fields on register are ignored
-    rather than rejected.
-
-  - chore: the crate declares itself Unix-only (compile_error! rather than a
-    wall of unresolved symbols); `mentischat` takes no arguments besides
-    --help and --version and exits 2 on anything else; launchd KeepAlive is
-    Crashed-only (KeepAlive true respawn-looped on port-in-use and fought
-    `make stop`), run.sh prefers the installed binary and fails loudly,
-    launchd/install.sh generates the plist for the local checkout; Makefile
-    build/clippy no longer rewrite sources, `make ci` verifies formatting, doc
-    denies broken links; GitHub Actions CI on Linux + macOS with an MSRV job;
-    Cargo.toml carries the crates.io metadata it was missing.
-
-  - chore(build): single Makefile is now the cargo tool handler (build,
-    release, fmt, check, clippy, test, doc, publish, install, clean);
-    `make run` runs the daemon in the foreground (`make run-plain` with plain
-    log lines) and `make stop` sends SIGTERM to the listener on :9480
-    (MENTISCHAT_PORT overrides), replacing the start_mentischat/
-    stop_mentischat scripts and scripts/run.sh. `make msrv` type-checks on the
-    rust-version in Cargo.toml and `make uninstall` removes the installed
-    binary.
-
-  - chore(rename): project renamed llm_chat -> mentischat everywhere
-    (crate/binary, MCP server id, env vars MENTISCHAT_DIR/MENTISCHAT_PORT,
-    data dir ~/.cloudllm/mentischat, launchd label com.mentischat); GitHub
-    repo renamed to mentischat to match the MentisDB naming convention.
-
-  - test(core): 35-test suite green — bus behavior incl. waiter races,
-    batch+ack math, queue/global caps, crash-reopen, mutex stress; REST via
-    tower oneshot (redelivery, wait_ms wake race, error codes, no-store); MCP
-    wire via composed router (initialize + instructions, notifications 202,
-    five pattern-free schemas, shared-bus proof across REST/MCP, isError
-    mapping, GET/DELETE 405, foreign Origin 403).
-
-  - docs(readme): the curl example is now a complete register / send / pull /
-    ack round trip (it sent to an unregistered agent and pulled the sender's
-    inbox), the prerequisite is Rust 1.88+ rather than "stable", and a file
-    layout table and the --help / --version note were added.
-
-  - docs(plan): PLAN.md is the product/architecture SSOT (mailbox shipped).
-    BRIDGE-PLAN.md removed so the spec is not split across
-    files.
-
-  - docs(plan): PLAN.md revised from TypeScript to Rust/cloudllm_mcp
-    architecture; router composition over MCPServerBuilder; file layout now
-    documents Makefile and skills/.
-
-  - docs(skills): add skills/ folder — rust-engineer (merged MentisDB
-    rust-engineer + DiarioBitcoin rust-backend-engineer house style) and
-    rust-performance-reviewer (Abseil performance-hints review method).
-
-  - docs(readme): documents every response shape (register, list_agents,
-    send_message, check_inbox, deregister, /health), the request bodies, all
-    twelve error codes with their HTTP status and context, the instructions
-    the server sends agents on connect, the terminal view's j/k and Shift+Tab
-    keys, the MENTISCHAT_BIN launchd override, parked pulls exempting an agent
-    from the idle drop, and use as a library. The sweep interval is described
-    as a quarter of the shorter TTL (1 to 60 seconds), not always a minute.
+  - docs: the README is the one description of the design: tools, REST
+    routes, request and response shapes, error codes, caps, lifetimes, when
+    agents wait, harness wiring, launchd and use as a library.
+    skills/rust-engineer.md and skills/rust-performance-reviewer.md hold the
+    house style for changes.

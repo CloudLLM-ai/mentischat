@@ -9,12 +9,14 @@ use serde::Serialize;
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
 /// Per-recipient cap on unread messages.
 pub const MAX_PENDING_PER_AGENT: i64 = 1024;
-/// Global cap on rows in `messages`.
+/// Global cap on rows in `messages`, read and unread. A send at the cap
+/// deletes the oldest read message to make room; when every row is unread it
+/// fails `storage_full`.
 pub const MAX_TOTAL_MESSAGES: i64 = 8192;
-/// Max messages returned by one `check_inbox`.
+/// Max messages returned by one `check_inbox` or `history` page.
 pub const MAX_BATCH: i64 = 8;
 /// Max summed serialized-JSON bytes of the messages returned by one
-/// `check_inbox` (first message always included).
+/// `check_inbox` or `history` page (first message always included).
 pub const MAX_RETURN_BYTES: usize = 16 * 1024;
 /// Upper bound of `wait_ms`.
 pub const MAX_WAIT_MS: u32 = 30_000;
@@ -22,11 +24,13 @@ pub const MAX_WAIT_MS: u32 = 30_000;
 pub const MAX_WAITERS_PER_AGENT: usize = 8;
 /// Cap on roster rows — bounds the number of parked pulls (8 per name).
 pub const MAX_ROSTER: i64 = 256;
-/// Default time an unread message is kept before it expires.
-const DEFAULT_MESSAGE_TTL: Duration = Duration::from_secs(60 * 60);
-/// Default time an agent stays on the roster without a `register` or
-/// `check_inbox`.
+/// Default time a read message is kept after it was read.
+const DEFAULT_READ_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Default time an agent stays on the roster without a `register`,
+/// `send_message`, `check_inbox` or `history`.
 const DEFAULT_AGENT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Default time a released name is held for its previous holder.
+const DEFAULT_NAME_HOLD: Duration = Duration::from_secs(10 * 60);
 /// Maximum UTF-8 byte length of an agent's roster description.
 pub const MAX_DESCRIPTION_BYTES: usize = 256;
 
@@ -38,6 +42,12 @@ pub struct Registration {
     /// [`MAX_DESCRIPTION_BYTES`] or holding control characters with
     /// `invalid_description`.
     pub description: Option<String>,
+    /// The harness or app the agent runs in. `None` keeps the stored one.
+    pub provider: Option<crate::names::Provider>,
+    /// Take the name even though it is registered or held: the caller says it
+    /// is the agent that held it. Without this a taken name fails
+    /// `name_taken`.
+    pub reclaim: bool,
 }
 
 /// A delivered or queued mail row (wire shape).
@@ -54,6 +64,8 @@ pub struct Message {
     pub body: String,
     /// UTC RFC 3339 creation timestamp.
     pub created_at: String,
+    /// UTC RFC 3339 time the recipient read it; `None` while unread.
+    pub read_at: Option<String>,
 }
 
 /// Send receipt handed back to the sender.
@@ -74,28 +86,43 @@ pub struct SendReceipt {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RegisterOutcome {
-    /// The registered name.
+    /// The registered name, spelled as the roster stores it.
     pub agent: String,
     /// True only when the name was not already on the roster.
     pub created: bool,
     /// Fresh last-seen timestamp.
     pub last_seen: String,
+    /// The harness or app now stored for this name, if any.
+    pub provider: Option<String>,
     /// The description now stored for this name, if any.
     pub description: Option<String>,
 }
 
-/// Roster entry (wire shape of `list_agents`).
+/// Roster entry.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RosterEntry {
     /// Agent name.
     pub name: String,
+    /// The harness or app the agent runs in, if it said.
+    pub provider: Option<String>,
     /// What the agent said it is or does at `register`, if anything.
     pub description: Option<String>,
-    /// UTC RFC 3339 timestamp of the last register / send / check_inbox.
+    /// UTC RFC 3339 timestamp of the last register / send / check_inbox /
+    /// history.
     pub last_seen: String,
     /// Unread messages addressed to this agent.
     pub queued: i64,
+}
+
+/// Wire shape of `list_agents`: the roster and some names free to take.
+#[derive(Debug, Clone, Serialize)]
+pub struct RosterListing {
+    /// Registered agents, sorted by name.
+    pub agents: Vec<RosterEntry>,
+    /// Up to [`crate::names::SUGGESTION_COUNT`] names from
+    /// [`crate::names::SUGGESTED_NAMES`] that are neither registered nor held.
+    pub suggestions: Vec<String>,
 }
 
 /// One roster row as the terminal view shows it: who is registered, what it
@@ -107,6 +134,8 @@ pub struct RosterEntry {
 pub struct AgentOverview {
     /// Agent name.
     pub name: String,
+    /// The harness or app the agent runs in, if it said.
+    pub provider: Option<String>,
     /// What the agent said it is or does at `register`, if anything.
     pub description: Option<String>,
     /// Whole seconds since the last `register` / `send` / `check_inbox`, never negative.
@@ -123,9 +152,9 @@ pub struct AgentOverview {
 pub struct Overview {
     /// Registered agents, sorted by name.
     pub agents: Vec<AgentOverview>,
-    /// Messages accepted by `send` since this daemon process started. Read,
-    /// discarded and wiped mail still counts; the number never goes down and
-    /// restarts at 0 with the process.
+    /// Messages accepted by `send` since this daemon process started.
+    /// Expired, discarded and wiped mail still counts; the number never goes
+    /// down and restarts at 0 with the process.
     pub messages_sent: u64,
 }
 
@@ -135,7 +164,7 @@ pub struct Overview {
 pub struct DiscardOutcome {
     /// The removed name.
     pub agent: String,
-    /// Undelivered inbox messages dropped with it.
+    /// Messages addressed to it, read or unread, deleted with it.
     pub discarded: i64,
 }
 
@@ -144,36 +173,56 @@ pub struct DiscardOutcome {
 pub struct InboxPage {
     /// Pulled name.
     pub agent: String,
-    /// Delivered messages. They are deleted as they are returned: each
-    /// message is handed out once.
+    /// Delivered messages, now marked read. Each message is handed out by
+    /// `check_inbox` once; `history` shows it again.
     pub messages: Vec<Message>,
     /// Unread messages still queued after this page; drain while `> 0`.
     pub remaining: i64,
 }
 
-/// How long the mailbox keeps things nobody collects. Read messages are
-/// deleted at once; these bound what is left unread.
+/// One `history` result page: the newest messages older than the cursor,
+/// oldest first.
+#[derive(Debug, Serialize)]
+pub struct HistoryPage {
+    /// The agent whose history this is.
+    pub agent: String,
+    /// Messages it sent (read or not) and messages it has read, oldest first.
+    pub messages: Vec<Message>,
+    /// Pass as `before` to get the page of older messages; `None` when there
+    /// are none.
+    pub next: Option<i64>,
+}
+
+/// How long the mailbox keeps things, and how long a released name is held.
+///
+/// Unread mail has no lifetime of its own: it waits until its recipient
+/// reads it or leaves the roster, or the daemon restarts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Retention {
-    /// An unread message expires this long after it was sent.
-    pub message_ttl: Duration,
-    /// An agent drops off the roster (with its unread inbox) after this long
-    /// without a `register`, `send_message` or `check_inbox`.
+    /// A read message is deleted this long after it was read.
+    pub read_ttl: Duration,
+    /// An agent drops off the roster (with the mail addressed to it) after
+    /// this long without a `register`, `send_message`, `check_inbox` or
+    /// `history`.
     pub agent_ttl: Duration,
+    /// A name that leaves the roster is held this long: only `reclaim` takes
+    /// it, so a new agent cannot pick up mail meant for the old one.
+    pub name_hold: Duration,
 }
 
 impl Default for Retention {
     fn default() -> Self {
         Self {
-            message_ttl: DEFAULT_MESSAGE_TTL,
+            read_ttl: DEFAULT_READ_TTL,
             agent_ttl: DEFAULT_AGENT_TTL,
+            name_hold: DEFAULT_NAME_HOLD,
         }
     }
 }
 
 impl Retention {
-    /// Build from the `MENTISCHAT_MESSAGE_TTL` / `MENTISCHAT_AGENT_TTL`
-    /// values; `None` or empty keeps the default.
+    /// Build from `MENTISCHAT_READ_TTL`, `MENTISCHAT_AGENT_TTL` and
+    /// `MENTISCHAT_NAME_HOLD` as `setting` returns them (usually [`std::env::var`]); `None` or empty keeps the default.
     ///
     /// # Errors
     ///
@@ -186,28 +235,31 @@ impl Retention {
     /// use std::time::Duration;
     /// use mentischat::bus::Retention;
     ///
-    /// let r = Retention::from_settings(Some("15m"), None).unwrap();
-    /// assert_eq!(r.message_ttl, Duration::from_secs(900));
-    /// assert!(Retention::from_settings(Some("soon"), None).is_err());
+    /// let r = Retention::from_settings(|var| {
+    ///     (var == "MENTISCHAT_READ_TTL").then(|| "15m".to_string())
+    /// })
+    /// .unwrap();
+    /// assert_eq!(r.read_ttl, Duration::from_secs(900));
+    /// assert_eq!(r.agent_ttl, Duration::from_secs(86_400));
+    /// assert!(Retention::from_settings(|_| Some("soon".into())).is_err());
     /// ```
-    pub fn from_settings(
-        message_ttl: Option<&str>,
-        agent_ttl: Option<&str>,
-    ) -> Result<Self, String> {
-        let pick = |var: &str, raw: Option<&str>, default: Duration| match raw {
+    pub fn from_settings(setting: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        let pick = |var: &str, default: Duration| match setting(var).as_deref() {
             None | Some("") => Ok(default),
             Some(v) => parse_duration(v).map_err(|e| format!("{var}={v:?}: {e}")),
         };
         Ok(Self {
-            message_ttl: pick("MENTISCHAT_MESSAGE_TTL", message_ttl, DEFAULT_MESSAGE_TTL)?,
-            agent_ttl: pick("MENTISCHAT_AGENT_TTL", agent_ttl, DEFAULT_AGENT_TTL)?,
+            read_ttl: pick("MENTISCHAT_READ_TTL", DEFAULT_READ_TTL)?,
+            agent_ttl: pick("MENTISCHAT_AGENT_TTL", DEFAULT_AGENT_TTL)?,
+            name_hold: pick("MENTISCHAT_NAME_HOLD", DEFAULT_NAME_HOLD)?,
         })
     }
 
-    /// How often the daemon sweeps: a quarter of the shorter TTL, between 1 s
-    /// and 60 s, so nothing outlives its TTL by much.
+    /// How often the daemon sweeps: a quarter of the shorter TTL, between
+    /// 1 s and 60 s, so nothing outlives its TTL by much. Holds are checked
+    /// when a name is registered, so they do not set the pace.
     pub fn sweep_interval(&self) -> Duration {
-        (self.message_ttl.min(self.agent_ttl) / 4)
+        (self.read_ttl.min(self.agent_ttl) / 4)
             .clamp(Duration::from_secs(1), Duration::from_secs(60))
     }
 }
@@ -243,12 +295,24 @@ pub fn parse_duration(raw: &str) -> Result<Duration, String> {
         .ok_or_else(|| "number too large".into())
 }
 
+/// Mailbox counts for `/health`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stats {
+    /// Agents on the roster.
+    pub agents: i64,
+    /// Messages not yet read.
+    pub unread: i64,
+    /// Read messages still kept for `history`.
+    pub read: i64,
+}
+
 /// What one expiry sweep removed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SweepOutcome {
-    /// Unread messages deleted for being older than the message TTL.
-    pub expired: i64,
-    /// Unread messages deleted with an agent that dropped off the roster.
+    /// Read messages deleted for having been read longer than the read TTL ago.
+    pub expired_read: i64,
+    /// Messages addressed to an agent that dropped off the roster, deleted
+    /// with it.
     pub discarded: i64,
     /// Agents removed for being idle longer than the agent TTL.
     pub dropped_agents: Vec<String>,
@@ -257,6 +321,6 @@ pub struct SweepOutcome {
 impl SweepOutcome {
     /// True when the sweep removed nothing.
     pub fn is_empty(&self) -> bool {
-        self.expired == 0 && self.discarded == 0 && self.dropped_agents.is_empty()
+        self.expired_read == 0 && self.discarded == 0 && self.dropped_agents.is_empty()
     }
 }

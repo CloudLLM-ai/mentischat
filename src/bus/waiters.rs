@@ -26,14 +26,16 @@ pub(super) fn wake_one(q: &mut VecDeque<Waiter>) {
     }
 }
 
-/// True when a pull is parked for `name` right now (its client still there).
-pub(super) fn has_live_waiter(waiters: &WaiterMap, name: &str) -> bool {
+/// True when a pull is parked under `key` (a folded name) right now, its
+/// client still there.
+pub(super) fn has_live_waiter(waiters: &WaiterMap, key: &str) -> bool {
     waiters
-        .get(name)
+        .get(key)
         .is_some_and(|q| q.iter().any(|w| !w.tx.is_closed()))
 }
 
-/// Park a fresh waiter for `name`, enforcing the per-name cap.
+/// Park a fresh waiter under `key` (the folded name), enforcing the
+/// per-name cap; `agent` is the name a `too_many_waiters` error reports.
 ///
 /// Returns `(waiter id, receiver)`; the caller awaits the receiver outside
 /// the bus lock and must later call [`unpark`] with the id.
@@ -41,14 +43,18 @@ pub(super) fn has_live_waiter(waiters: &WaiterMap, name: &str) -> bool {
 /// A pull whose client disconnected is dropped mid-await and never reaches
 /// [`unpark`]; its closed sender is pruned here so abandoned pulls cannot
 /// fill the cap and lock the name out of blocking pulls.
-pub(super) fn try_park(g: &mut Inner, name: &str) -> Result<(u64, oneshot::Receiver<()>), MailErr> {
-    if let Some(q) = g.waiters.get_mut(name) {
+pub(super) fn try_park(
+    g: &mut Inner,
+    key: &str,
+    agent: &str,
+) -> Result<(u64, oneshot::Receiver<()>), MailErr> {
+    if let Some(q) = g.waiters.get_mut(key) {
         q.retain(|w| !w.tx.is_closed());
     }
-    let waiting = g.waiters.get(name).map_or(0, VecDeque::len);
+    let waiting = g.waiters.get(key).map_or(0, VecDeque::len);
     if waiting >= MAX_WAITERS_PER_AGENT {
         return Err(MailErr::TooManyWaiters {
-            agent: name.to_string(),
+            agent: agent.to_string(),
             waiting,
         });
     }
@@ -56,19 +62,20 @@ pub(super) fn try_park(g: &mut Inner, name: &str) -> Result<(u64, oneshot::Recei
     g.next_waiter_id += 1;
     let (tx, rx) = oneshot::channel();
     g.waiters
-        .entry(name.to_string())
+        .entry(key.to_string())
         .or_default()
         .push_back(Waiter { id, tx });
     Ok((id, rx))
 }
 
-/// Remove a settled waiter (woken, timed out, or canceled) and drop its
-/// queue when empty so idle keys cannot accumulate.
-pub(super) fn unpark(g: &mut Inner, name: &str, id: u64) {
-    if let Some(q) = g.waiters.get_mut(name) {
+/// Remove a settled waiter (woken, timed out, or canceled) from under `key`
+/// (the folded name) and drop its queue when empty so idle keys cannot
+/// accumulate.
+pub(super) fn unpark(g: &mut Inner, key: &str, id: u64) {
+    if let Some(q) = g.waiters.get_mut(key) {
         q.retain(|w| w.id != id);
         if q.is_empty() {
-            g.waiters.remove(name);
+            g.waiters.remove(key);
         }
     }
 }
@@ -82,7 +89,8 @@ pub(super) fn unpark(g: &mut Inner, name: &str, id: u64) {
 /// passes the wake to the next live waiter.
 pub(super) struct ParkGuard {
     inner: Arc<Mutex<Inner>>,
-    name: String,
+    /// The folded name the waiter is parked under.
+    key: String,
     id: u64,
     rx: oneshot::Receiver<()>,
     woken: bool,
@@ -92,13 +100,13 @@ pub(super) struct ParkGuard {
 impl ParkGuard {
     pub(super) fn new(
         inner: Arc<Mutex<Inner>>,
-        name: &str,
+        key: &str,
         id: u64,
         rx: oneshot::Receiver<()>,
     ) -> Self {
         Self {
             inner,
-            name: name.to_string(),
+            key: key.to_string(),
             id,
             rx,
             woken: false,
@@ -125,11 +133,11 @@ impl Drop for ParkGuard {
             return;
         }
         let woken = self.woken || self.rx.try_recv().is_ok();
-        let (name, id) = (std::mem::take(&mut self.name), self.id);
+        let (key, id) = (std::mem::take(&mut self.key), self.id);
         let settle = move |g: &mut Inner| {
-            unpark(g, &name, id);
+            unpark(g, &key, id);
             if woken {
-                if let Some(q) = g.waiters.get_mut(&name) {
+                if let Some(q) = g.waiters.get_mut(&key) {
                     wake_one(q);
                 }
             }

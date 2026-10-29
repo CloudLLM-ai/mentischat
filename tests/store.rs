@@ -30,13 +30,27 @@ fn a_fresh_database_has_the_roster_and_messages_schema() {
     let conn = Connection::open(data.join("pending.sqlite")).expect("reopen");
     assert_eq!(
         columns(&conn, "roster"),
-        ["name", "last_seen", "description"]
+        [
+            "name",
+            "provider",
+            "description",
+            "registered_at",
+            "last_seen"
+        ]
     );
     assert_eq!(
         columns(&conn, "messages"),
-        ["id", "sender", "recipient", "body", "created_at", "seq"]
+        [
+            "id",
+            "sender",
+            "recipient",
+            "body",
+            "created_at",
+            "read_at",
+            "seq"
+        ]
     );
-    for index in ["idx_inbox", "idx_created"] {
+    for index in ["idx_inbox", "idx_sent", "idx_read"] {
         assert_eq!(index_count(&conn, index), 1, "{index}");
     }
 }
@@ -47,10 +61,18 @@ fn reopening_an_existing_database_keeps_its_rows() {
     let data = dir.path().join("reopen");
     let conn = mentischat::store::open(&data).expect("first open");
     conn.execute(
-        "INSERT INTO roster (name, last_seen, description) VALUES ('a', 't', 'd')",
+        "INSERT INTO roster (name, registered_at, last_seen) VALUES ('a', 't', 't')",
         [],
     )
     .unwrap();
+    assert!(
+        conn.execute(
+            "INSERT INTO roster (name, registered_at, last_seen) VALUES ('A', 't', 't')",
+            [],
+        )
+        .is_err(),
+        "names are unique without regard to case"
+    );
     drop(conn);
 
     let conn = mentischat::store::open(&data).expect("second open");
@@ -68,14 +90,14 @@ fn an_older_table_shape_is_refused_and_reset_clears_it() {
     Connection::open(data.join("pending.sqlite"))
         .unwrap()
         .execute_batch(
-            "CREATE TABLE roster (name TEXT PRIMARY KEY, last_seen TEXT NOT NULL, wake_id TEXT);",
+            "CREATE TABLE roster (name TEXT PRIMARY KEY, last_seen TEXT NOT NULL, description TEXT);",
         )
         .unwrap();
 
     match mentischat::store::open(&data) {
         Err(mentischat::store::StoreError::Schema { table, found }) => {
             assert_eq!(table, "roster");
-            assert_eq!(found, ["name", "last_seen", "wake_id"]);
+            assert_eq!(found, ["name", "last_seen", "description"]);
         }
         other => panic!("expected a schema error, got {:?}", other.map(|_| ())),
     }

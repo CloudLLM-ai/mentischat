@@ -2,7 +2,8 @@
 //!
 //! Success is always 200 + JSON (no 201/204). Errors map once via
 //! [`MailboxError::http_status`] + [`MailboxError::to_json`]. Inbox pulls
-//! mutate state, so they answer with `Cache-Control: no-store`.
+//! mutate state and history pages hold message text, so both answer with
+//! `Cache-Control: no-store`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,9 +28,11 @@ pub fn router(bus: Ctx) -> Router {
         .route("/agents", post(register).get(list))
         .route("/agents/{agent}", delete(deregister_one))
         .route("/messages", post(send_msg))
-        // A pull deletes mail, so HEAD (which axum would otherwise send to
-        // the GET handler) is refused rather than deleting without a body.
+        // A pull marks mail read, so HEAD (which axum would otherwise send to
+        // the GET handler) is refused rather than consuming mail it does not
+        // return.
         .route("/inboxes/{agent}", get(pull).head(method_not_allowed))
+        .route("/history/{agent}", get(history))
         .route("/health", get(health))
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
@@ -81,7 +84,8 @@ fn path_name(path: Result<Path<String>, PathRejection>) -> Result<AgentName, Res
     AgentName::parse(&raw).map_err(err_response)
 }
 
-/// `POST /agents` `{ "provider" | "agent", "description"? }` — same as register.
+/// `POST /agents` `{ "agent", "provider"?, "description"?, "reclaim"? }` —
+/// same as register.
 async fn register(State(bus): State<Ctx>, body: Result<Json<Value>, JsonRejection>) -> Response {
     let v = match json_body(body) {
         Ok(v) => v,
@@ -90,12 +94,9 @@ async fn register(State(bus): State<Ctx>, body: Result<Json<Value>, JsonRejectio
     respond(crate::tools::register_agent(&bus, &v).await)
 }
 
-/// `GET /agents` — roster sorted by name ascending.
+/// `GET /agents` — roster sorted by name ascending, plus free names.
 async fn list(State(bus): State<Ctx>) -> Response {
-    match bus.list_agents().await {
-        Ok(entries) => ok_response(json!({ "agents": entries })),
-        Err(e) => err_response(e),
-    }
+    respond(bus.list_agents().await.map(crate::tools::to_wire))
 }
 
 /// `DELETE /agents/{agent}` — same as the deregister tool.
@@ -120,7 +121,7 @@ async fn send_msg(State(bus): State<Ctx>, body: Result<Json<Value>, JsonRejectio
 }
 
 /// `GET /inboxes/{agent}?wait_ms=` — same as check_inbox: returned messages
-/// are deleted.
+/// are marked read.
 async fn pull(
     State(bus): State<Ctx>,
     path: Result<Path<String>, PathRejection>,
@@ -143,12 +144,43 @@ async fn pull(
     }
 }
 
-/// `GET /health` — `{ ok, agents, pending }`; counts only.
+/// `GET /history/{agent}?with=&before=` — same as the history tool.
+async fn history(
+    State(bus): State<Ctx>,
+    path: Result<Path<String>, PathRejection>,
+    query: Result<Query<HashMap<String, String>>, QueryRejection>,
+) -> Response {
+    let agent = match path_name(path) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let Ok(Query(q)) = query else {
+        return err_response(MailboxError::InvalidCursor);
+    };
+    let field = |key: &str| q.get(key).map(|v| Value::String(v.clone()));
+    let with = match crate::tools::optional_name(field("with").as_ref()) {
+        Ok(w) => w,
+        Err(e) => return err_response(e),
+    };
+    let before = match crate::tools::parse_cursor(field("before").as_ref()) {
+        Ok(b) => b,
+        Err(e) => return err_response(e),
+    };
+    match bus.history(&agent, with.as_ref(), before).await {
+        Ok(page) => no_store_response(page),
+        Err(e) => err_response(e),
+    }
+}
+
+/// `GET /health` — `{ ok, agents, pending, read }`; counts only.
 async fn health(State(bus): State<Ctx>) -> Response {
     match bus.stats().await {
-        Ok((agents, pending)) => {
-            ok_response(json!({ "ok": true, "agents": agents, "pending": pending }))
-        }
+        Ok(stats) => ok_response(json!({
+            "ok": true,
+            "agents": stats.agents,
+            "pending": stats.unread,
+            "read": stats.read,
+        })),
         Err(e) => err_response(e),
     }
 }

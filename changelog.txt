@@ -149,6 +149,10 @@ UNRELEASED
   - docs: PLAN.md is removed; it repeated the README, which is now the one
     description of the design.
 
+  - chore(ci): the macOS job runs on macos-26-intel. Hosted arm64 Mac
+    runners (macos-latest) were not being assigned, so the job was cancelled
+    after 15 minutes without running a step.
+
   - chore(ci): CI ran on pushes to main, but the default branch is master;
     it now runs there, with a read-only token. make check/clippy/test/doc
     pass --locked like CI.

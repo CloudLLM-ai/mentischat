@@ -16,10 +16,13 @@ jobs:
   verify:
     # mentischat is Unix-only by design (data directory permissions, SIGTERM),
     # so both supported platforms are covered and Windows is not attempted.
+    # macOS uses the Intel image: hosted arm64 Mac runners are
+    # capacity-constrained, and a job waiting for one is cancelled after 15
+    # minutes without running.
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-26-intel]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

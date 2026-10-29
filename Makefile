@@ -22,7 +22,7 @@ ci: fmt-check check clippy test doc ## Verification-only pipeline (no source rew
 
 # Check the rust-version claim in Cargo.toml (needs rustup and the toolchain)
 msrv: ## Type-check on the minimum supported Rust version (MSRV, default 1.88)
-	${CARGO_CMD} +$(MSRV) check --all-targets --all-features --locked
+	${CARGO_CMD} +$(MSRV) check --release --all-targets --all-features --locked
 
 # Format the code
 fmt: ## Format the code using cargo fmt
@@ -33,20 +33,20 @@ fmt-check: ## Fail if anything is unformatted
 	${CARGO_CMD} fmt --check
 
 # Check for errors without building. --all-targets covers bins, tests and benches.
-check: ## Run cargo check to analyze the code without compiling
-	${CARGO_CMD} check --all-targets --all-features --locked
+check: ## Run cargo check --release to analyze the code without compiling
+	${CARGO_CMD} check --release --all-targets --all-features --locked
 
 # Strict linter, fails on warnings and suggests fixes
 clippy: ## Run clippy and fail on warnings
-	${CARGO_CMD} clippy --all-targets --all-features --locked -- -D warnings
+	${CARGO_CMD} clippy --release --all-targets --all-features --locked -- -D warnings
 
 # Run tests
-test: ## Run all tests using cargo test
-	${CARGO_CMD} test --all-features --locked
+test: ## Run all tests using cargo test --release
+	${CARGO_CMD} test --release --all-features --locked
 
 # Generate documentation. Broken intra-doc links fail the build.
-doc: ## Generate project documentation using cargo doc
-	RUSTDOCFLAGS="-D warnings" ${CARGO_CMD} doc --all-features --no-deps --locked
+doc: ## Generate project documentation using cargo doc --release
+	RUSTDOCFLAGS="-D warnings" ${CARGO_CMD} doc --release --all-features --no-deps --locked
 
 # Publish to crates.io
 publish: ## Publish mentischat to crates.io
@@ -69,12 +69,12 @@ clean: ## Remove build artifacts using cargo clean
 	${CARGO_CMD} clean
 
 # Run the mentischat daemon in the foreground (Ctrl-C to stop)
-run: ## Run mentischat in the foreground (cargo run --bin mentischat)
-	${CARGO_CMD} run --bin mentischat
+run: ## Run mentischat in the foreground (cargo run --release --bin mentischat)
+	${CARGO_CMD} run --release --bin mentischat
 
 # Run the daemon with plain log lines instead of the terminal view
 run-plain: ## Run mentischat with plain logs (MENTISCHAT_PLAIN=1)
-	MENTISCHAT_PLAIN=1 ${CARGO_CMD} run --bin mentischat
+	MENTISCHAT_PLAIN=1 ${CARGO_CMD} run --release --bin mentischat
 
 # Gracefully stop a locally running mentischat daemon (SIGTERM on the mailbox port)
 stop: ## Stop the running daemon with SIGTERM (port from MENTISCHAT_PORT, default 9480)

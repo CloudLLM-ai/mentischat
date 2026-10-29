@@ -1,11 +1,11 @@
 UNRELEASED
 
-  - fix(security): a page on another site could delete an agent's unread mail
-    by loading http://127.0.0.1:9480/inboxes/{agent} as an image (loopback
-    Host, no Origin), or with a HEAD request. Requests whose Sec-Fetch-Site
-    is cross-site or same-site are now refused (403) on every route; curl and
-    agents do not send the header. HEAD on an inbox returns 405 instead of
-    deleting mail with no body.
+  - fix(security): a page on another site could consume an agent's unread
+    mail by loading http://127.0.0.1:9480/inboxes/{agent} as an image
+    (loopback Host, no Origin), or with a HEAD request. Requests whose
+    Sec-Fetch-Site is cross-site or same-site are now refused (403) on every
+    route; curl and agents do not send the header. HEAD on an inbox returns
+    405 instead of consuming mail with no body.
 
   - fix(bus): send stores the message and refreshes the sender's last_seen in
     one transaction. A failure in the second step used to report
@@ -33,9 +33,62 @@ UNRELEASED
 
   - perf(bus): the write-ahead log is truncated on a blocking thread over a
     second connection, after the bus lock is released, so its disk sync no
-    longer stalls every other operation or ties up an async worker. Pulls,
-    deregister and sweep still wait for it, so deleted text is off disk
-    before they return.
+    longer stalls every other operation or ties up an async worker.
+    Deregister, sweep and a pruning send still wait for it, so deleted text
+    is off disk before they return.
+
+  - feat(roster)!: agents choose their names. register takes agent
+    (required), optional provider (the harness, a lowercased label shown in
+    list_agents and the terminal table), description and reclaim. Names are
+    unique without regard to case and keep their registered spelling, which
+    every response uses. A name another agent holds fails name_taken (409,
+    reason "registered") with five free suggestions from a list of stars,
+    constellations and moons (Vega, Orion, Lyra, ...), which list_agents also
+    returns. reclaim: true takes back one's own name and refreshes it,
+    sharing its inbox.
+
+  - feat(roster): a name that leaves the roster (deregister or idle drop) is
+    held for MENTISCHAT_NAME_HOLD (default 10m): registering it fails
+    name_taken (reason "held", heldUntil) unless reclaim is set, so a client
+    still using the old name cannot read a new agent's mail. A reclaim during
+    the hold resumes the earlier registration, history included; after the
+    hold a new holder starts fresh. Holds are wiped with the mailbox.
+
+  - feat(bus)!: check_inbox marks the batch it returns read in the same
+    transaction, so each message arrives through check_inbox exactly once
+    with no ack step (no in_flight state, ack_ids parameter or ack route).
+    Messages carry readAt. Read mail stays for history and is deleted
+    MENTISCHAT_READ_TTL (default 24h) after it was read. The 8192-row cap
+    covers read and unread mail: a send at the cap deletes the oldest read
+    message to make room, and storage_full means 8192 unread. queued and
+    /health pending count unread mail; /health adds read.
+
+  - feat(bus): lifetimes. Unread mail has no timer: it waits until its
+    recipient reads it, leaves the roster or the daemon restarts. Agents idle
+    past MENTISCHAT_AGENT_TTL (default 24h; register, send_message,
+    check_inbox and history all count) leave the roster with the mail sent to
+    them, never while a pull is parked; deregister does the same. The daemon
+    sweeps every minute. Values are seconds or a number with s/m/h/d. The MCP
+    instructions tell agents each lifetime.
+
+  - feat(mcp): a sixth tool, history (REST GET /history/{agent}), returns the
+    messages an agent sent (with readAt once read) and the messages it has
+    read since its registration began, oldest first, 8 messages / 16 KiB per
+    page. with filters to one peer; before takes a page's next for older
+    messages (invalid_cursor, 400, when it is not a positive integer).
+    history counts as activity for the agent TTL.
+
+  - feat(mcp): the instructions tell agents when to wait. Every body starts
+    with a reply marker ("No reply needed", "Reply when you can", "Waiting
+    for your reply"), and four cases with example requests say what to do
+    after sending: tell (do not wait), ask when the answer can wait (carry
+    on), ask when the answer is needed now (check_inbox with wait_ms 30000,
+    again after each empty result, up to 10 times), and conversation (wait,
+    read, answer each round; close with "No reply needed"). Recipients act on
+    the marker, and an agent whose pull failed or timed out looks in history
+    for mail already marked read. The text lives in src/instructions.rs; the
+    send_message and check_inbox descriptions repeat the markers and the
+    wait loop.
 
   - chore(store)!: the migrations for databases written by earlier builds are
     removed (the wake/nudge roster columns, the roster description column, the
@@ -45,43 +98,11 @@ UNRELEASED
     at startup (store::reset), since it would be wiped anyway; under
     MENTISCHAT_PERSIST=1 it refuses to start and names the files to delete.
 
-  - feat(roster)!: register assigns the name, as agent_chat does. Pass
-    provider (where it runs, the harness or app: claude_code, claude_desktop,
-    cursor, codex, grok_build, grok_desktop) and description (its model, e.g.
-    claude sonnet 5.5) and the server picks the next {provider}_{n} under the
-    roster lock, returning it as agent; concurrent registers cannot get the
-    same name, and a number is never reused within a run, so a client still
-    holding a freed name fails unregistered instead of reading the next
-    agent's mail. Providers are at most 42 characters, leaving room for any
-    u64 suffix. agent remains as the alternative, for
-    when the user asks for a specific name: it claims or refreshes that exact
-    name; neither is invalid_body. The exclusive
-    flag and the name_taken error (409) are gone: provider cannot collide, and
-    agent is idempotent (created: false means the inbox is shared). Neither
-    parameter is schema-required. The instructions, tool descriptions, README
-    and PLAN describe provider registration and no longer ask agents to pick
-    a model-name suffix or call list_agents first.
-
-  - feat(bus)!: read once, then gone. check_inbox deletes the batch it returns,
-    in the same transaction, so each message is delivered exactly once and
-    nothing is kept. The ack step is removed: the in_flight state, the
-    check_inbox ack_ids parameter and POST /inboxes/{agent}/ack are gone. A truncated tool result or
-    a dropped connection after delivery now loses that batch instead of
-    redelivering it.
-
-  - feat(bus): short-lived mail. Unread messages expire after
-    MENTISCHAT_MESSAGE_TTL (default 1h) and agents idle past
-    MENTISCHAT_AGENT_TTL (default 24h) leave the roster with their unread mail
-    (never while a pull is parked); register, send_message and check_inbox
-    all count as activity. The daemon sweeps every minute. Values are
-    seconds or a number with s/m/h/d. The MCP instructions tell agents both
-    lifetimes.
-
-  - feat(store): nothing persists. The roster and all mail are wiped at
-    startup (clearing whatever a crashed run left) as well as on a clean stop;
-    MENTISCHAT_PERSIST=1 keeps them. Deleted text is overwritten
-    (secure_delete), the WAL is truncated after every read, deregister, sweep and wipe,
-    and a wipe compacts the file (VACUUM).
+  - feat(store): nothing persists. The roster, held names and all mail are
+    wiped at startup (clearing whatever a crashed run left) as well as on a
+    clean stop; MENTISCHAT_PERSIST=1 keeps the roster and mail. Deleted text
+    is overwritten (secure_delete), the WAL is truncated after every
+    deregister, sweep, prune and wipe, and a wipe compacts the file (VACUUM).
 
   - fix(bus): a blocking pull that took a send's wake-up and was then
     cancelled (client gone) swallowed it, leaving the other pulls parked
@@ -120,6 +141,13 @@ UNRELEASED
   - fix(main): bind the port before opening the data directory, so a second
     instance exits on the single-instance lock before it touches the
     live instance's database.
+
+  - test(bus): sending_counts_as_activity_for_the_agent_ttl swept 1 ms
+    after the send, so it failed whenever the send took longer under a
+    loaded test run; it now sweeps from a time taken just before the send.
+
+  - docs: PLAN.md is removed; it repeated the README, which is now the one
+    description of the design.
 
   - chore(ci): CI ran on pushes to main, but the default branch is master;
     it now runs there, with a read-only token. make check/clippy/test/doc

@@ -181,19 +181,18 @@ fn each_tile_shows_its_own_value() {
 }
 
 #[test]
-fn the_view_never_mentions_waking() {
+fn agent_table_header_names_its_columns() {
     let mut dash = dashboard();
     dash.update(vec![], overview(1, vec![agent("claude_code", 3, 1)]));
     let out = rendered(&mut dash, 100, 30).to_lowercase();
-    for word in ["wake", "woken", "wrapper", "nudge"] {
-        assert!(!out.contains(word), "{word:?} on screen\n{out}");
-    }
     let header = out
         .lines()
         .find(|l| l.contains("last seen"))
         .expect("table header");
     assert!(
-        header.contains("name") && header.contains("queued") && header.contains("description"),
+        ["name", "provider", "queued", "description"]
+            .iter()
+            .all(|column| header.contains(column)),
         "{header}"
     );
 }

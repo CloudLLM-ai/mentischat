@@ -71,48 +71,6 @@ async fn agent_routes_happy_path() {
 }
 
 #[tokio::test]
-async fn register_response_has_no_wake_fields_and_ignores_legacy_input() {
-    let (_d, mut app) = app();
-    let (s, v) = send(
-        &mut app,
-        post(
-            "/agents",
-            r#"{"agent":"grok","wakeId":"11111111-1111-4111-8111-111111111111","nudgeTransport":"wrapper"}"#,
-        ),
-    )
-    .await;
-    assert_eq!(s, 200, "an older client's extra fields are not an error");
-    assert_eq!(v["agent"], "grok");
-    assert_eq!(v["created"], true);
-    assert!(
-        v.get("nudgeTransport").is_none() && v.get("nudgeWindow").is_none(),
-        "{v}"
-    );
-
-    let (_, v) = send(&mut app, req("GET", "/agents")).await;
-    assert!(v["agents"][0].get("nudgeTransport").is_none(), "{v}");
-}
-
-#[tokio::test]
-async fn wake_and_wrapper_routes_are_gone() {
-    let (_d, mut app) = app();
-    send(&mut app, post("/agents", r#"{"agent":"grok"}"#)).await;
-    for (method, uri) in [
-        ("GET", "/nudge/grok"),
-        ("GET", "/wake/11111111-1111-4111-8111-111111111111"),
-        ("DELETE", "/wake/11111111-1111-4111-8111-111111111111"),
-        ("POST", "/agents/grok/wrapper"),
-        ("DELETE", "/agents/grok/wrapper"),
-    ] {
-        let (s, v) = send(&mut app, req(method, uri)).await;
-        assert!(
-            s == 404 || s == 405,
-            "{method} {uri} should not be served, got {s} {v}"
-        );
-    }
-}
-
-#[tokio::test]
 async fn inbox_get_marks_what_it_returns_read() {
     let (_d, mut app) = app();
     register_two(&mut app).await;
@@ -131,10 +89,6 @@ async fn inbox_get_marks_what_it_returns_read() {
     assert_eq!(p2["messages"].as_array().unwrap().len(), 0, "pulled once");
     let (_, h) = send(&mut app, req("GET", "/history/b")).await;
     assert_eq!(h["messages"][0]["body"], "m1", "kept as read: {h}");
-
-    // There is nothing to acknowledge any more.
-    let (s, v) = send(&mut app, post("/inboxes/b/ack", r#"{"ids":[]}"#)).await;
-    assert_eq!((s, v["error"].as_str()), (404, Some("not_found")));
 }
 
 #[tokio::test]

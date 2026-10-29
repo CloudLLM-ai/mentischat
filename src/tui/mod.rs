@@ -316,23 +316,25 @@ impl Dashboard {
             } else {
                 Span::styled("0", secondary())
             };
-            let description = a
-                .description
-                .as_deref()
-                .map_or_else(|| Span::styled("—", secondary()), |d| Span::raw(plain(d)));
+            let or_dash = |text: &Option<String>| {
+                text.as_deref()
+                    .map_or_else(|| Span::styled("—", secondary()), |t| Span::raw(plain(t)))
+            };
             Row::new([
                 Cell::from(plain(&a.name)),
+                Cell::from(or_dash(&a.provider)),
                 Cell::from(ago(a.seen_secs_ago)),
                 Cell::from(queued),
-                Cell::from(description),
+                Cell::from(or_dash(&a.description)),
             ])
         });
-        let header =
-            Row::new(["NAME", "LAST SEEN", "QUEUED", "DESCRIPTION"]).style(bold(Color::Yellow));
+        let header = Row::new(["NAME", "PROVIDER", "LAST SEEN", "QUEUED", "DESCRIPTION"])
+            .style(bold(Color::Yellow));
         let table = Table::new(
             rows,
             [
-                Constraint::Length(28),
+                Constraint::Length(24),
+                Constraint::Length(16),
                 Constraint::Length(12),
                 Constraint::Length(8),
                 Constraint::Fill(1),

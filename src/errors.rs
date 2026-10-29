@@ -8,6 +8,19 @@ use std::fmt;
 
 use serde_json::{json, Value};
 
+/// Why a name could not be registered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TakenReason {
+    /// Another agent has it on the roster now.
+    Registered,
+    /// It left the roster recently and is held for its previous holder until
+    /// the given UTC RFC 3339 time.
+    Held {
+        /// When anyone may take it.
+        until: String,
+    },
+}
+
 /// Domain failures of the mailbox. Never logged with backtraces; mapped once
 /// in REST (`rest.rs`) and once in MCP (`tools.rs`).
 #[derive(Debug, Clone, PartialEq)]
@@ -15,11 +28,20 @@ pub enum MailboxError {
     /// Name fails the roster regex.
     InvalidName { agent: String },
     /// Missing / non-string / whitespace-only / oversized body, a body that
-    /// is not JSON, a name field that is not a string, or a register naming
-    /// neither `provider` nor `agent`.
+    /// is not JSON, a name field that is not a string, or a `reclaim` that is
+    /// not a boolean.
     InvalidBody,
     /// `wait_ms` present but not an integer in `0..=30000`.
     InvalidWait,
+    /// The name is registered or held; `reclaim` takes it anyway. Carries
+    /// free names to pick instead.
+    NameTaken {
+        agent: String,
+        reason: TakenReason,
+        suggestions: Vec<String>,
+    },
+    /// `before` is not a positive integer.
+    InvalidCursor,
     /// `description` is not a string, is over
     /// [`crate::bus::MAX_DESCRIPTION_BYTES`], or holds control characters.
     InvalidDescription,
@@ -52,6 +74,8 @@ impl MailboxError {
             Self::InvalidBody => "invalid_body",
             Self::InvalidWait => "invalid_wait",
             Self::InvalidDescription => "invalid_description",
+            Self::InvalidCursor => "invalid_cursor",
+            Self::NameTaken { .. } => "name_taken",
             Self::Unregistered { .. } => "unregistered",
             Self::QueueFull { .. } => "queue_full",
             Self::StorageFull { .. } => "storage_full",
@@ -71,12 +95,14 @@ impl MailboxError {
             Self::InvalidName { .. }
             | Self::InvalidBody
             | Self::InvalidWait
-            | Self::InvalidDescription => StatusCode::BAD_REQUEST,
+            | Self::InvalidDescription
+            | Self::InvalidCursor => StatusCode::BAD_REQUEST,
             Self::Unregistered { .. } | Self::NotFound => StatusCode::NOT_FOUND,
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
-            Self::QueueFull { .. } | Self::TooManyWaiters { .. } | Self::RosterFull { .. } => {
-                StatusCode::CONFLICT
-            }
+            Self::QueueFull { .. }
+            | Self::TooManyWaiters { .. }
+            | Self::RosterFull { .. }
+            | Self::NameTaken { .. } => StatusCode::CONFLICT,
             Self::StorageFull { .. } => StatusCode::INSUFFICIENT_STORAGE,
             Self::StorageError => StatusCode::INTERNAL_SERVER_ERROR,
             Self::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
@@ -87,8 +113,28 @@ impl MailboxError {
     pub fn to_json(&self) -> Value {
         match self {
             Self::InvalidName { agent } => json!({ "error": self.code(), "agent": agent }),
-            Self::InvalidBody | Self::InvalidWait | Self::InvalidDescription => {
-                json!({ "error": self.code() })
+            Self::InvalidBody
+            | Self::InvalidWait
+            | Self::InvalidDescription
+            | Self::InvalidCursor => json!({ "error": self.code() }),
+            Self::NameTaken {
+                agent,
+                reason,
+                suggestions,
+            } => {
+                let mut body = json!({
+                    "error": self.code(),
+                    "agent": agent,
+                    "suggestions": suggestions,
+                });
+                match reason {
+                    TakenReason::Registered => body["reason"] = json!("registered"),
+                    TakenReason::Held { until } => {
+                        body["reason"] = json!("held");
+                        body["heldUntil"] = json!(until);
+                    }
+                }
+                body
             }
             Self::Unregistered { agent, known } => {
                 json!({ "error": self.code(), "agent": agent, "known": known })

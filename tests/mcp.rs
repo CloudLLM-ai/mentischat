@@ -87,7 +87,7 @@ async fn notification_gets_202() {
 }
 
 #[tokio::test]
-async fn tools_list_shows_exactly_five_pattern_free_tools() {
+async fn tools_list_shows_exactly_six_pattern_free_tools() {
     let (_d, app) = app();
     let (_, resp) = rpc(&app, "tools/list", json!({})).await;
     let tools = resp["result"]["tools"].as_array().unwrap();
@@ -99,6 +99,7 @@ async fn tools_list_shows_exactly_five_pattern_free_tools() {
             "deregister",
             "send_message",
             "check_inbox",
+            "history",
             "list_agents"
         ]
     );
@@ -144,7 +145,7 @@ async fn domain_error_is_iserror_true_content_block() {
 }
 
 #[tokio::test]
-async fn register_tool_takes_a_provider_or_name_and_a_description() {
+async fn register_tool_requires_a_name_and_takes_provider_description_and_reclaim() {
     let (_d, app) = app();
     let (_, resp) = rpc(&app, "tools/list", json!({})).await;
     let tools = resp["result"]["tools"].as_array().unwrap();
@@ -152,17 +153,16 @@ async fn register_tool_takes_a_provider_or_name_and_a_description() {
     let props = register["inputSchema"]["properties"].as_object().unwrap();
     let mut names: Vec<&str> = props.keys().map(String::as_str).collect();
     names.sort_unstable();
-    assert_eq!(
-        names,
-        ["agent", "description", "provider"],
-        "no wakeId or nudgeTransport parameter"
-    );
-    assert!(
-        register["inputSchema"]["required"]
-            .as_array()
-            .is_none_or(|r| r.is_empty()),
-        "provider and agent are alternatives, so neither is schema-required"
-    );
+    assert_eq!(names, ["agent", "description", "provider", "reclaim"]);
+    assert_eq!(props["reclaim"]["type"], "boolean");
+    assert_eq!(register["inputSchema"]["required"], json!(["agent"]));
+
+    let history = tools.iter().find(|t| t["name"] == "history").unwrap();
+    let props = history["inputSchema"]["properties"].as_object().unwrap();
+    let mut names: Vec<&str> = props.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["agent", "before", "with"]);
+    assert_eq!(history["inputSchema"]["required"], json!(["agent"]));
 
     let (_, reg) = rpc(
         &app,
@@ -233,7 +233,7 @@ async fn send_and_pull_over_mcp_roundtrip() {
     let page: Value = serde_json::from_str(text).unwrap();
     assert_eq!(page["messages"][0]["body"], "ping");
 
-    // Read means gone: the next pull is empty.
+    // check_inbox returns a message once; history shows it again.
     let (_, resp) = rpc(
         &app,
         "tools/call",
@@ -243,6 +243,30 @@ async fn send_and_pull_over_mcp_roundtrip() {
     let text = resp["result"]["content"][0]["text"].as_str().unwrap();
     let page: Value = serde_json::from_str(text).unwrap();
     assert_eq!(page["messages"].as_array().unwrap().len(), 0);
+
+    let (_, resp) = rpc(
+        &app,
+        "tools/call",
+        json!({ "name": "history", "arguments": { "agent": "grok", "with": "codex" } }),
+    )
+    .await;
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let page: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(page["messages"][0]["body"], "ping", "{page}");
+    assert!(page["messages"][0]["readAt"].as_str().is_some(), "{page}");
+    assert!(page["next"].is_null());
+
+    for before in [json!(0), json!(-3), json!("x"), json!(1.5), json!(true)] {
+        let (_, resp) = rpc(
+            &app,
+            "tools/call",
+            json!({ "name": "history", "arguments": { "agent": "grok", "before": before } }),
+        )
+        .await;
+        let err: Value =
+            serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(err["error"], "invalid_cursor", "{before}");
+    }
 }
 
 #[tokio::test]
@@ -363,7 +387,7 @@ async fn non_loopback_peer_is_403() {
 }
 
 #[tokio::test]
-async fn register_over_mcp_assigns_a_numbered_name_for_a_provider() {
+async fn register_over_mcp_takes_a_chosen_name_and_suggests_free_ones() {
     let (_d, app) = app();
     let call = |args: Value| json!({ "name": "register", "arguments": args });
     let out = |resp: &Value| -> Value {
@@ -373,37 +397,40 @@ async fn register_over_mcp_assigns_a_numbered_name_for_a_provider() {
     let (_, one) = rpc(
         &app,
         "tools/call",
-        call(json!({"provider": "claude_code", "description": "reviews PRs"})),
+        call(json!({"agent": "Orion", "provider": "claude_code", "description": "reviews PRs"})),
     )
     .await;
     assert_eq!(one["result"]["isError"], false, "{one}");
-    assert_eq!(out(&one)["agent"], "claude_code_1");
+    assert_eq!(out(&one)["agent"], "Orion");
     assert_eq!(out(&one)["created"], true);
+    assert_eq!(out(&one)["provider"], "claude_code");
     assert_eq!(out(&one)["description"], "reviews PRs");
 
-    let (_, two) = rpc(&app, "tools/call", call(json!({"provider": "Claude_Code"}))).await;
-    assert_eq!(
-        out(&two)["agent"],
-        "claude_code_2",
-        "provider is lowercased"
-    );
+    let (_, two) = rpc(&app, "tools/call", call(json!({"agent": "orion"}))).await;
+    assert_eq!(two["result"]["isError"], true, "{two}");
+    assert_eq!(out(&two)["error"], "name_taken");
+    assert_eq!(out(&two)["agent"], "Orion");
+    assert_eq!(out(&two)["suggestions"].as_array().unwrap().len(), 5);
 
-    let (_, again) = rpc(&app, "tools/call", call(json!({"agent": "claude_code_1"}))).await;
-    assert_eq!(out(&again)["agent"], "claude_code_1");
-    assert_eq!(out(&again)["created"], false, "agent refreshes a held name");
+    let (_, again) = rpc(
+        &app,
+        "tools/call",
+        call(json!({"agent": "orion", "reclaim": "true"})),
+    )
+    .await;
+    assert_eq!(out(&again)["agent"], "Orion");
+    assert_eq!(out(&again)["created"], false);
     assert_eq!(
         out(&again)["description"],
         "reviews PRs",
-        "a refresh without a description keeps the stored one"
+        "a reclaim without a description keeps the stored one"
     );
 
-    for bad in [json!({}), json!({"provider": null})] {
+    for bad in [json!({}), json!({"provider": "claude_code"})] {
         let (_, resp) = rpc(&app, "tools/call", call(bad)).await;
         assert_eq!(resp["result"]["isError"], true, "{resp}");
-        assert_eq!(out(&resp)["error"], "invalid_body");
+        assert_eq!(out(&resp)["error"], "invalid_name");
     }
-    let (_, resp) = rpc(&app, "tools/call", call(json!({"provider": "-cursor"}))).await;
-    assert_eq!(out(&resp)["error"], "invalid_name");
 
     let (_, list) = rpc(
         &app,
@@ -414,7 +441,9 @@ async fn register_over_mcp_assigns_a_numbered_name_for_a_provider() {
     let roster: Value =
         serde_json::from_str(list["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(roster["agents"][0]["description"], "reviews PRs");
+    assert_eq!(roster["agents"][0]["provider"], "claude_code");
     assert_eq!(roster["agents"][0]["queued"], 0);
+    assert_eq!(roster["suggestions"].as_array().unwrap().len(), 5);
 }
 
 #[tokio::test]
@@ -449,7 +478,7 @@ async fn dns_rebinding_host_gets_403() {
 }
 
 #[tokio::test]
-async fn agents_are_told_reads_delete_and_unread_mail_expires() {
+async fn agents_are_told_how_names_reads_and_retention_work() {
     let (_d, app) = app();
     let (_, init) = rpc(
         &app,
@@ -458,21 +487,80 @@ async fn agents_are_told_reads_delete_and_unread_mail_expires() {
     )
     .await;
     let instructions = init["result"]["instructions"].as_str().unwrap();
-    assert!(
-        instructions.contains("deletes the messages it returns"),
-        "{instructions}"
-    );
-    assert!(
-        instructions.contains("expire 1 hour after"),
-        "{instructions}"
-    );
-    assert!(instructions.contains("for 1 day"), "{instructions}");
+    for phrase in [
+        "a name of your own",
+        "name_taken",
+        "reclaim: true",
+        "marks them read",
+        "history shows",
+        "Unread messages wait until they are read",
+        "kept for 1 day after they are read",
+        "for 1 day is dropped",
+        "held for 10 minutes",
+    ] {
+        assert!(instructions.contains(phrase), "{phrase:?}: {instructions}");
+    }
     assert!(!instructions.contains("ack_ids"), "{instructions}");
 
     let (_, list) = rpc(&app, "tools/list", json!({})).await;
     let tools = list["result"]["tools"].as_array().unwrap();
     let inbox = tools.iter().find(|t| t["name"] == "check_inbox").unwrap();
     assert!(inbox["inputSchema"]["properties"].get("ack_ids").is_none());
+}
+
+#[tokio::test]
+async fn agents_are_told_when_to_wait_and_how_to_mark_what_they_need() {
+    let (_d, app) = app();
+    let (_, init) = rpc(
+        &app,
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}),
+    )
+    .await;
+    let instructions = init["result"]["instructions"].as_str().unwrap();
+    for phrase in [
+        // The four cases, each with an example request.
+        "1. Tell.",
+        "tell Orion the tests pass",
+        "2. Ask, answer can wait.",
+        "ask Lyra to look at the flaky test when she can",
+        "3. Ask, answer needed now.",
+        "ask Vega which port the API uses",
+        "4. Conversation.",
+        "debug this with Vega",
+        // How to wait, and when to stop.
+        "check_inbox with wait_ms 30000",
+        "After 10 empty calls",
+        "Finish with a message marked",
+        // The markers, for senders and for recipients.
+        "\"No reply needed\"",
+        "\"Reply when you can\"",
+        "\"Waiting for your reply\"",
+        "the sender is blocked on you",
+        // Recovering mail a failed pull already marked read.
+        "If check_inbox fails or times out",
+    ] {
+        assert!(instructions.contains(phrase), "{phrase:?}: {instructions}");
+    }
+    assert!(
+        !instructions.contains("expire"),
+        "unread mail has no expiry to mention: {instructions}"
+    );
+
+    let (_, list) = rpc(&app, "tools/list", json!({})).await;
+    let tools = list["result"]["tools"].as_array().unwrap();
+    let described = |tool: &str| {
+        tools.iter().find(|t| t["name"] == tool).unwrap()["description"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let send = described("send_message");
+    assert!(send.contains("Waiting for your reply"), "{send}");
+    assert!(send.contains("wait_ms 30000"), "{send}");
+    let inbox = described("check_inbox");
+    assert!(inbox.contains("wait_ms 30000"), "{inbox}");
+    assert!(inbox.contains("up to 10 times"), "{inbox}");
 }
 
 #[tokio::test]
@@ -541,8 +629,9 @@ async fn a_non_string_name_is_invalid_body() {
     let (_d, app) = app();
     let call = |name: &str, args: Value| json!({ "name": name, "arguments": args });
     for (tool, args) in [
-        ("register", json!({"provider": 5})),
+        ("register", json!({"agent": "a", "provider": 5})),
         ("register", json!({"agent": ["a"]})),
+        ("history", json!({"agent": "a", "with": 3})),
         ("send_message", json!({"from": 1, "to": "b", "body": "x"})),
         ("check_inbox", json!({"agent": true})),
     ] {

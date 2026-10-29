@@ -1,25 +1,20 @@
-//! Bus behavior tests: roster semantics, caps, delete-on-read delivery, waiter
+//! Bus behavior tests: roster semantics, caps, read-marking delivery, waiter
 //! races, crash recovery, and mutex stress — all in-process against tempdirs.
+//! Chosen names and holds are in `tests/names.rs`, history in
+//! `tests/history.rs`, and lifetimes and on-disk scrubbing in
+//! `tests/retention.rs`.
+
+mod common;
 
 use std::sync::Arc;
 
-use mentischat::bus::Bus;
+use common::{fresh_bus, name, reclaim, stats};
+use mentischat::bus::{Bus, Registration};
 use mentischat::errors::MailboxError;
 use mentischat::names::AgentName;
 
-fn name(s: &str) -> AgentName {
-    AgentName::parse(s).expect("valid test name")
-}
-
-fn fresh_bus(tag: &str) -> (tempfile::TempDir, Arc<Bus>) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let data = dir.path().join(tag);
-    let b = Bus::new(&data).expect("bus opens");
-    (dir, Arc::new(b))
-}
-
 #[tokio::test]
-async fn register_is_idempotent_and_keeps_unread_mail() {
+async fn reclaiming_a_registered_name_keeps_its_unread_mail() {
     let (_d, bus) = fresh_bus("idem");
     bus.register(&name("grok")).await.unwrap();
     bus.register(&name("opencode")).await.unwrap();
@@ -27,11 +22,11 @@ async fn register_is_idempotent_and_keeps_unread_mail() {
         .await
         .unwrap();
 
-    let again = bus.register(&name("grok")).await.unwrap();
+    let again = bus.register_with(&name("grok"), reclaim()).await.unwrap();
     assert!(!again.created);
 
     let page = bus.check_inbox(&name("grok"), 0).await.unwrap();
-    assert_eq!(page.messages.len(), 1, "queue survived re-register");
+    assert_eq!(page.messages.len(), 1, "queue survived the reclaim");
 }
 
 #[tokio::test]
@@ -55,17 +50,25 @@ async fn send_between_two_names() {
 }
 
 #[tokio::test]
-async fn a_read_message_is_gone() {
+async fn a_read_message_is_pulled_once_and_kept_as_read() {
     let (_d, bus) = fresh_bus("readonce");
     bus.register(&name("a")).await.unwrap();
     bus.register(&name("b")).await.unwrap();
-    bus.send(&name("a"), &name("b"), "m1".into()).await.unwrap();
+    let receipt = bus.send(&name("a"), &name("b"), "m1".into()).await.unwrap();
+    assert_eq!(bus.stats().await.unwrap(), stats(2, 1, 0));
 
     let p1 = bus.check_inbox(&name("b"), 0).await.unwrap();
     assert_eq!(p1.messages.len(), 1);
+    let read_at = p1.messages[0].read_at.clone().expect("marked read");
+    assert!(read_at >= receipt.created_at);
     let p2 = bus.check_inbox(&name("b"), 0).await.unwrap();
-    assert!(p2.messages.is_empty(), "delivered once, then deleted");
-    assert_eq!(bus.stats().await.unwrap(), (2, 0), "nothing kept");
+    assert!(p2.messages.is_empty(), "check_inbox returns it once");
+    assert_eq!(bus.stats().await.unwrap(), stats(2, 0, 1), "kept as read");
+    assert_eq!(
+        bus.list_agents().await.unwrap().agents[1].queued,
+        0,
+        "queued counts unread mail only"
+    );
 }
 
 #[tokio::test]
@@ -266,7 +269,8 @@ async fn only_oldest_waiter_gets_the_batch() {
     let p1 = t1.await.unwrap().unwrap();
     let p2 = t2.await.unwrap().unwrap();
     assert_eq!(p1.messages.len(), 1);
-    // Read means gone: the other pull under the same name times out empty.
+    // check_inbox hands a message out once: the other pull under the same
+    // name times out empty.
     assert!(p2.messages.is_empty());
 }
 
@@ -350,7 +354,7 @@ async fn crash_reopen_preserves_roster_and_rows() {
     drop(bus);
 
     let bus = Bus::new(&data).unwrap();
-    let roster = bus.list_agents().await.unwrap();
+    let roster = bus.list_agents().await.unwrap().agents;
     assert_eq!(roster.len(), 2, "roster survives a crash (no shutdown)");
     let page = bus.check_inbox(&name("b"), 0).await.unwrap();
     assert_eq!(
@@ -367,20 +371,27 @@ async fn graceful_shutdown_discards_roster_and_mail() {
     let bus = Bus::new(&data).unwrap();
     bus.register(&name("a")).await.unwrap();
     bus.register(&name("b")).await.unwrap();
+    bus.send(&name("a"), &name("b"), "read".into())
+        .await
+        .unwrap();
+    bus.check_inbox(&name("b"), 0).await.unwrap();
     bus.send(&name("a"), &name("b"), "gone".into())
         .await
         .unwrap();
+    bus.deregister(&name("a")).await.unwrap();
 
     bus.shutdown().await.unwrap();
 
     let bus = Bus::new(&data).unwrap();
     assert!(
-        bus.list_agents().await.unwrap().is_empty(),
+        bus.list_agents().await.unwrap().agents.is_empty(),
         "graceful shutdown clears the roster"
     );
-    let (agents, pending) = bus.stats().await.unwrap();
-    assert_eq!(agents, 0);
-    assert_eq!(pending, 0, "graceful shutdown discards undelivered mail");
+    assert_eq!(
+        bus.stats().await.unwrap(),
+        stats(0, 0, 0),
+        "graceful shutdown discards read and unread mail"
+    );
 }
 
 #[tokio::test]
@@ -401,7 +412,7 @@ async fn concurrent_send_check_never_dups_or_drops() {
             b.check_inbox(&name("receiver"), 0).await.unwrap()
         }));
     }
-    // Delete-on-read is exactly-once: no id may ever arrive twice.
+    // check_inbox is exactly-once: no id may ever arrive twice.
     for t in tasks {
         for msg in t.await.unwrap().messages {
             assert!(seen.insert(msg.id), "duplicate delivery");
@@ -560,7 +571,7 @@ async fn overview_counts_messages_sent_even_after_they_are_read_or_discarded() {
 async fn overview_does_not_count_rejected_sends_or_reregistration() {
     let (_d, bus) = fresh_bus("overview_rejected");
     bus.register(&name("a")).await.unwrap();
-    bus.register(&name("a")).await.unwrap();
+    assert!(bus.register(&name("a")).await.is_err(), "name_taken");
     assert!(bus
         .send(&name("a"), &name("ghost"), "x".into())
         .await
@@ -597,211 +608,61 @@ async fn overview_fails_once_the_bus_is_closed() {
 }
 
 #[tokio::test]
-async fn description_is_set_kept_and_cleared_by_register() {
-    use mentischat::bus::Registration;
+async fn description_and_provider_are_set_kept_and_cleared_by_register() {
     let (_d, bus) = fresh_bus("describe");
     let set = |d: &str| Registration {
         description: Some(d.into()),
+        reclaim: true,
+        ..Registration::default()
     };
 
     let out = bus
-        .register_with(&name("grok"), set("reviews PRs"))
+        .register_with(
+            &name("grok"),
+            Registration {
+                description: Some("reviews PRs".into()),
+                provider: Some(mentischat::names::Provider::parse("Grok_Build").unwrap()),
+                reclaim: false,
+            },
+        )
         .await
         .unwrap();
     assert!(out.created);
     assert_eq!(out.description.as_deref(), Some("reviews PRs"));
+    assert_eq!(out.provider.as_deref(), Some("grok_build"), "lowercased");
 
-    let kept = bus.register(&name("grok")).await.unwrap();
+    let kept = bus.register_with(&name("grok"), reclaim()).await.unwrap();
     assert_eq!(
         kept.description.as_deref(),
         Some("reviews PRs"),
         "a register without a description keeps the stored one"
     );
+    assert_eq!(kept.provider.as_deref(), Some("grok_build"));
 
     bus.register_with(&name("grok"), set("writes docs"))
         .await
         .unwrap();
-    let roster = bus.list_agents().await.unwrap();
+    let roster = bus.list_agents().await.unwrap().agents;
     assert_eq!(roster[0].description.as_deref(), Some("writes docs"));
+    assert_eq!(roster[0].provider.as_deref(), Some("grok_build"));
 
     let cleared = bus.register_with(&name("grok"), set("")).await.unwrap();
     assert_eq!(cleared.description, None, "an empty description clears it");
-    assert_eq!(bus.list_agents().await.unwrap()[0].description, None);
-}
-
-fn provider(raw: &str) -> mentischat::names::Provider {
-    mentischat::names::Provider::parse(raw).unwrap()
+    assert_eq!(bus.list_agents().await.unwrap().agents[0].description, None);
 }
 
 #[tokio::test]
-async fn provider_register_assigns_increasing_numbers_and_never_reuses_one() {
-    use mentischat::bus::Registration;
-    let (_d, bus) = fresh_bus("provider_numbers");
-    let claude = provider("claude_code");
-
-    let first = bus
-        .register_provider(
-            &claude,
-            Registration {
-                description: Some("claude code".into()),
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(first.agent, "claude_code_1");
-    assert!(first.created);
-    assert_eq!(first.description.as_deref(), Some("claude code"));
-
-    let second = bus
-        .register_provider(&claude, Registration::default())
-        .await
-        .unwrap();
-    assert_eq!(second.agent, "claude_code_2");
-
-    let other = bus
-        .register_provider(&provider("cursor"), Registration::default())
-        .await
-        .unwrap();
-    assert_eq!(other.agent, "cursor_1", "numbering is per provider");
-
-    bus.deregister(&name("claude_code_1")).await.unwrap();
-    let refill = bus
-        .register_provider(&claude, Registration::default())
-        .await
-        .unwrap();
-    assert_eq!(
-        refill.agent, "claude_code_3",
-        "a freed number is not reused"
-    );
-
-    bus.register(&name("claude_code_7")).await.unwrap();
-    bus.deregister(&name("claude_code_7")).await.unwrap();
-    let after_explicit = bus
-        .register_provider(&claude, Registration::default())
-        .await
-        .unwrap();
-    assert_eq!(
-        after_explicit.agent, "claude_code_8",
-        "an explicitly registered number counts too, even once freed"
-    );
-}
-
-#[tokio::test]
-async fn a_client_holding_a_freed_name_cannot_read_the_next_agents_mail() {
-    use mentischat::bus::Registration;
-    let (_d, bus) = fresh_bus("provider_stale");
-    let claude = provider("claude_code");
-    let stale = bus
-        .register_provider(&claude, Registration::default())
-        .await
-        .unwrap()
-        .agent;
-    bus.deregister(&name(&stale)).await.unwrap();
-
-    let fresh = bus
-        .register_provider(&claude, Registration::default())
-        .await
-        .unwrap()
-        .agent;
-    bus.register(&name("peer")).await.unwrap();
-    bus.send(&name("peer"), &name(&fresh), "for the new agent".into())
-        .await
-        .unwrap();
-
-    assert!(matches!(
-        bus.check_inbox(&name(&stale), 0).await,
-        Err(MailboxError::Unregistered { .. })
-    ));
-    let page = bus.check_inbox(&name(&fresh), 0).await.unwrap();
-    assert_eq!(page.messages.len(), 1, "the new agent still has its mail");
-}
-
-#[tokio::test]
-async fn provider_register_reports_an_exhausted_number_space() {
-    use mentischat::bus::Registration;
-    let (_d, bus) = fresh_bus("provider_exhausted");
-    bus.register(&name(&format!("cursor_{}", u64::MAX)))
-        .await
-        .unwrap();
-    assert!(matches!(
-        bus.register_provider(&provider("cursor"), Registration::default())
-            .await,
-        Err(MailboxError::InvalidName { .. })
-    ));
-}
-
-#[tokio::test]
-async fn provider_numbering_ignores_names_that_only_look_numbered() {
-    use mentischat::bus::Registration;
-    let (_d, bus) = fresh_bus("provider_lookalikes");
-    for taken in [
-        "claude_code_01",
-        "claude_code_x",
-        "claude_code_1_2",
-        "claude",
-    ] {
-        bus.register(&name(taken)).await.unwrap();
-    }
-    let out = bus
-        .register_provider(&provider("claude_code"), Registration::default())
-        .await
-        .unwrap();
-    assert_eq!(out.agent, "claude_code_1");
-}
-
-#[tokio::test]
-async fn concurrent_provider_registers_get_distinct_names() {
-    use mentischat::bus::Registration;
-    let (_d, bus) = fresh_bus("provider_race");
-    let bus = std::sync::Arc::new(bus);
-    let handles: Vec<_> = (0..16)
-        .map(|_| {
-            let bus = bus.clone();
-            tokio::spawn(async move {
-                bus.register_provider(&provider("codex"), Registration::default())
-                    .await
-                    .unwrap()
-                    .agent
-            })
-        })
-        .collect();
-    let mut names = Vec::new();
-    for h in handles {
-        names.push(h.await.unwrap());
-    }
-    names.sort_by_key(|n| n.trim_start_matches("codex_").parse::<u32>().unwrap());
-    let expected: Vec<String> = (1..=16).map(|n| format!("codex_{n}")).collect();
-    assert_eq!(names, expected);
-}
-
-#[tokio::test]
-async fn provider_register_stops_at_the_roster_cap() {
-    use mentischat::bus::{Registration, MAX_ROSTER};
-    let (_d, bus) = fresh_bus("provider_cap");
-    for _ in 0..MAX_ROSTER {
-        bus.register_provider(&provider("grok_build"), Registration::default())
-            .await
-            .unwrap();
-    }
-    assert!(matches!(
-        bus.register_provider(&provider("grok_build"), Registration::default())
-            .await,
-        Err(MailboxError::RosterFull { .. })
-    ));
-}
-
-#[tokio::test]
-async fn provider_register_rejects_a_bad_description_without_registering() {
-    use mentischat::bus::Registration;
-    let (_d, bus) = fresh_bus("provider_bad_description");
+async fn a_bad_description_registers_nothing() {
+    let (_d, bus) = fresh_bus("bad_description");
     let bad = Registration {
-        description: Some("line\nbreak".into()),
+        description: Some("x".repeat(257)),
+        ..Registration::default()
     };
     assert!(matches!(
-        bus.register_provider(&provider("cursor"), bad).await,
+        bus.register_with(&name("cursor"), bad).await,
         Err(MailboxError::InvalidDescription)
     ));
-    assert!(bus.list_agents().await.unwrap().is_empty());
+    assert!(bus.list_agents().await.unwrap().agents.is_empty());
 }
 
 #[tokio::test]
@@ -826,7 +687,7 @@ async fn a_send_that_fails_stores_nothing() {
     ));
     assert_eq!(
         bus.stats().await.unwrap(),
-        (2, 0),
+        stats(2, 0, 0),
         "the failed send left no message behind"
     );
 }
@@ -841,7 +702,7 @@ async fn list_agents_reports_queue_depth_without_delivering() {
             .await
             .unwrap();
     }
-    let roster = bus.list_agents().await.unwrap();
+    let roster = bus.list_agents().await.unwrap().agents;
     let queued: Vec<(String, i64)> = roster.iter().map(|e| (e.name.clone(), e.queued)).collect();
     assert_eq!(queued, [("a".to_string(), 0), ("b".to_string(), 3)]);
 
@@ -980,231 +841,80 @@ async fn delivery_order_survives_a_crash() {
     assert_eq!(bodies, ["first", "second"]);
 }
 
-fn bus_with(tag: &str, message_ttl: u64, agent_ttl: u64) -> (tempfile::TempDir, Arc<Bus>) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let retention = mentischat::bus::Retention {
-        message_ttl: std::time::Duration::from_secs(message_ttl),
-        agent_ttl: std::time::Duration::from_secs(agent_ttl),
+/// Case 4 of the agent instructions: each side sends, then waits with
+/// check_inbox (calling again after an empty result) until the other
+/// answers. No one has to prompt either agent between rounds.
+#[tokio::test]
+async fn two_agents_hold_a_conversation_by_waiting_on_each_other() {
+    async fn next_message(bus: &Bus, me: &str) -> String {
+        for _ in 0..10 {
+            let page = bus.check_inbox(&name(me), 300).await.unwrap();
+            if let Some(msg) = page.messages.into_iter().next() {
+                return msg.body;
+            }
+        }
+        panic!("{me} heard nothing after 10 waits");
+    }
+
+    let (_d, bus) = fresh_bus("conversation");
+    bus.register(&name("Vega")).await.unwrap();
+    bus.register(&name("Orion")).await.unwrap();
+
+    let orion = {
+        let bus = bus.clone();
+        tokio::spawn(async move {
+            for round in 0..3 {
+                let got = next_message(&bus, "Orion").await;
+                assert_eq!(got, format!("Waiting for your reply. ping {round}"));
+                bus.send(
+                    &name("Orion"),
+                    &name("Vega"),
+                    format!("Waiting for your reply. pong {round}"),
+                )
+                .await
+                .unwrap();
+            }
+            let last = next_message(&bus, "Orion").await;
+            assert!(last.starts_with("No reply needed"), "{last}");
+        })
     };
-    let b = Bus::with_retention(&dir.path().join(tag), retention).expect("bus opens");
-    (dir, Arc::new(b))
-}
-
-fn later(secs: u64) -> std::time::SystemTime {
-    std::time::SystemTime::now() + std::time::Duration::from_secs(secs)
-}
-
-#[tokio::test]
-async fn unread_mail_expires_after_the_message_ttl() {
-    let (_d, bus) = bus_with("expire", 3600, 86_400);
-    bus.register(&name("a")).await.unwrap();
-    bus.register(&name("b")).await.unwrap();
-    bus.send(&name("a"), &name("b"), "read me soon".into())
+    for round in 0..3 {
+        bus.send(
+            &name("Vega"),
+            &name("Orion"),
+            format!("Waiting for your reply. ping {round}"),
+        )
         .await
         .unwrap();
-
-    let early = bus.sweep_at(later(59 * 60)).await.unwrap();
-    assert!(early.is_empty(), "{early:?}");
-    let late = bus.sweep_at(later(61 * 60)).await.unwrap();
-    assert_eq!(late.expired, 1);
-    assert!(late.dropped_agents.is_empty(), "agents are not idle yet");
-    assert!(bus
-        .check_inbox(&name("b"), 0)
-        .await
-        .unwrap()
-        .messages
-        .is_empty());
-}
-
-#[tokio::test]
-async fn idle_agents_drop_off_the_roster_with_their_unread_mail() {
-    let (_d, bus) = bus_with("idle", 2 * 86_400, 3600);
-    bus.register(&name("a")).await.unwrap();
-    bus.register(&name("b")).await.unwrap();
-    bus.send(&name("a"), &name("b"), "never read".into())
-        .await
-        .unwrap();
-
-    let out = bus.sweep_at(later(2 * 3600)).await.unwrap();
-    assert_eq!(out.dropped_agents, ["a", "b"]);
-    assert_eq!(out.discarded, 1);
-    assert_eq!(out.expired, 0);
-    assert_eq!(bus.stats().await.unwrap(), (0, 0));
-    assert!(matches!(
-        bus.check_inbox(&name("b"), 0).await,
-        Err(MailboxError::Unregistered { .. })
-    ));
-}
-
-#[tokio::test]
-async fn an_agent_with_a_parked_pull_is_never_dropped() {
-    let (_d, bus) = bus_with("parked", 3600, 3600);
-    bus.register(&name("a")).await.unwrap();
-    bus.register(&name("b")).await.unwrap();
-    let b = bus.clone();
-    let parked = tokio::spawn(async move { b.check_inbox(&name("b"), 2_000).await });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let out = bus.sweep_at(later(2 * 3600)).await.unwrap();
-    assert_eq!(out.dropped_agents, ["a"], "b is waiting right now");
-    bus.send(&name("b"), &name("b"), "still here".into())
-        .await
-        .unwrap();
-    assert_eq!(parked.await.unwrap().unwrap().messages.len(), 1);
-}
-
-#[tokio::test]
-async fn clear_wipes_everything_and_close_keeps_it() {
-    let dir = tempfile::tempdir().unwrap();
-    let data = dir.path().join("lifecycle");
-
-    let bus = Bus::new(&data).unwrap();
-    bus.register(&name("a")).await.unwrap();
-    bus.register(&name("b")).await.unwrap();
-    bus.send(&name("a"), &name("b"), "kept".into())
-        .await
-        .unwrap();
-    bus.close().await; // MENTISCHAT_PERSIST=1: nothing is wiped
-    assert!(matches!(bus.stats().await, Err(MailboxError::ShuttingDown)));
-    drop(bus);
-
-    let bus = Bus::new(&data).unwrap();
-    assert_eq!(bus.stats().await.unwrap(), (2, 1), "close kept the mailbox");
-    assert_eq!(bus.clear().await.unwrap(), (1, 2));
-    assert_eq!(bus.stats().await.unwrap(), (0, 0));
-}
-
-/// Every byte under the data directory, so a test can assert some text is
-/// nowhere on disk (database, `-wal`, `-shm`).
-fn disk_bytes(dir: &std::path::Path) -> Vec<u8> {
-    let mut all = Vec::new();
-    for entry in std::fs::read_dir(dir).unwrap() {
-        all.extend(std::fs::read(entry.unwrap().path()).unwrap_or_default());
+        assert_eq!(
+            next_message(&bus, "Vega").await,
+            format!("Waiting for your reply. pong {round}")
+        );
     }
-    all
-}
+    bus.send(
+        &name("Vega"),
+        &name("Orion"),
+        "No reply needed. Done.".into(),
+    )
+    .await
+    .unwrap();
+    orion.await.unwrap();
 
-fn on_disk(dir: &std::path::Path, needle: &str) -> bool {
-    disk_bytes(dir)
-        .windows(needle.len())
-        .any(|w| w == needle.as_bytes())
-}
-
-#[tokio::test]
-async fn read_expired_and_shutdown_text_leaves_no_trace_on_disk() {
-    let dir = tempfile::tempdir().unwrap();
-    let data = dir.path().join("scrub");
-    let bus = Bus::new(&data).unwrap();
-    bus.register(&name("a")).await.unwrap();
-    bus.register(&name("b")).await.unwrap();
-
-    bus.send(&name("a"), &name("b"), "READ-CANARY-4f1c".into())
+    let page = bus
+        .history(&name("Vega"), Some(&name("Orion")), None)
         .await
         .unwrap();
-    assert!(on_disk(&data, "READ-CANARY-4f1c"), "unread mail is on disk");
-    bus.check_inbox(&name("b"), 0).await.unwrap();
-    assert!(
-        !on_disk(&data, "READ-CANARY-4f1c"),
-        "read mail lingered on disk"
-    );
-
-    bus.send(&name("a"), &name("b"), "EXPIRED-CANARY-9d2e".into())
-        .await
-        .unwrap();
-    bus.sweep_at(later(2 * 3600)).await.unwrap();
-    assert!(
-        !on_disk(&data, "EXPIRED-CANARY-9d2e"),
-        "expired mail lingered"
-    );
-
-    bus.register(&name("a")).await.unwrap();
-    bus.register(&name("b")).await.unwrap();
-    bus.send(&name("a"), &name("b"), "SHUTDOWN-CANARY-77aa".into())
-        .await
-        .unwrap();
-    bus.shutdown().await.unwrap();
-    assert!(
-        !on_disk(&data, "SHUTDOWN-CANARY-77aa"),
-        "shutdown left mail"
-    );
-}
-
-#[test]
-fn durations_parse_with_units_and_reject_junk() {
-    use mentischat::bus::parse_duration;
-    use std::time::Duration;
-    assert_eq!(parse_duration("90"), Ok(Duration::from_secs(90)));
-    assert_eq!(parse_duration("45s"), Ok(Duration::from_secs(45)));
-    assert_eq!(parse_duration("30m"), Ok(Duration::from_secs(1800)));
-    assert_eq!(parse_duration(" 1h "), Ok(Duration::from_secs(3600)));
-    assert_eq!(parse_duration("2d"), Ok(Duration::from_secs(172_800)));
-    for bad in [
-        "",
-        "0",
-        "0h",
-        "h",
-        "1.5h",
-        "-1",
-        "1w",
-        "1 h",
-        "99999999999999999999d",
-    ] {
-        assert!(parse_duration(bad).is_err(), "{bad:?} should not parse");
-    }
-}
-
-#[test]
-fn retention_defaults_and_sweep_interval() {
-    use mentischat::bus::Retention;
-    use std::time::Duration;
-    let r = Retention::from_settings(None, Some("")).unwrap();
-    assert_eq!(r, Retention::default());
-    assert_eq!(r.message_ttl, Duration::from_secs(3600));
-    assert_eq!(r.agent_ttl, Duration::from_secs(86_400));
-    assert_eq!(r.sweep_interval(), Duration::from_secs(60));
-    let short = Retention::from_settings(Some("20s"), None).unwrap();
-    assert_eq!(short.sweep_interval(), Duration::from_secs(5));
-    let err = Retention::from_settings(None, Some("forever")).unwrap_err();
-    assert!(err.contains("MENTISCHAT_AGENT_TTL"), "{err}");
-}
-
-#[tokio::test]
-async fn sending_counts_as_activity_for_the_agent_ttl() {
-    let (_d, bus) = bus_with("sender_alive", 2 * 86_400, 3600);
-    bus.register(&name("talker")).await.unwrap();
-    bus.register(&name("listener")).await.unwrap();
-    let before = bus.list_agents().await.unwrap()[1].last_seen.clone();
-    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    bus.send(&name("talker"), &name("listener"), "hi".into())
-        .await
-        .unwrap();
-    let after = bus.list_agents().await.unwrap()[1].last_seen.clone();
-    assert!(after > before, "send refreshed the sender's lastSeen");
-    // `listener` never called anything after register; `talker` just sent.
-    let at = std::time::SystemTime::now() + std::time::Duration::from_secs(3600)
-        - std::time::Duration::from_millis(1);
-    let out = bus.sweep_at(at).await.unwrap();
+    let bodies: Vec<&str> = page.messages.iter().map(|m| m.body.as_str()).collect();
     assert_eq!(
-        out.dropped_agents,
-        ["listener"],
-        "talker stays: it just sent"
-    );
-}
-
-#[tokio::test]
-async fn deregistered_inbox_text_leaves_no_trace_on_disk() {
-    let dir = tempfile::tempdir().unwrap();
-    let data = dir.path().join("dereg_scrub");
-    let bus = Bus::new(&data).unwrap();
-    bus.register(&name("a")).await.unwrap();
-    bus.register(&name("b")).await.unwrap();
-    bus.send(&name("a"), &name("b"), "DEREG-CANARY-31b0".into())
-        .await
-        .unwrap();
-    assert!(on_disk(&data, "DEREG-CANARY-31b0"));
-    assert_eq!(bus.deregister(&name("b")).await.unwrap().discarded, 1);
-    assert!(
-        !on_disk(&data, "DEREG-CANARY-31b0"),
-        "discarded inbox lingered"
+        bodies,
+        [
+            "Waiting for your reply. ping 0",
+            "Waiting for your reply. pong 0",
+            "Waiting for your reply. ping 1",
+            "Waiting for your reply. pong 1",
+            "Waiting for your reply. ping 2",
+            "Waiting for your reply. pong 2",
+            "No reply needed. Done.",
+        ]
     );
 }

@@ -24,6 +24,7 @@ fn dashboard() -> Dashboard {
 fn agent(name: &str, secs: i64, queued: i64) -> AgentOverview {
     AgentOverview {
         name: name.into(),
+        provider: None,
         description: None,
         seen_secs_ago: secs,
         queued,
@@ -215,6 +216,27 @@ fn agent_table_shows_descriptions_without_control_characters() {
         bare.contains('—'),
         "a missing description shows a dash: {bare}"
     );
+}
+
+#[test]
+fn agent_table_shows_the_provider_or_a_dash() {
+    let mut dash = dashboard();
+    let mut vega = agent("Vega", 3, 0);
+    vega.provider = Some("claude_code".into());
+    dash.update(vec![], overview(0, vec![vega, agent("Orion", 5, 0)]));
+    let out = rendered(&mut dash, 110, 30);
+    let header = out
+        .lines()
+        .find(|l| l.contains("LAST SEEN"))
+        .expect("table header");
+    assert!(header.contains("PROVIDER"), "{header}");
+    let row = out.lines().find(|l| l.contains("Vega")).expect("agent row");
+    assert!(row.contains("claude_code"), "{row}");
+    let row = out
+        .lines()
+        .find(|l| l.contains("Orion"))
+        .expect("agent row");
+    assert!(row.contains('—'), "{row}");
 }
 
 #[test]

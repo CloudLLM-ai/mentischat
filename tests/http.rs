@@ -113,7 +113,7 @@ async fn wake_and_wrapper_routes_are_gone() {
 }
 
 #[tokio::test]
-async fn inbox_get_deletes_what_it_returns() {
+async fn inbox_get_marks_what_it_returns_read() {
     let (_d, mut app) = app();
     register_two(&mut app).await;
     send(
@@ -125,9 +125,12 @@ async fn inbox_get_deletes_what_it_returns() {
     let (s, p1) = send(&mut app, req("GET", "/inboxes/b")).await;
     assert_eq!(s, 200);
     assert_eq!(p1["messages"][0]["body"], "m1");
+    assert!(p1["messages"][0]["readAt"].as_str().is_some(), "{p1}");
 
     let (_, p2) = send(&mut app, req("GET", "/inboxes/b")).await;
-    assert_eq!(p2["messages"].as_array().unwrap().len(), 0, "read once");
+    assert_eq!(p2["messages"].as_array().unwrap().len(), 0, "pulled once");
+    let (_, h) = send(&mut app, req("GET", "/history/b")).await;
+    assert_eq!(h["messages"][0]["body"], "m1", "kept as read: {h}");
 
     // There is nothing to acknowledge any more.
     let (s, v) = send(&mut app, post("/inboxes/b/ack", r#"{"ids":[]}"#)).await;
@@ -203,7 +206,8 @@ async fn overlapping_waits_one_post_one_delivery() {
         let page: Value = serde_json::from_slice(&bytes).unwrap();
         page["messages"][0]["id"].as_str().unwrap_or("").to_string()
     }
-    // The oldest waiter got the row and deleted it; the other times out empty.
+    // The oldest waiter got the row and marked it read; the other times out
+    // empty.
     let id1 = first_msg_id(t1.await.unwrap()).await;
     let id2 = first_msg_id(t2.await.unwrap()).await;
     assert!(!id1.is_empty());
@@ -261,9 +265,11 @@ async fn health_counts_rows_and_roster() {
     assert_eq!(h["ok"], true);
     assert_eq!(h["agents"], 2);
     assert_eq!(h["pending"], 1, "unread mail counts");
+    assert_eq!(h["read"], 0);
     send(&mut app, req("GET", "/inboxes/b")).await;
     let (_, h) = send(&mut app, req("GET", "/health")).await;
-    assert_eq!(h["pending"], 0, "read mail is gone");
+    assert_eq!(h["pending"], 0, "read mail is not pending");
+    assert_eq!(h["read"], 1, "read mail is kept");
 }
 
 #[tokio::test]
@@ -304,36 +310,105 @@ async fn register_accepts_a_description_and_lists_it() {
 }
 
 #[tokio::test]
-async fn register_by_provider_assigns_numbered_names() {
+async fn register_takes_a_chosen_name_and_refuses_a_taken_one() {
     let (_d, mut app) = app();
-    for expected in ["claude_code_1", "claude_code_2"] {
-        let (s, v) = send(
-            &mut app,
-            post(
-                "/agents",
-                r#"{"provider":"claude_code","description":"cli"}"#,
-            ),
-        )
-        .await;
-        assert_eq!(s, 200, "{v}");
-        assert_eq!(v["agent"], expected);
-        assert_eq!(v["created"], true);
-    }
+    let (s, v) = send(
+        &mut app,
+        post(
+            "/agents",
+            r#"{"agent":"Vega","provider":"Claude_Code","description":"cli"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["agent"], "Vega");
+    assert_eq!(v["provider"], "claude_code");
+    assert_eq!(v["created"], true);
 
-    let (s, v) = send(&mut app, post("/agents", r#"{"agent":"claude_code_2"}"#)).await;
-    assert_eq!((s, v["created"].as_bool()), (200, Some(false)));
+    let (s, v) = send(&mut app, post("/agents", r#"{"agent":"vega"}"#)).await;
+    assert_eq!((s, v["error"].as_str()), (409, Some("name_taken")), "{v}");
+    assert_eq!(v["agent"], "Vega");
+    assert_eq!(v["reason"], "registered");
+    assert_eq!(v["suggestions"].as_array().unwrap().len(), 5);
+
+    let (s, v) = send(
+        &mut app,
+        post("/agents", r#"{"agent":"vega","reclaim":true}"#),
+    )
+    .await;
+    assert_eq!((s, v["created"].as_bool()), (200, Some(false)), "{v}");
+    assert_eq!(v["provider"], "claude_code", "kept");
+
+    send(&mut app, req("DELETE", "/agents/Vega")).await;
+    let (s, v) = send(&mut app, post("/agents", r#"{"agent":"Vega"}"#)).await;
+    assert_eq!((s, v["reason"].as_str()), (409, Some("held")), "{v}");
+    assert!(v["heldUntil"].as_str().is_some(), "{v}");
+
+    let (_, v) = send(&mut app, req("GET", "/agents")).await;
+    assert_eq!(v["suggestions"].as_array().unwrap().len(), 5, "{v}");
 
     for (body, error) in [
-        (r#"{}"#, "invalid_body"),
-        (r#"{"provider":"-cursor"}"#, "invalid_name"),
+        (r#"{}"#, "invalid_name"),
+        (r#"{"provider":"cursor"}"#, "invalid_name"),
+        (r#"{"agent":"Lyra","provider":"-cursor"}"#, "invalid_name"),
+        (r#"{"agent":"Lyra","provider":7}"#, "invalid_body"),
+        (r#"{"agent":"Lyra","reclaim":"yes"}"#, "invalid_body"),
         (
-            r#"{"provider":"cursor","description":"a\nb"}"#,
+            r#"{"agent":"Lyra","description":"a\nb"}"#,
             "invalid_description",
         ),
     ] {
         let (s, v) = send(&mut app, post("/agents", body)).await;
         assert_eq!((s, v["error"].as_str()), (400, Some(error)), "{body}");
     }
+}
+
+#[tokio::test]
+async fn history_route_pages_and_rejects_bad_cursors() {
+    let (_d, mut app) = app();
+    register_two(&mut app).await;
+    for i in 0..10 {
+        let body = format!(r#"{{"from":"a","to":"b","body":"m{i}"}}"#);
+        send(&mut app, post("/messages", &body)).await;
+    }
+    let resp = app
+        .clone()
+        .oneshot(req("GET", "/history/a?with=B"))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.headers()
+            .get("cache-control")
+            .map(|v| v.to_str().unwrap()),
+        Some("no-store")
+    );
+    let bytes = BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+    let page: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(page["agent"], "a");
+    assert_eq!(page["messages"].as_array().unwrap().len(), 8);
+    assert_eq!(page["messages"][0]["body"], "m2");
+    assert!(page["messages"][0]["readAt"].is_null(), "unread so far");
+    let next = page["next"].as_i64().expect("an older page");
+
+    let (s, older) = send(&mut app, req("GET", &format!("/history/a?before={next}"))).await;
+    assert_eq!(s, 200);
+    assert_eq!(older["messages"][1]["body"], "m1");
+    assert!(older["next"].is_null(), "{older}");
+
+    for bad in ["0", "-1", "abc", "1.5", "%FF"] {
+        let (s, v) = send(&mut app, req("GET", &format!("/history/a?before={bad}"))).await;
+        assert_eq!(
+            (s, v["error"].as_str()),
+            (400, Some("invalid_cursor")),
+            "{bad}"
+        );
+    }
+    let (s, v) = send(&mut app, req("GET", "/history/a?with=-x")).await;
+    assert_eq!((s, v["error"].as_str()), (400, Some("invalid_name")), "{v}");
+    let (s, v) = send(&mut app, req("GET", "/history/ghost")).await;
+    assert_eq!((s, v["error"].as_str()), (404, Some("unregistered")), "{v}");
+    let (s, v) = send(&mut app, req("POST", "/history/a")).await;
+    assert_eq!((s, v["error"].as_str()), (405, Some("method_not_allowed")));
 }
 
 #[tokio::test]

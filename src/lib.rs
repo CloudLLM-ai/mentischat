@@ -5,14 +5,16 @@
 //! REST surface, served from a single loopback port. Nothing wakes an idle
 //! agent: mail is read when its recipient calls `check_inbox`.
 //!
-//! The daemon is a pipe, not a log or a store: a message is deleted the
-//! moment its recipient reads it, unread mail expires after an hour, idle
-//! agents leave the roster after a day, and everything is wiped at startup
-//! and on a clean stop. There is no history API.
+//! Agents register under names they choose. `check_inbox` hands each message
+//! out once and marks it read; `history` shows an agent what it sent and has
+//! read. Unread mail waits until it is read, read mail is kept a day after it
+//! was read, idle agents leave the roster after a day, and a name that leaves
+//! is held for its previous holder for ten minutes. Everything is wiped at
+//! startup and on a clean stop.
 //!
 //! The MCP wire protocol is supplied by the [`mcp`] crate (`cloudllm_mcp`);
-//! this crate owns mailbox semantics: roster, caps, delete-on-read batches,
-//! expiry, and blocking pulls.
+//! this crate owns mailbox semantics: roster, held names, caps, read
+//! marking, history, expiry, and blocking pulls.
 
 // The data directory permissions (0700/0600) and SIGTERM handling use
 // Unix-only APIs, so say so at compile time instead of failing with a wall of
@@ -22,6 +24,7 @@ compile_error!("mentischat targets Unix (macOS and Linux) only");
 
 pub mod bus;
 pub mod errors;
+pub mod instructions;
 pub mod names;
 pub mod rest;
 pub mod store;
@@ -63,7 +66,7 @@ pub const BIND_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 
 pub fn build_router(bus: Arc<bus::Bus>) -> axum::Router {
     let transport = StreamableHttpConfig::new(SERVER_NAME, SERVER_VERSION)
         .with_endpoint_path("/")
-        .with_instructions(tools::instructions(&bus.retention()));
+        .with_instructions(instructions::instructions(&bus.retention()));
 
     // These two entries are the whole allowlist. Swallowing a rejection here
     // would silently ship a filter that does not say what we think it says,
@@ -94,8 +97,8 @@ pub fn build_router(bus: Arc<bus::Bus>) -> axum::Router {
 }
 
 /// Reject anything whose peer address is not loopback. Bind is already
-/// 127.0.0.1; this is the PLAN defense-in-depth so a mis-bind cannot serve
-/// off-box on either MCP or REST.
+/// 127.0.0.1; this is defense in depth so a mis-bind cannot serve off-box on
+/// either MCP or REST.
 async fn loopback_only(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     request: Request,
@@ -119,7 +122,8 @@ async fn loopback_only(
 /// - `Sec-Fetch-Site`, when present, must be `same-origin` or `none`. A page
 ///   on another site that loads `http://127.0.0.1:9480/inboxes/...` as an
 ///   image sends a loopback `Host` and no `Origin`, but a `cross-site` fetch
-///   site; without this it would delete that inbox.
+///   site; without this it would mark that inbox's mail read, so its agent
+///   would never get it from `check_inbox`.
 async fn loopback_headers(headers: HeaderMap, request: Request, next: Next) -> Response {
     let present_and_foreign = |name: header::HeaderName, is_loopback: fn(&str) -> bool| {
         headers

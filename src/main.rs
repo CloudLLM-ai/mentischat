@@ -24,10 +24,12 @@ Serves MCP at /mcp and REST on 127.0.0.1:9480. Started from a terminal it paints
 a live view; set MENTISCHAT_PLAIN=1, or run it without a terminal, for plain logs.
 MENTISCHAT_DIR overrides the data directory (default ~/.cloudllm/mentischat).
 
-Mail is deleted when read. Unread mail expires after MENTISCHAT_MESSAGE_TTL
-(default 1h) and agents idle for MENTISCHAT_AGENT_TTL (default 24h) leave the
-roster; values are seconds or a number with s, m, h or d. Everything is wiped
-at startup and on a clean stop unless MENTISCHAT_PERSIST=1.";
+Unread mail waits until it is read. Read mail is deleted MENTISCHAT_READ_TTL
+(default 24h) after it was read. Agents idle for MENTISCHAT_AGENT_TTL (default
+24h) leave the roster with the mail sent to them, and a name that leaves is
+held for MENTISCHAT_NAME_HOLD (default 10m). Values are seconds or a number with s, m,
+h or d. Everything is wiped at startup and on a clean stop unless
+MENTISCHAT_PERSIST=1.";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -75,10 +77,7 @@ async fn run_daemon() -> ExitCode {
             .init();
     }
 
-    let retention = match Retention::from_settings(
-        std::env::var("MENTISCHAT_MESSAGE_TTL").ok().as_deref(),
-        std::env::var("MENTISCHAT_AGENT_TTL").ok().as_deref(),
-    ) {
+    let retention = match Retention::from_settings(|var| std::env::var(var).ok()) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("mentischat: {e}");
@@ -214,7 +213,7 @@ async fn run_daemon() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Expire unread mail and idle agents on the retention's interval until the
+/// Expire read mail and idle agents on the retention's interval until the
 /// bus closes.
 async fn sweep_forever(bus: Arc<Bus>) {
     let mut tick = tokio::time::interval(bus.retention().sweep_interval());
@@ -224,10 +223,10 @@ async fn sweep_forever(bus: Arc<Bus>) {
         match bus.sweep().await {
             Ok(out) if out.is_empty() => {}
             Ok(out) => tracing::info!(
-                expired = out.expired,
+                expired_read = out.expired_read,
                 discarded = out.discarded,
                 dropped = ?out.dropped_agents,
-                "expired unread mail and idle agents"
+                "expired read mail and idle agents"
             ),
             Err(mentischat::errors::MailboxError::ShuttingDown) => return,
             Err(e) => tracing::warn!(error = %e, "expiry sweep failed"),

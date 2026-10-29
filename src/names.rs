@@ -5,7 +5,9 @@ use std::fmt;
 use crate::errors::MailboxError;
 
 /// A roster name: 1–63 chars, starting `[a-zA-Z0-9]`, then
-/// `[a-zA-Z0-9._-]`.
+/// `[a-zA-Z0-9._-]`. The roster keeps the spelling it was registered with
+/// but compares names without regard to case, so `Vega` and `vega` are the
+/// same agent.
 ///
 /// Construct through [`AgentName::parse`] so every handler sees a validated
 /// value; the regex lives here, never in tool JSON schemas (local GGUF /
@@ -43,23 +45,22 @@ impl AgentName {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The name lowercased: the form two spellings of one name share.
+    pub fn folded(&self) -> String {
+        self.0.to_ascii_lowercase()
+    }
 }
 
-/// The product an agent runs in (`claude_code`, `cursor`), lowercased: the
-/// stem of the name the roster assigns it, `{provider}_{n}`.
-///
-/// At most [`MAX_PROVIDER_LEN`] characters, so the assigned name with any
-/// numeric suffix still fits the 63-character name limit.
+/// The harness or app an agent runs in (`claude_code`, `cursor`), lowercased.
+/// A label on the roster entry, shown in `list_agents` and the terminal view;
+/// it plays no part in the name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Provider(String);
 
-/// Longest provider: leaves room for `_` and a 20-digit (`u64`) suffix under
-/// the 63-character name limit.
-pub const MAX_PROVIDER_LEN: usize = 42;
-
 impl Provider {
-    /// Lowercase and validate a raw provider, or fail with
-    /// [`MailboxError::InvalidName`].
+    /// Lowercase and validate a raw provider (the same rules as
+    /// [`AgentName`]), or fail with [`MailboxError::InvalidName`].
     ///
     /// # Examples
     ///
@@ -69,13 +70,13 @@ impl Provider {
     /// assert_eq!(Provider::parse("Claude_Code").unwrap().as_str(), "claude_code");
     /// assert!(Provider::parse("").is_err());
     /// assert!(Provider::parse("-cursor").is_err());
-    /// assert!(Provider::parse(&"x".repeat(43)).is_err());
+    /// assert!(Provider::parse(&"x".repeat(64)).is_err());
     /// ```
     pub fn parse(raw: &str) -> Result<Self, MailboxError> {
         let lower = raw.to_ascii_lowercase();
         match AgentName::parse(&lower) {
-            Ok(_) if lower.len() <= MAX_PROVIDER_LEN => Ok(Self(lower)),
-            _ => Err(MailboxError::InvalidName { agent: echo(raw) }),
+            Ok(_) => Ok(Self(lower)),
+            Err(_) => Err(MailboxError::InvalidName { agent: echo(raw) }),
         }
     }
 
@@ -83,6 +84,72 @@ impl Provider {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// Names offered to agents that have not picked one: stars, constellations
+/// and moons. Agents may register any valid name; these are suggestions.
+pub const SUGGESTED_NAMES: [&str; 42] = [
+    "Alcyone",
+    "Aldebaran",
+    "Altair",
+    "Andromeda",
+    "Antares",
+    "Aquila",
+    "Arcturus",
+    "Callisto",
+    "Canopus",
+    "Capella",
+    "Carina",
+    "Cassiopeia",
+    "Castor",
+    "Charon",
+    "Corvus",
+    "Cygnus",
+    "Deneb",
+    "Draco",
+    "Electra",
+    "Europa",
+    "Ganymede",
+    "Hydra",
+    "Io",
+    "Lyra",
+    "Maia",
+    "Mira",
+    "Miranda",
+    "Oberon",
+    "Orion",
+    "Pegasus",
+    "Perseus",
+    "Phoenix",
+    "Polaris",
+    "Pollux",
+    "Regulus",
+    "Rigel",
+    "Sirius",
+    "Spica",
+    "Titan",
+    "Triton",
+    "Vega",
+    "Vela",
+];
+
+/// How many free names `list_agents` and `name_taken` offer.
+pub const SUGGESTION_COUNT: usize = 5;
+
+/// Up to [`SUGGESTION_COUNT`] names from [`SUGGESTED_NAMES`] for which
+/// `is_taken` is false, starting at a random point in the list so agents
+/// connecting together are not all offered the same first name.
+pub fn suggestions(is_taken: impl Fn(&str) -> bool) -> Vec<String> {
+    let start = (uuid::Uuid::new_v4().as_u128() % SUGGESTED_NAMES.len() as u128) as usize;
+    SUGGESTED_NAMES
+        .iter()
+        .cycle()
+        .skip(start)
+        .take(SUGGESTED_NAMES.len())
+        .filter(|name| !is_taken(name))
+        .take(SUGGESTION_COUNT)
+        .map(|name| (*name).to_string())
+        .collect()
 }
 
 /// The rejected input as echoed in `invalid_name`: at most 64 characters, so

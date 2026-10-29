@@ -15,7 +15,8 @@ use rusqlite::Connection;
 
 /// Open (creating if needed) `{data_dir}/pending.sqlite` with mode `0700`
 /// directory / `0600` file permissions, WAL journaling, and the mailbox
-/// schema applied.
+/// schema applied. Names in `roster.name`, `messages.sender` and
+/// `messages.recipient` compare without regard to ASCII case.
 pub fn open(data_dir: &Path) -> Result<Connection, StoreError> {
     fs::create_dir_all(data_dir).map_err(StoreError::Io)?;
     #[cfg(unix)]
@@ -42,24 +43,28 @@ pub fn open(data_dir: &Path) -> Result<Connection, StoreError> {
     conn.pragma_update(None, "synchronous", "NORMAL")
         .map_err(StoreError::Sqlite)?;
     // Overwrite deleted content with zeros instead of leaving it in free
-    // pages: read and expired messages must not be recoverable from the file.
+    // pages: expired, discarded and pruned messages must not be recoverable
+    // from the file.
     conn.pragma_update(None, "secure_delete", "ON")
         .map_err(StoreError::Sqlite)?;
 
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS roster (
-          name TEXT PRIMARY KEY,
-          last_seen TEXT NOT NULL,
-          description TEXT
+          name TEXT PRIMARY KEY COLLATE NOCASE,
+          provider TEXT,
+          description TEXT,
+          registered_at TEXT NOT NULL,
+          last_seen TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS messages (
           id TEXT PRIMARY KEY,
-          sender TEXT NOT NULL,
-          recipient TEXT NOT NULL,
+          sender TEXT NOT NULL COLLATE NOCASE,
+          recipient TEXT NOT NULL COLLATE NOCASE,
           body TEXT NOT NULL,
           created_at TEXT NOT NULL,
+          read_at TEXT,
           seq INTEGER NOT NULL
         );
         "#,
@@ -74,7 +79,8 @@ pub fn open(data_dir: &Path) -> Result<Connection, StoreError> {
     }
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_inbox ON messages (recipient, seq);
-         CREATE INDEX IF NOT EXISTS idx_created ON messages (created_at);",
+         CREATE INDEX IF NOT EXISTS idx_sent ON messages (sender, seq);
+         CREATE INDEX IF NOT EXISTS idx_read ON messages (read_at);",
     )
     .map_err(StoreError::Sqlite)?;
     Ok(conn)
@@ -82,10 +88,27 @@ pub fn open(data_dir: &Path) -> Result<Connection, StoreError> {
 
 /// The columns each table must have, in order.
 const SCHEMA: [(&str, &[&str]); 2] = [
-    ("roster", &["name", "last_seen", "description"]),
+    (
+        "roster",
+        &[
+            "name",
+            "provider",
+            "description",
+            "registered_at",
+            "last_seen",
+        ],
+    ),
     (
         "messages",
-        &["id", "sender", "recipient", "body", "created_at", "seq"],
+        &[
+            "id",
+            "sender",
+            "recipient",
+            "body",
+            "created_at",
+            "read_at",
+            "seq",
+        ],
     ),
 ];
 

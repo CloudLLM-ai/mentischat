@@ -99,7 +99,7 @@ skill and follow it.
 - Never use raw `String` constants as function parameters, control values, or
   discriminators.
 - Model every domain concept with enums that encode valid states at compile
-  time (message state `pending`/`in_flight`, error codes, wait outcomes).
+  time (`TakenReason`, error codes, wait outcomes).
 - Make enums ergonomic at the boundary with `FromStr`, `Display`, and serde;
   use `#[serde(rename_all = "snake_case")]` for consistent serialization.
 
@@ -201,7 +201,8 @@ pub struct Example {
 ## Testing conventions
 
 - Integration tests under `tests/` with clear behavioral names:
-  `unacked_in_flight_rows_redeliver_until_acked`.
+  `a_read_message_is_pulled_once_and_kept_as_read`. Shared helpers live in
+  `tests/common/mod.rs`.
 - Use temp dirs (never touch `~/.cloudllm/mentischat/` in tests); always clean up.
 - Cover success path, denial path, and restart/crash-reopen cases.
 - For wire behavior: test initialize handshake, tools/list shape, isError
@@ -218,7 +219,9 @@ pub struct Example {
 2. **Fail modes:** Do error bodies distinguish which agent/name failed and why?
 3. **Defaults:** What happens when optional parameters are omitted?
 4. **Delivery guarantees:** Can this change drop mail, duplicate rows, or tear
-   a batch? At-least-once + ack-before-delete is the invariant.
+   a batch? `check_inbox` hands each message out exactly once by marking it
+   read in the transaction that returns it; read mail stays for `history`
+   until the read TTL. Unread mail never expires on its own.
 5. **Regression surface:** Is there a test that would have caught this?
 6. **Concurrency:** Waiter FIFO, one-consumer-per-wake, park-under-mutex —
    still honored?
@@ -274,7 +277,7 @@ override generic best practices when they conflict.
   section, appended in random order instead of sorted by impact
 - Writing changelog lines that only restate the commit subject
 - Dual-writing chat traffic into MentisDB (the mailbox is not the ledger)
-- Adding a sixth MCP tool when five cover the contract
+- Adding a seventh MCP tool when the six cover the contract
 
 ## Version history
 

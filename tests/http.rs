@@ -415,3 +415,153 @@ async fn invalid_name_echo_is_capped() {
         v["agent"]
     );
 }
+
+#[tokio::test]
+async fn room_routes_happy_path() {
+    let (_d, mut app) = app();
+    register_two(&mut app).await;
+    let (s, v) = send(
+        &mut app,
+        post(
+            "/rooms",
+            r#"{"agent":"a","room":"Lobby","description":"chat"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(
+        (s, &v["room"], &v["members"]),
+        (200, &Value::from("Lobby"), &Value::from(vec!["a"]))
+    );
+
+    let (s, v) = send(&mut app, post("/rooms/lobby/members", r#"{"agent":"b"}"#)).await;
+    assert_eq!(s, 200);
+    assert_eq!(v["members"], serde_json::json!(["a", "b"]));
+
+    let (s, v) = send(
+        &mut app,
+        post(
+            "/messages",
+            r#"{"from":"a","room":"lobby","body":"hi room"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(s, 200);
+    assert_eq!(v["room"], "Lobby");
+
+    let (s, v) = send(&mut app, req("GET", "/inboxes/b")).await;
+    assert_eq!(s, 200);
+    assert_eq!(v["messages"][0]["room"], "Lobby");
+    assert_eq!(v["messages"][0]["body"], "hi room");
+
+    let (s, v) = send(&mut app, req("GET", "/history/b?room=lobby")).await;
+    assert_eq!(
+        (s, &v["messages"][0]["body"]),
+        (200, &Value::from("hi room"))
+    );
+
+    let (s, v) = send(&mut app, req("GET", "/rooms?agent=b")).await;
+    assert_eq!(s, 200);
+    assert_eq!(v["rooms"][0]["joined"], true);
+
+    let (s, v) = send(&mut app, req("DELETE", "/rooms/lobby/members/b")).await;
+    assert_eq!((s, &v["deleted"]), (200, &Value::from(false)));
+}
+
+#[tokio::test]
+async fn private_rooms_are_joined_by_invitation_over_rest() {
+    let (_d, mut app) = app();
+    register_two(&mut app).await;
+    send(
+        &mut app,
+        post("/rooms", r#"{"agent":"a","room":"den","private":true}"#),
+    )
+    .await;
+    let (s, v) = send(&mut app, post("/rooms/den/members", r#"{"agent":"b"}"#)).await;
+    assert_eq!((s, &v["error"]), (403, &Value::from("private_room")));
+    let (_, listed) = send(&mut app, req("GET", "/rooms?agent=b")).await;
+    assert_eq!(listed["rooms"], serde_json::json!([]));
+
+    let (s, _) = send(
+        &mut app,
+        post("/rooms/den/invitations", r#"{"agent":"a","invitee":"b"}"#),
+    )
+    .await;
+    assert_eq!(s, 200);
+    let (s, v) = send(&mut app, post("/rooms/den/members", r#"{"agent":"b"}"#)).await;
+    assert_eq!((s, &v["private"]), (200, &Value::from(true)));
+}
+
+#[tokio::test]
+async fn room_errors_map_to_contract_statuses() {
+    let (_d, mut app) = app();
+    register_two(&mut app).await;
+    send(&mut app, post("/rooms", r#"{"agent":"a","room":"den"}"#)).await;
+    let cases = [
+        (
+            post("/rooms", r#"{"agent":"b","room":"DEN"}"#),
+            409,
+            "room_exists",
+        ),
+        (
+            post("/rooms", r#"{"agent":"b","room":"-x"}"#),
+            400,
+            "invalid_room",
+        ),
+        (post("/rooms", r#"{"agent":"b"}"#), 400, "invalid_room"),
+        (post("/rooms", "not json"), 400, "invalid_body"),
+        (
+            post("/rooms/nowhere/members", r#"{"agent":"b"}"#),
+            404,
+            "room_not_found",
+        ),
+        (
+            post("/rooms/-x/members", r#"{"agent":"b"}"#),
+            400,
+            "invalid_room",
+        ),
+        (post("/rooms/den/members", "[]"), 400, "invalid_body"),
+        (
+            post("/rooms/den/members", r#"{"agent":"ghost"}"#),
+            404,
+            "unregistered",
+        ),
+        (
+            post("/rooms/den/invitations", r#"{"agent":"b","invitee":"a"}"#),
+            403,
+            "not_a_member",
+        ),
+        (req("DELETE", "/rooms/den/members/b"), 403, "not_a_member"),
+        (req("GET", "/rooms"), 400, "invalid_name"),
+        (req("GET", "/rooms?agent=ghost"), 404, "unregistered"),
+        (req("GET", "/history/b?room=den"), 403, "not_a_member"),
+        (
+            req("GET", "/history/a?room=den&with=b"),
+            400,
+            "invalid_body",
+        ),
+        (req("GET", "/history/a?room=-x"), 400, "invalid_room"),
+        (
+            post(
+                "/messages",
+                r#"{"from":"a","room":"den","to":"b","body":"x"}"#,
+            ),
+            400,
+            "invalid_body",
+        ),
+        (
+            post("/messages", r#"{"from":"b","room":"den","body":"x"}"#),
+            403,
+            "not_a_member",
+        ),
+        (req("GET", "/rooms/den/members"), 405, "method_not_allowed"),
+    ];
+    for (request, status, code) in cases {
+        let desc = format!("{} {}", request.method(), request.uri());
+        let (s, v) = send(&mut app, request).await;
+        assert_eq!(
+            (s, v["error"].as_str()),
+            (status, Some(code)),
+            "{desc}: {v}"
+        );
+    }
+}

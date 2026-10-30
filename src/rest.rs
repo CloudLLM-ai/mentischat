@@ -33,6 +33,10 @@ pub fn router(bus: Ctx) -> Router {
         // return.
         .route("/inboxes/{agent}", get(pull).head(method_not_allowed))
         .route("/history/{agent}", get(history))
+        .route("/rooms", post(create_room).get(list_rooms))
+        .route("/rooms/{room}/members", post(join_room))
+        .route("/rooms/{room}/members/{agent}", delete(leave_room))
+        .route("/rooms/{room}/invitations", post(invite))
         .route("/health", get(health))
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
@@ -144,7 +148,7 @@ async fn pull(
     }
 }
 
-/// `GET /history/{agent}?with=&before=` — same as the history tool.
+/// `GET /history/{agent}?with=&room=&before=` — same as the history tool.
 async fn history(
     State(bus): State<Ctx>,
     path: Result<Path<String>, PathRejection>,
@@ -166,10 +170,105 @@ async fn history(
         Ok(b) => b,
         Err(e) => return err_response(e),
     };
-    match bus.history(&agent, with.as_ref(), before).await {
+    let room = match crate::tools::optional_room(field("room").as_ref()) {
+        Ok(r) => r,
+        Err(e) => return err_response(e),
+    };
+    let page = match room {
+        Some(_) if with.is_some() => Err(MailboxError::InvalidBody),
+        Some(room) => bus.room_history(&agent, &room, before).await,
+        None => bus.history(&agent, with.as_ref(), before).await,
+    };
+    match page {
         Ok(page) => no_store_response(page),
         Err(e) => err_response(e),
     }
+}
+
+/// `POST /rooms` `{ "agent", "room", "private"?, "description"? }` — same as
+/// create_room.
+async fn create_room(State(bus): State<Ctx>, body: Result<Json<Value>, JsonRejection>) -> Response {
+    let v = match json_body(body) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    respond(crate::tools::create_room(&bus, &v).await)
+}
+
+/// `GET /rooms?agent=` — same as list_rooms.
+async fn list_rooms(
+    State(bus): State<Ctx>,
+    query: Result<Query<HashMap<String, String>>, QueryRejection>,
+) -> Response {
+    let Ok(Query(q)) = query else {
+        return err_response(MailboxError::InvalidBody);
+    };
+    let agent = q.get("agent").map_or(Value::Null, |a| json!(a));
+    respond(crate::tools::list_rooms(&bus, &json!({ "agent": agent })).await)
+}
+
+/// The `{room}` path segment, as `path_name` does for agents.
+#[allow(clippy::result_large_err)]
+fn path_room(path: Result<Path<String>, PathRejection>) -> Result<String, Response> {
+    path.map(|Path(raw)| raw).map_err(|_| {
+        err_response(MailboxError::InvalidRoom {
+            room: String::new(),
+        })
+    })
+}
+
+/// A request body that must be a JSON object, with the path's `room` set in
+/// it (the path wins over a `room` in the body).
+#[allow(clippy::result_large_err)]
+fn body_with_room(
+    body: Result<Json<Value>, JsonRejection>,
+    room: String,
+) -> Result<Value, Response> {
+    let mut v = json_body(body)?;
+    let Some(object) = v.as_object_mut() else {
+        return Err(err_response(MailboxError::InvalidBody));
+    };
+    object.insert("room".to_string(), Value::String(room));
+    Ok(v)
+}
+
+/// `POST /rooms/{room}/members` `{ "agent" }` — same as join_room.
+async fn join_room(
+    State(bus): State<Ctx>,
+    path: Result<Path<String>, PathRejection>,
+    body: Result<Json<Value>, JsonRejection>,
+) -> Response {
+    let v = match path_room(path).and_then(|room| body_with_room(body, room)) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    respond(crate::tools::join_room(&bus, &v).await)
+}
+
+/// `POST /rooms/{room}/invitations` `{ "agent", "invitee" }` — same as invite.
+async fn invite(
+    State(bus): State<Ctx>,
+    path: Result<Path<String>, PathRejection>,
+    body: Result<Json<Value>, JsonRejection>,
+) -> Response {
+    let v = match path_room(path).and_then(|room| body_with_room(body, room)) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    respond(crate::tools::invite(&bus, &v).await)
+}
+
+/// `DELETE /rooms/{room}/members/{agent}` — same as leave_room.
+async fn leave_room(
+    State(bus): State<Ctx>,
+    path: Result<Path<(String, String)>, PathRejection>,
+) -> Response {
+    let Ok(Path((room, agent))) = path else {
+        return err_response(MailboxError::InvalidRoom {
+            room: String::new(),
+        });
+    };
+    respond(crate::tools::leave_room(&bus, &json!({ "agent": agent, "room": room })).await)
 }
 
 /// `GET /health` — `{ ok, agents, pending, read }`; counts only.

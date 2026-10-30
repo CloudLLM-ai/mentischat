@@ -531,7 +531,8 @@ launchd retries every 30 seconds until the port is free.
 | `src/instructions.rs` | What agents are told when they connect: names, reply markers, when to wait |
 | `src/errors.rs`, `src/names.rs` | Typed mailbox errors; agent-name validation and the suggested names |
 | `src/tui/` | The terminal view: `mod.rs` (dashboard), `banner.rs`, `log_buffer.rs`, `terminal.rs` |
-| `tests/` | `bus`, `names`, `history`, `retention`, `rooms`, `budget`, `scale`, `pull_limit`, `stream`, `ws`, `http`, `mcp`, `engine`, `snapshot`, `tui`; shared helpers in `common/` |
+| `tests/` | `bus`, `names`, `history`, `retention`, `rooms`, `budget`, `scale`, `pull_limit`, `stream`, `ws`, `http`, `mcp`, `engine`, `snapshot`, `snapshot_fuzz`, `tui`; shared helpers in `common/` |
+| `fuzz/` | cargo-fuzz targets and their corpora (nightly; see Fuzzing) |
 | `benches/`, `examples/` | Criterion benches (`bus`, `rest`) and the HTTP load generator `http_load` |
 | `launchd/`, `skills/` | Optional launchd service; engineering-style notes |
 | `changelog.txt` | Release notes |
@@ -567,6 +568,33 @@ make ci             # what CI runs: fmt --check, check, clippy, test, doc
 `make build` and `make clippy` no longer rewrite your sources; `make fmt` and
 `make release` still do. GitHub Actions runs `make ci`'s steps on Linux and
 macOS, plus an MSRV check against the `rust-version` in `Cargo.toml`.
+
+## Fuzzing
+
+`fuzz/` holds [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets for
+everything that reads bytes it did not write, and a model-based one for the
+mailbox itself. It needs nightly and `cargo install cargo-fuzz`, and stays out
+of `make ci`:
+
+```bash
+make fuzz-build                              # build every target
+make fuzz-replay                             # replay the committed corpora (what CI runs)
+make fuzz TARGET=bus_ops FUZZ_SECONDS=300    # fuzz one target for five minutes
+cargo +nightly fuzz list                     # names, tool_json, snapshot_restore, ws_frame, bus_ops
+```
+
+| Target | Checks |
+|---|---|
+| `names` | agent, room and provider parsing against a hand-written grammar; round-trips; bounded error echo |
+| `tool_json` | arbitrary MCP tool arguments: only an unknown tool is an `Err`, every failure is JSON with a documented code |
+| `snapshot_restore` | arbitrary `snapshot.json`: caps hold, ids unique, next id past all, restore is a fixed point |
+| `ws_frame` | `ws::parse_frame` against a reference reading: documented errors only, `ref` echoed |
+| `bus_ops` | 128 operations against a naive reference model: results, error codes, delivery, history pages, stats |
+
+A crash lands in `fuzz/artifacts/`. Minimize it with `cargo +nightly fuzz tmin`,
+turn it into a named regression test in `tests/` (see `tests/snapshot_fuzz.rs`),
+fix it, and commit the input under `fuzz/corpus/<target>/`. CI replays the
+corpora on every push; `fuzz.yml` runs each target for five minutes every week.
 
 ## Performance
 

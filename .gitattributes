@@ -1,0 +1,2 @@
+# Fuzz corpus files are raw bytes: never convert line endings.
+fuzz/corpus/** -text

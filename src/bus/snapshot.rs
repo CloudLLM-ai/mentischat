@@ -19,6 +19,11 @@ use serde::{Deserialize, Serialize};
 use super::log::{json_len, Msg, Target};
 use super::rooms::{Member, Room, RoomState};
 use super::state::{convo_key, Agent, Hold, Key, State};
+use super::{
+    MAX_PENDING_PER_AGENT, MAX_ROOMS, MAX_ROOMS_PER_AGENT, MAX_ROOM_MEMBERS, MAX_ROSTER,
+    MAX_TOTAL_MESSAGES,
+};
+use crate::names::{AgentName, RoomName};
 
 /// File name of the snapshot inside the data directory.
 const SNAPSHOT_FILE: &str = "snapshot.json";
@@ -257,55 +262,50 @@ fn msg_rec(m: &Arc<Msg>) -> MsgRec {
     }
 }
 
-/// A [`State`] holding what `snapshot` described. Mail addressed to an agent
-/// that is not on the roster is dropped: it would have been discarded with
-/// the agent.
+/// The largest message id a snapshot may carry. Ids beyond it would leave no
+/// room to number what comes next, so such messages are dropped.
+const ID_LIMIT: u64 = u64::MAX / 2;
+
+/// A [`State`] holding what `snapshot` described. The file is trusted to be
+/// ours but not to be sane: names are validated, messages sorted by id and
+/// deduplicated, and every cap a live daemon enforces (roster, rooms,
+/// per-agent and per-room limits, the unread and total message counts, the
+/// byte budget) is applied again, skipping what does not fit and logging one
+/// warning. Mail addressed to an agent that is not on the roster is dropped:
+/// it would have been discarded with the agent.
 fn rebuild(snapshot: Snapshot) -> State {
     let state = State::new();
+    let mut skipped = 0usize;
     state.sent_by_gone.store(snapshot.messages_sent, Relaxed);
-    for rec in snapshot.agents {
-        let key = rec.name.to_ascii_lowercase();
-        let gen = state.next_gen.fetch_add(1, Relaxed);
-        let agent = Agent::new(
-            rec.name.into(),
-            gen,
-            rec.provider,
-            rec.description,
-            rec.registered_ms,
-            rec.last_seen_ms,
-        );
-        state.add_agent(key, Arc::new(agent));
-    }
+    skipped += restore_agents(&state, snapshot.agents);
     {
         let mut holds = state.holds.lock();
-        for rec in snapshot.holds {
-            let hold = Hold {
-                until_ms: rec.until_ms,
-                registered_ms: rec.registered_ms,
-            };
-            holds.insert(rec.key, hold);
+        for rec in snapshot.holds.into_iter().take(MAX_ROSTER as usize) {
+            holds.insert(
+                rec.key,
+                Hold {
+                    until_ms: rec.until_ms,
+                    registered_ms: rec.registered_ms,
+                },
+            );
         }
     }
     let mut messages = snapshot.messages;
-    messages.sort_unstable_by_key(|m| m.id);
-    let next_id = snapshot
-        .next_id
-        .max(messages.last().map_or(1, |m| m.id + 1));
-    state.next_id.0.store(next_id, Relaxed);
+    sort_dedupe(&mut messages);
+    let top = messages.last().map_or(0, |m| m.id.min(ID_LIMIT));
+    state.next_id.0.store(
+        snapshot.next_id.min(ID_LIMIT).max(top.saturating_add(1)),
+        Relaxed,
+    );
+    for rec in snapshot.rooms {
+        skipped += restore_room(&state, rec);
+    }
     let mut names: HashMap<String, Arc<str>> = HashMap::new();
     let mut read = Vec::new();
-    let next_after_rooms = snapshot
-        .rooms
-        .iter()
-        .flat_map(|r| r.messages.iter().map(|m| m.id + 1))
-        .max()
-        .unwrap_or(1);
-    state.next_id.0.fetch_max(next_after_rooms, Relaxed);
-    for rec in snapshot.rooms {
-        restore_room(&state, rec);
-    }
     for rec in messages {
-        restore_message(&state, &mut names, &mut read, rec);
+        if !restore_message(&state, &mut names, &mut read, rec) {
+            skipped += 1;
+        }
     }
     read.sort_by_key(|(_, m): &(String, Arc<Msg>)| m.read_at_ms());
     for (key, msg) in read {
@@ -318,22 +318,75 @@ fn rebuild(snapshot: Snapshot) -> State {
             }
         }
     }
+    if skipped > 0 {
+        tracing::warn!(
+            skipped,
+            "the snapshot held entries this build does not allow (limits, names, duplicate ids); they were dropped"
+        );
+    }
     state
 }
 
+/// Order messages by id and keep one of each id.
+fn sort_dedupe(messages: &mut Vec<MsgRec>) {
+    messages.sort_by_key(|m| m.id);
+    messages.dedup_by_key(|m| m.id);
+}
+
+/// Put the snapshot's agents on the roster, up to [`MAX_ROSTER`], skipping
+/// invalid or repeated names. Returns how many were skipped.
+fn restore_agents(state: &State, agents: Vec<AgentRec>) -> usize {
+    let mut skipped = 0;
+    for rec in agents {
+        let key = rec.name.to_ascii_lowercase();
+        if AgentName::parse(&rec.name).is_err()
+            || state.roster.get(&key).is_some()
+            || state.roster.len() >= MAX_ROSTER as usize
+        {
+            skipped += 1;
+            continue;
+        }
+        let gen = state.next_gen.fetch_add(1, Relaxed);
+        let agent = Agent::new(
+            rec.name.into(),
+            gen,
+            rec.provider,
+            rec.description,
+            rec.registered_ms,
+            rec.last_seen_ms,
+        );
+        state.add_agent(key, Arc::new(agent));
+    }
+    skipped
+}
+
 /// File one snapshot message where `State::send` would have, as read or
-/// unread as it was. Read ones are collected into `read`, with their recipient's key, for
-/// the caller to queue in read order.
+/// unread as it was. Read ones are collected into `read`, with their
+/// recipient's key, for the caller to queue in read order. False when it was
+/// dropped: unknown or invalid names, an id out of range, or a cap reached.
 fn restore_message(
     state: &State,
     names: &mut HashMap<String, Arc<str>>,
     read: &mut Vec<(String, Arc<Msg>)>,
     rec: MsgRec,
-) {
+) -> bool {
     let (from_key, to_key) = (rec.from.to_ascii_lowercase(), rec.to.to_ascii_lowercase());
     let Some(recipient) = state.roster.get(&to_key) else {
-        return;
+        return false;
     };
+    if rec.id > ID_LIMIT || AgentName::parse(&rec.from).is_err() {
+        return false;
+    }
+    let unread = rec.read_ms == 0;
+    let cost = rec.body.len() + super::MESSAGE_OVERHEAD_BYTES;
+    if state.total.0.load(Relaxed) >= MAX_TOTAL_MESSAGES as usize
+        || (unread
+            && (state.unread.0.load(Relaxed) >= MAX_TOTAL_MESSAGES as usize
+                || recipient.inner.lock().unread.len() >= MAX_PENDING_PER_AGENT as usize))
+        || !state.try_reserve_bytes(cost)
+    {
+        return false;
+    }
     let from: Arc<str> = state.roster.get(&from_key).map_or_else(
         || {
             names
@@ -368,33 +421,47 @@ fn restore_message(
         .lock()
         .push(msg.clone());
     state.total.0.fetch_add(1, Relaxed);
-    state.bytes.0.fetch_add(msg.cost(), Relaxed);
-    if rec.read_ms == 0 {
+    if unread {
         state.unread.0.fetch_add(1, Relaxed);
         recipient.inner.lock().unread.push_back(msg);
     } else {
         read.push((to_key, msg));
     }
+    true
 }
 
 /// Rebuild one room: its members that are still on the roster (each told
 /// where to look), its retained messages, and the unread counts those and
-/// the saved cursors imply.
-fn restore_room(state: &State, rec: RoomRec) {
-    let room_is_private = rec.private;
-    let name: Arc<str> = rec.name.into();
-    let mut st = RoomState {
-        invited: rec.invited.into_iter().collect(),
-        ..RoomState::default()
+/// the saved cursors imply. Returns how many entries it dropped for being
+/// invalid or over a cap (the whole room counts as one).
+fn restore_room(state: &State, rec: RoomRec) -> usize {
+    let Ok(room_name) = RoomName::parse(&rec.name) else {
+        return 1;
     };
-    for m in rec.messages {
+    let key = room_name.folded();
+    if state.rooms.get(&key).is_some() || state.rooms.len() >= MAX_ROOMS {
+        return 1;
+    }
+    let mut skipped = 0;
+    let room_is_private = rec.private;
+    let name: Arc<str> = room_name.as_str().into();
+    let mut messages = rec.messages;
+    sort_dedupe(&mut messages);
+    messages.retain(|m| m.id <= ID_LIMIT && AgentName::parse(&m.from).is_ok());
+    // Keep the newest a room holds.
+    let excess = messages.len().saturating_sub(state.room_capacity);
+    skipped += excess;
+    let mut st = RoomState::default();
+    let mut reserved = 0;
+    for m in messages.into_iter().skip(excess) {
+        let cost = m.body.len() + super::MESSAGE_OVERHEAD_BYTES;
+        if !state.try_reserve_bytes(cost) {
+            skipped += 1;
+            continue;
+        }
+        reserved += cost;
         let body: Box<str> = m.body.into();
         let body_len = json_len(&body);
-        state
-            .bytes
-            .0
-            .fetch_add(body.len() + super::MESSAGE_OVERHEAD_BYTES, Relaxed);
-        let from: Arc<str> = m.from.into();
         let target = Target {
             to: state.no_agent.clone(),
             to_gen: 0,
@@ -402,7 +469,7 @@ fn restore_room(state: &State, rec: RoomRec) {
         };
         st.log.push_back(Arc::new(Msg::new(
             m.id,
-            from,
+            m.from.into(),
             target,
             body,
             body_len,
@@ -414,6 +481,12 @@ fn restore_room(state: &State, rec: RoomRec) {
         let Some(agent) = state.roster.get(&m.name.to_ascii_lowercase()) else {
             continue;
         };
+        if st.members.len() >= MAX_ROOM_MEMBERS
+            || agent.inner.lock().rooms.len() >= MAX_ROOMS_PER_AGENT
+        {
+            skipped += 1;
+            continue;
+        }
         let unread = st
             .log
             .iter()
@@ -431,11 +504,19 @@ fn restore_room(state: &State, rec: RoomRec) {
         joined.push(agent);
     }
     if st.members.is_empty() {
-        return;
+        state.release_bytes(reserved);
+        return skipped + 1;
     }
+    let room_for_invites = MAX_ROOM_MEMBERS - st.members.len();
+    st.invited = rec
+        .invited
+        .into_iter()
+        .filter(|who| AgentName::parse(who).is_ok())
+        .take(room_for_invites)
+        .collect();
     st.publish_oldest();
     let room = Arc::new(Room {
-        name: name.clone(),
+        name,
         private: rec.private,
         description: rec.description,
         oldest: st.oldest.clone(),
@@ -447,16 +528,19 @@ fn restore_room(state: &State, rec: RoomRec) {
     let invited: Vec<String> = room.inner.lock().invited.iter().cloned().collect();
     for who in invited {
         if let Some(agent) = state.roster.get(&who) {
-            agent
-                .inner
-                .lock()
-                .invited_to
-                .insert(Key::fold(&room.name).as_str().to_string());
+            let mut st = agent.inner.lock();
+            if st.invited_to.len() < MAX_ROOMS_PER_AGENT {
+                st.invited_to.insert(key.clone());
+            }
         }
     }
-    let key = name.to_ascii_lowercase();
-    // A duplicate room name in a hand-edited snapshot keeps the first.
-    if state.rooms.try_insert(&key, room).is_ok() && !room_is_private {
-        state.public_names.write().insert(key);
+    if state.rooms.try_insert(&key, room).is_ok() {
+        if !room_is_private {
+            state.public_names.write().insert(key);
+        }
+    } else {
+        state.release_bytes(reserved);
+        skipped += 1;
     }
+    skipped
 }

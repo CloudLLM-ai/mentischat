@@ -116,3 +116,138 @@ async fn close_fails_parked_pulls_with_shutting_down() {
         Err(MailboxError::ShuttingDown)
     ));
 }
+
+/// Write `snapshot` as the snapshot of a data directory and open a bus on it.
+fn bus_from(snapshot: serde_json::Value) -> (tempfile::TempDir, Bus) {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("crafted");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(data.join("snapshot.json"), snapshot.to_string()).unwrap();
+    let bus = Bus::new(&data).expect("a sane-enough snapshot loads");
+    (dir, bus)
+}
+
+fn agent_rec(name: &str) -> serde_json::Value {
+    serde_json::json!({"name": name, "provider": null, "description": null,
+        "registered_ms": 1, "last_seen_ms": u64::MAX / 4})
+}
+
+fn msg_rec(id: u64, from: &str, to: &str, read_ms: u64) -> serde_json::Value {
+    serde_json::json!({"id": id, "from": from, "to": to, "body": format!("m{id}"),
+        "created_ms": 2, "read_ms": read_ms})
+}
+
+fn snapshot(
+    agents: &[&str],
+    messages: Vec<serde_json::Value>,
+    rooms: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "version": 1, "next_id": 1, "messages_sent": 0,
+        "agents": agents.iter().map(|a| agent_rec(a)).collect::<Vec<_>>(),
+        "holds": [], "messages": messages, "rooms": rooms,
+    })
+}
+
+#[tokio::test]
+async fn a_snapshot_with_huge_or_repeated_ids_loads_without_overflow() {
+    let (_d, bus) = bus_from(snapshot(
+        &["a", "b"],
+        vec![
+            msg_rec(u64::MAX, "a", "b", 0),
+            msg_rec(u64::MAX - 1, "a", "b", 0),
+            msg_rec(7, "a", "b", 0),
+            msg_rec(5, "a", "b", 0),
+            msg_rec(7, "a", "b", 0),
+        ],
+        vec![],
+    ));
+    let page = bus.check_inbox(&name("b"), 0).await.unwrap();
+    let bodies: Vec<&str> = page.messages.iter().map(|m| m.body.as_str()).collect();
+    assert_eq!(
+        bodies,
+        ["m5", "m7"],
+        "sorted, de-duplicated, impossible ids dropped"
+    );
+    // Numbering carries on without wrapping.
+    let receipt = bus
+        .send(&name("a"), &name("b"), "next".into())
+        .await
+        .unwrap();
+    assert!(receipt.id.parse::<u64>().unwrap() > 7);
+}
+
+#[tokio::test]
+async fn a_snapshot_is_held_to_the_caps_of_a_running_daemon() {
+    use mentischat::bus::{MAX_PENDING_PER_AGENT, MAX_ROOM_MEMBERS};
+    let too_many = MAX_PENDING_PER_AGENT as u64 + 100;
+    let room_msgs: Vec<_> = (1..=1100u64)
+        .rev()
+        .map(|id| {
+            serde_json::json!({"id": id, "from": "a", "to": "", "body": format!("r{id}"),
+            "created_ms": 2, "read_ms": 0})
+        })
+        .collect();
+    let members: Vec<_> = (0..MAX_ROOM_MEMBERS + 10)
+        .map(|i| serde_json::json!({"name": format!("m{i}"), "cursor": 0, "skipped": 0}))
+        .collect();
+    let names: Vec<String> = std::iter::once("a".to_string())
+        .chain((0..MAX_ROOM_MEMBERS + 10).map(|i| format!("m{i}")))
+        .chain(["b".to_string()])
+        .collect();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let (_d, bus) = bus_from(snapshot(
+        &names,
+        (1..=too_many).map(|i| msg_rec(i, "a", "b", 0)).collect(),
+        vec![
+            serde_json::json!({"name": "big", "private": false, "description": null,
+            "members": members, "invited": [], "messages": room_msgs}),
+        ],
+    ));
+
+    let stats = bus.stats().await.unwrap();
+    assert_eq!(
+        stats.unread, MAX_PENDING_PER_AGENT,
+        "per-recipient cap re-applied"
+    );
+
+    let room = mentischat::names::RoomName::parse("big").unwrap();
+    let listed = bus.list_rooms(&name("m0")).await.unwrap();
+    assert_eq!(listed.rooms[0].members, MAX_ROOM_MEMBERS, "members capped");
+    let page = bus.room_history(&name("m0"), &room, None).await.unwrap();
+    let newest = &page.messages.last().unwrap().body;
+    assert_eq!(
+        newest, "r1100",
+        "the log is sorted and keeps the newest 1024"
+    );
+    let mut count = page.messages.len();
+    let mut before = page.next;
+    while let Some(b) = before {
+        let page = bus.room_history(&name("m0"), &room, Some(b)).await.unwrap();
+        count += page.messages.len();
+        before = page.next;
+    }
+    assert_eq!(count, 1024);
+}
+
+#[tokio::test]
+async fn a_snapshot_with_invalid_names_or_repeated_agents_skips_them() {
+    let (_d, bus) = bus_from(snapshot(
+        &["ok", "OK", "-bad", "has space", &"x".repeat(80), "fine"],
+        vec![msg_rec(1, "ok", "fine", 0), msg_rec(2, "-bad", "fine", 0)],
+        vec![
+            serde_json::json!({"name": "-bad-room", "private": false, "description": null,
+            "members": [{"name": "ok", "cursor": 0, "skipped": 0}], "invited": [], "messages": []}),
+        ],
+    ));
+    let roster = bus.list_agents().await.unwrap();
+    let names: Vec<&str> = roster.agents.iter().map(|a| a.name.as_str()).collect();
+    assert_eq!(names, ["fine", "ok"]);
+    let page = bus.check_inbox(&name("fine"), 0).await.unwrap();
+    assert_eq!(
+        page.messages.len(),
+        1,
+        "mail from an invalid name is dropped"
+    );
+    assert!(bus.list_rooms(&name("ok")).await.unwrap().rooms.is_empty());
+}

@@ -91,27 +91,34 @@ async fn send_and_pull(bus: &Bus, iters: u64, body: &str) -> Duration {
     started.elapsed()
 }
 
-/// `tasks` pairs of agents on worker threads, each pair sending and pulling
-/// `iters / tasks` messages at the same time; the time the slowest took.
+/// `tasks` pairs of agents on worker threads, together sending and pulling
+/// exactly `iters` messages (the first `iters % tasks` pairs do one more), at
+/// the same time; the time from the start signal to the last pair finishing.
+/// Registration and task spawn happen before the clock starts.
 async fn contended(bus: std::sync::Arc<Bus>, tasks: u64, iters: u64, body: &str) -> Duration {
+    // Read mail from the previous call would pile up toward the row cap.
+    bus.clear().await.expect("clear");
+    let start = std::sync::Arc::new(tokio::sync::Barrier::new(tasks as usize + 1));
+    let mut workers = Vec::with_capacity(tasks as usize);
+    for t in 0..tasks {
+        let (bus, body, start) = (bus.clone(), body.to_string(), start.clone());
+        let (sender, reader) = (name(&format!("s{t}")), name(&format!("r{t}")));
+        for who in [&sender, &reader] {
+            bus.register(who).await.expect("register");
+        }
+        let share = iters / tasks + u64::from(t < iters % tasks);
+        workers.push(tokio::spawn(async move {
+            start.wait().await;
+            for _ in 0..share {
+                bus.send(&sender, &reader, body.clone())
+                    .await
+                    .expect("send");
+                black_box(bus.check_inbox(&reader, 0).await.expect("pull"));
+            }
+        }));
+    }
+    start.wait().await;
     let started = Instant::now();
-    let workers: Vec<_> = (0..tasks)
-        .map(|t| {
-            let (bus, body) = (bus.clone(), body.to_string());
-            tokio::spawn(async move {
-                let (sender, reader) = (name(&format!("s{t}")), name(&format!("r{t}")));
-                for who in [&sender, &reader] {
-                    bus.register(who).await.expect("register");
-                }
-                for _ in 0..iters / tasks {
-                    bus.send(&sender, &reader, body.clone())
-                        .await
-                        .expect("send");
-                    black_box(bus.check_inbox(&reader, 0).await.expect("pull"));
-                }
-            })
-        })
-        .collect();
     for worker in workers {
         worker.await.expect("worker");
     }
@@ -138,10 +145,8 @@ fn bench_contention(c: &mut Criterion) {
     for tasks in [1u64, 2, 4, 8, 16, 32] {
         group.bench_function(format!("{tasks}_pairs"), |b| {
             b.iter_custom(|iters| {
-                rt.block_on(contended(bus.clone(), tasks, iters.max(tasks), &body))
+                rt.block_on(contended(bus.clone(), tasks, iters, &body))
             });
-            // Read mail piles up toward the row cap otherwise.
-            rt.block_on(bus.clear()).expect("clear");
         });
     }
     group.finish();
@@ -203,16 +208,23 @@ fn bench_room_fanout(c: &mut Criterion) {
     group.warm_up_time(Duration::from_millis(500));
     group.measurement_time(Duration::from_secs(3));
     for members in [2usize, 16, 128] {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let bus = Bus::new(dir.path()).expect("bus opens");
-        let room = rt.block_on(room_with(&bus, members));
+        // A fresh mailbox and room per measurement call, built before the
+        // clock starts, so `send` leaves no backlog for `send_and_pull`.
+        let fresh = |pull: bool, iters: u64| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            rt.block_on(async {
+                let bus = Bus::new(dir.path()).expect("bus opens");
+                let room = room_with(&bus, members).await;
+                fan_out(&bus, &room, members, iters, pull, &body).await
+            })
+        };
         group.throughput(Throughput::Elements(1));
         group.bench_function(format!("send/{members}"), |b| {
-            b.iter_custom(|iters| rt.block_on(fan_out(&bus, &room, members, iters, false, &body)));
+            b.iter_custom(|iters| fresh(false, iters));
         });
         group.throughput(Throughput::Elements(members as u64 - 1));
         group.bench_function(format!("send_and_pull/{members}"), |b| {
-            b.iter_custom(|iters| rt.block_on(fan_out(&bus, &room, members, iters, true, &body)));
+            b.iter_custom(|iters| fresh(true, iters));
         });
     }
     group.finish();

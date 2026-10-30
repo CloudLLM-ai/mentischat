@@ -7,13 +7,14 @@
 //! `send` is one `POST /messages` to a room; `batch_64` is `POST
 //! /messages/batch` of 64 (throughput counts messages); `pull` is one
 //! `GET /inboxes/{agent}` returning a full page of 8, the messages having
-//! been sent straight to the bus outside the timed region.
+//! been sent straight to the bus outside the timed region (on a mailbox of its own, so
+//! the room backlog of the send benches does not count).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use http::Request;
 use mentischat::bus::Bus;
 use mentischat::names::{AgentName, RoomName};
@@ -59,58 +60,63 @@ fn bench_rest(c: &mut Criterion) {
     group.warm_up_time(Duration::from_millis(500));
     group.measurement_time(Duration::from_secs(3));
 
+    // Requests (and the router handle each one consumes) are built before the
+    // clock starts, so the timed region is the handler and nothing else.
+    let prebuilt = |path: &'static str, body: &str, n: u64| -> Vec<_> {
+        (0..n)
+            .map(|_| (app.clone(), post(path, body.to_string())))
+            .collect()
+    };
+    let drive = |reqs: Vec<(axum::Router, Request<Body>)>| {
+        rt.block_on(async {
+            let started = Instant::now();
+            for (app, req) in reqs {
+                std::hint::black_box(app.oneshot(req).await.expect("response"));
+            }
+            started.elapsed()
+        })
+    };
+
     group.throughput(Throughput::Elements(1));
     group.bench_function("send", |b| {
-        b.iter_custom(|iters| {
-            rt.block_on(async {
-                let started = Instant::now();
-                for _ in 0..iters {
-                    let resp = app.clone().oneshot(post("/messages", single.clone())).await;
-                    std::hint::black_box(resp.expect("response"));
-                }
-                started.elapsed()
-            })
-        });
+        b.iter_custom(|iters| drive(prebuilt("/messages", &single, iters)));
     });
     group.throughput(Throughput::Elements(64));
     group.bench_function("batch_64", |b| {
-        b.iter_custom(|iters| {
-            rt.block_on(async {
-                let started = Instant::now();
-                for _ in 0..iters {
-                    let resp = app
-                        .clone()
-                        .oneshot(post("/messages/batch", batch.clone()))
-                        .await;
-                    std::hint::black_box(resp.expect("response"));
-                }
-                started.elapsed()
-            })
-        });
+        b.iter_custom(|iters| drive(prebuilt("/messages/batch", &batch, iters)));
     });
+    // A mailbox of its own, so the room backlog the send benches leave behind
+    // does not turn this into a pull from a deep backlog.
+    let pull_dir = tempfile::tempdir().expect("tempdir");
+    let pull_bus = Arc::new(Bus::new(pull_dir.path()).expect("bus opens"));
+    rt.block_on(async {
+        pull_bus.register(&s).await.expect("register");
+        pull_bus.register(&r).await.expect("register");
+    });
+    let pull_app = mentischat::rest::router(pull_bus.clone());
     group.throughput(Throughput::Elements(8));
     group.bench_function("pull_8", |b| {
-        b.iter_custom(|iters| {
-            let mut total = Duration::ZERO;
-            for _ in 0..iters {
+        b.iter_batched(
+            || {
                 rt.block_on(async {
                     for _ in 0..8 {
-                        bus.send_room(&s, &room, BODY.to_string())
+                        pull_bus
+                            .send(&s, &r, BODY.to_string())
                             .await
                             .expect("send");
                     }
-                    let req = Request::builder()
-                        .uri("/inboxes/reader")
-                        .body(Body::empty())
-                        .expect("request");
-                    let started = Instant::now();
-                    let resp = app.clone().oneshot(req).await;
-                    std::hint::black_box(resp.expect("response"));
-                    total += started.elapsed();
                 });
-            }
-            total
-        });
+                let req = Request::builder()
+                    .uri("/inboxes/reader")
+                    .body(Body::empty())
+                    .expect("request");
+                (pull_app.clone(), req)
+            },
+            |(app, req)| {
+                rt.block_on(async { std::hint::black_box(app.oneshot(req).await.expect("response")) })
+            },
+            BatchSize::PerIteration,
+        );
     });
     group.finish();
 }

@@ -15,8 +15,13 @@
 //!   `GET /inboxes/{agent}?limit=256` (one page); the pull is what is timed, so
 //!   `requests/s` counts pulls and `messages/s` the messages they returned.
 //!
-//! It speaks HTTP/1.1 over plain sockets (no client library), so what it
-//! measures is the daemon plus loopback. It registers agents named `lg…` and
+//! - `ws`: per client, a sender stream sends batches of 64 to a room over
+//!   `GET /ws` and a receiver stream is pushed them and acknowledges; it
+//!   reports end-to-end delivered messages/s and the push latency (send to
+//!   arrival, taken on the first message of each pushed frame).
+//!
+//! The HTTP modes speak HTTP/1.1 over plain sockets (no client library), so
+//! what they measure is the daemon plus loopback. It registers agents named `lg…` and
 //! rooms named `lg…`; run it against a throwaway daemon.
 
 use std::time::{Duration, Instant};
@@ -31,6 +36,7 @@ enum Mode {
     Send,
     Batch,
     Pull,
+    Ws,
 }
 
 struct Config {
@@ -114,7 +120,8 @@ fn parse_args() -> Config {
                     "send" => Mode::Send,
                     "batch" => Mode::Batch,
                     "pull" => Mode::Pull,
-                    other => panic!("--mode send|batch|pull, not {other}"),
+                    "ws" => Mode::Ws,
+                    other => panic!("--mode send|batch|pull|ws, not {other}"),
                 }
             }
             other => panic!("unknown option {other}"),
@@ -178,6 +185,7 @@ async fn client(cfg: &Config, id: usize, deadline: Instant) -> std::io::Result<T
                 )
                 .await?;
             }
+            Mode::Ws => unreachable!("ws mode has its own runner"),
             Mode::Pull => {
                 conn.request("POST", "/messages/batch", &batch).await?;
                 loop {
@@ -215,6 +223,9 @@ async fn timed(
 #[tokio::main]
 async fn main() {
     let cfg = std::sync::Arc::new(parse_args());
+    if cfg.mode == Mode::Ws {
+        return ws_load(cfg).await;
+    }
     let deadline = Instant::now() + Duration::from_secs(cfg.seconds);
     let started = Instant::now();
     let tasks: Vec<_> = (0..cfg.clients)
@@ -243,6 +254,123 @@ async fn main() {
         cfg.clients,
         secs,
         all.requests as f64 / secs,
+        all.messages as f64 / secs,
+        pct(0.5),
+        pct(0.99),
+    );
+}
+
+/// Microseconds since `epoch`, the clock the messages are stamped with.
+fn micros(epoch: Instant) -> u128 {
+    epoch.elapsed().as_micros()
+}
+
+/// What a receiver saw: messages delivered and the push latency of the first
+/// message of each frame, in microseconds.
+#[derive(Default)]
+struct Received {
+    messages: u64,
+    latencies: Vec<u64>,
+}
+
+/// The `ws` mode: sender and receiver streams per client, a room between them.
+async fn ws_load(cfg: std::sync::Arc<Config>) {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::connect_async;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let epoch = Instant::now();
+    let mut setup_conn = Conn::open(&cfg.addr).await.expect("connect");
+    for id in 0..cfg.clients {
+        setup(&mut setup_conn, id).await.expect("setup");
+    }
+    let run_for = Duration::from_secs(cfg.seconds);
+    let started = Instant::now();
+    let deadline = started + run_for;
+    let mut receivers = Vec::new();
+    let mut senders = Vec::new();
+    for id in 0..cfg.clients {
+        let url = format!("ws://{}/ws?agent=lgr{id}", cfg.addr);
+        let (mut rx, _) = connect_async(url).await.expect("receiver stream");
+        receivers.push(tokio::spawn(async move {
+            let mut seen = Received::default();
+            // Drain for a second past the deadline, then stop.
+            let stop = deadline + Duration::from_secs(1);
+            while let Ok(Some(Ok(frame))) = tokio::time::timeout_at(stop.into(), rx.next()).await {
+                let Message::Text(text) = frame else { continue };
+                let text = text.as_str();
+                // Keys come out sorted, so `type` is last.
+                if !text.ends_with(r#""type":"messages"}"#) {
+                    continue;
+                }
+                let arrived = micros(epoch) as u64;
+                let count = text.matches(r#""body":""#).count() as u64;
+                let stamp = text
+                    .split_once(r#""body":""#)
+                    .and_then(|(_, rest)| rest.split('"').next())
+                    .and_then(|b| b.parse::<u64>().ok());
+                if let Some(sent) = stamp {
+                    seen.latencies.push(arrived.saturating_sub(sent));
+                }
+                seen.messages += count;
+                let last = text.rfind(r#""id":""#).map(|i| &text[i + 6..]);
+                if let Some(id) = last.and_then(|r| r.split('"').next()) {
+                    let ack = format!(r#"{{"type":"ack","upTo":{id}}}"#);
+                    if rx.send(Message::Text(ack.into())).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            seen
+        }));
+        let url = format!("ws://{}/ws?agent=lgs{id}", cfg.addr);
+        let (mut tx, _) = connect_async(url).await.expect("sender stream");
+        senders.push(tokio::spawn(async move {
+            let mut sent = 0u64;
+            while Instant::now() < deadline {
+                let items: Vec<String> = (0..BATCH)
+                    .map(|_| format!(r#"{{"room":"lg{id}","body":"{}"}}"#, micros(epoch)))
+                    .collect();
+                let frame = format!(
+                    r#"{{"type":"batch","ref":1,"items":[{}]}}"#,
+                    items.join(",")
+                );
+                if tx.send(Message::Text(frame.into())).await.is_err() {
+                    break;
+                }
+                // One batch in flight per sender: wait for its replies.
+                match tx.next().await {
+                    Some(Ok(Message::Text(_))) => sent += BATCH as u64,
+                    _ => break,
+                }
+            }
+            sent
+        }));
+    }
+    let mut sent = 0;
+    for task in senders {
+        sent += task.await.expect("sender");
+    }
+    let mut all = Received::default();
+    for task in receivers {
+        let r = task.await.expect("receiver");
+        all.messages += r.messages;
+        all.latencies.extend(r.latencies);
+    }
+    let secs = started
+        .elapsed()
+        .as_secs_f64()
+        .min(cfg.seconds as f64 + 1.0);
+    all.latencies.sort_unstable();
+    let pct = |p: f64| {
+        let i = (all.latencies.len() as f64 * p) as usize;
+        Duration::from_micros(all.latencies.get(i).copied().unwrap_or_default())
+    };
+    println!(
+        "{} clients over WebSocket, {:.1}s: sent {:.0} msg/s, delivered {:.0} msg/s, push latency p50 {:?} p99 {:?}",
+        cfg.clients,
+        secs,
+        sent as f64 / cfg.seconds as f64,
         all.messages as f64 / secs,
         pct(0.5),
         pct(0.99),

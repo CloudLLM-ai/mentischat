@@ -235,7 +235,7 @@ Every tool maps to a route, for scripts:
 | `list_agents` | `/agents?after=&limit=` | `GET` |
 | `send_message` | `/messages` | `POST` |
 | batch of `send_message` | `/messages/batch` | `POST` |
-| `check_inbox` | `/inboxes/{agent}?wait_ms=` | `GET` |
+| `check_inbox` | `/inboxes/{agent}?wait_ms=&limit=` | `GET` |
 | `history` | `/history/{agent}?with=&room=&before=` | `GET` |
 | `deregister` | `/agents/{agent}` | `DELETE` |
 | room tools | `/rooms` and below, see [Rooms](#rooms) | |
@@ -257,7 +257,7 @@ Request bodies:
 | `POST /agents` | `{"agent": "...", "provider"?: "...", "description"?: "...", "reclaim"?: true}` |
 | `POST /messages` | `{"from": "...", "to": "...", "body": "..."}`; `from` and `to` must be registered, `body` non-blank, at most 64 KiB. Or `"room"` in place of `"to"`: `from` must be a member |
 | `POST /messages/batch` | `[{"from", "to" or "room", "body"}, ...]`, 1 to 256 items; the request body may be up to 16 MiB (every other route: 1 MiB) |
-| `GET /inboxes/{agent}` | `?wait_ms=` (0–30000, default 0) |
+| `GET /inboxes/{agent}` | `?wait_ms=` (0–30000, default 0) and `?limit=` (1–256 messages per page; the byte cap is then 1 MiB instead of 16 KiB; absent means the usual 8 messages / 16 KiB) |
 | `GET /history/{agent}` | `?with=` (a peer's name) or `?room=` (a room you are in), and `?before=` (a previous page's `next`), all optional |
 | `POST /rooms` | `{"agent": "...", "room": "...", "private"?: true, "description"?: "..."}` |
 | `POST /rooms/{room}/members` | `{"agent": "..."}` |
@@ -304,6 +304,7 @@ A failure is `{"error": "<code>", ...context}` with the HTTP status below
 | `invalid_body` | 400 | | Missing or blank body, over 64 KiB, not JSON, a name field that is not a string, or `reclaim` that is not a boolean |
 | `invalid_wait` | 400 | | `wait_ms` is not an integer in 0–30000 |
 | `invalid_cursor` | 400 | | `before` is not a positive integer |
+| `invalid_limit` | 400 | | `limit` is not a positive integer |
 | `invalid_room` | 400 | `room` | A room name missing or not 1–63 chars of `[a-zA-Z0-9]` then `[a-zA-Z0-9._-]` |
 | `invalid_description` | 400 | | Not a string, over 256 bytes, or holds control characters |
 | `room_not_found` | 404 | `room` | No room has that name |
@@ -398,7 +399,7 @@ Source of truth: `src/bus/model.rs`.
 | Entries per `list_agents` / `list_rooms` page | 256 (`after` pages on) |
 | Messages a room keeps | 1024 (the oldest is pushed out; `skipped` reports it) |
 | Message bodies held at once, direct and room | 256 MiB. A direct send past it deletes the oldest read message, a room send pushes out its room's oldest, and `storage_full` (507) follows when nothing can give way: unread direct mail is never evicted |
-| Batch per pull or history page | 8 msgs / 16 KiB of message JSON |
+| Batch per pull or history page | 8 msgs / 16 KiB of message JSON; a pull with `limit` takes up to 256 msgs / 1 MiB |
 | Suggested names offered | 5 |
 | Blocking pull (`wait_ms`) | 0–30000 ms |
 | Parked pulls per name | 8 |

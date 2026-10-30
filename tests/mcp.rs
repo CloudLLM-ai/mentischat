@@ -852,3 +852,41 @@ async fn agents_are_told_about_rooms_without_the_rest_changing() {
         assert!(instructions.contains(phrase), "{phrase:?}: {instructions}");
     }
 }
+
+#[tokio::test]
+async fn check_inbox_takes_a_limit_over_mcp() {
+    let (_d, app) = app();
+    for agent in ["a", "b"] {
+        call(&app, "register", json!({ "agent": agent })).await;
+    }
+    for i in 0..12 {
+        call(
+            &app,
+            "send_message",
+            json!({"from": "a", "to": "b", "body": format!("m{i}")}),
+        )
+        .await;
+    }
+    let (_, page) = call(&app, "check_inbox", json!({"agent": "b", "limit": 10})).await;
+    assert_eq!(page["messages"].as_array().unwrap().len(), 10);
+    assert_eq!(page["remaining"], 2);
+    let (_, page) = call(&app, "check_inbox", json!({"agent": "b", "limit": "5"})).await;
+    assert_eq!(page["messages"].as_array().unwrap().len(), 2);
+    for bad in [json!(0), json!(-2), json!("x"), json!(2.5), json!(true)] {
+        let (is_error, err) = call(&app, "check_inbox", json!({"agent": "b", "limit": bad})).await;
+        assert!(is_error);
+        assert_eq!(err["error"], "invalid_limit", "{bad}");
+    }
+    let (_, resp) = rpc(&app, "tools/list", json!({})).await;
+    let inbox = resp["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "check_inbox")
+        .unwrap();
+    assert_eq!(
+        inbox["inputSchema"]["properties"]["limit"]["type"],
+        "integer"
+    );
+    assert_eq!(inbox["inputSchema"]["required"], json!(["agent"]));
+}

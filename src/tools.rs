@@ -106,6 +106,11 @@ fn metadata_for(tool_name: &str) -> Option<ToolMetadata> {
                 ToolParameter::new("wait_ms", ToolParameterType::Integer)
                     .with_description("Block up to this many ms until mail arrives (0-30000): 30000 while waiting for a reply, 0 to just check")
                     .with_default(json!(0)),
+            )
+            .with_parameter(
+                ToolParameter::new("limit", ToolParameterType::Integer).with_description(
+                    "Messages per page, 1-256, to drain a backlog in fewer calls; omit for the usual page of 8",
+                ),
             ),
         ),
         "history" => Some(
@@ -290,7 +295,10 @@ async fn deregister(bus: &Bus, params: &Value) -> Result<Value, MailboxError> {
 async fn check_inbox(bus: &Bus, params: &Value) -> Result<Value, MailboxError> {
     let agent = required_name(params, "agent")?;
     let wait_ms = parse_wait_ms(params.get("wait_ms"))?;
-    Ok(to_wire(bus.check_inbox(&agent, wait_ms).await?))
+    let limit = parse_limit(params.get("limit"))?;
+    Ok(to_wire(
+        bus.check_inbox_limit(&agent, wait_ms, limit).await?,
+    ))
 }
 
 /// Pull a required name field: missing or empty is `invalid_name`, a
@@ -403,7 +411,7 @@ pub async fn leave_room(bus: &Bus, params: &Value) -> Result<Value, MailboxError
 pub async fn list_rooms(bus: &Bus, params: &Value) -> Result<Value, MailboxError> {
     let agent = required_name(params, "agent")?;
     let after = optional_room(params.get("after"))?;
-    let limit = parse_limit(params.get("limit"))?;
+    let limit = parse_limit(params.get("limit"))?.unwrap_or(crate::bus::MAX_PAGE);
     Ok(to_wire(
         bus.list_rooms_page(&agent, after.as_ref(), limit).await?,
     ))
@@ -413,25 +421,25 @@ pub async fn list_rooms(bus: &Bus, params: &Value) -> Result<Value, MailboxError
 /// page's `next`) and `limit` are optional.
 pub async fn list_agents(bus: &Bus, params: &Value) -> Result<Value, MailboxError> {
     let after = optional_name(params.get("after"))?;
-    let limit = parse_limit(params.get("limit"))?;
+    let limit = parse_limit(params.get("limit"))?.unwrap_or(crate::bus::MAX_PAGE);
     Ok(to_wire(bus.list_agents_page(after.as_ref(), limit).await?))
 }
 
-/// A page `limit`: absent, null or `""` -> the largest page; a positive
-/// integer, or a string of digits holding one -> its value (the bus caps it
-/// at [`crate::bus::MAX_PAGE`]); anything else -> `invalid_body`.
-pub fn parse_limit(v: Option<&Value>) -> Result<usize, MailboxError> {
+/// A page `limit`: absent, null or `""` -> `None` (the default page); a
+/// positive integer, or a string of digits holding one -> its value (the bus
+/// caps it at [`crate::bus::MAX_PAGE`]); anything else -> `invalid_limit`.
+pub fn parse_limit(v: Option<&Value>) -> Result<Option<usize>, MailboxError> {
     let parsed = match v {
-        None | Some(Value::Null) => return Ok(crate::bus::MAX_PAGE),
-        Some(Value::String(s)) if s.is_empty() => return Ok(crate::bus::MAX_PAGE),
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(s)) if s.is_empty() => return Ok(None),
         Some(Value::Number(n)) => n.as_u64(),
         Some(Value::String(s)) if s.bytes().all(|b| b.is_ascii_digit()) => s.parse().ok(),
         Some(_) => None,
     };
     parsed
         .filter(|l| *l > 0)
-        .map(|l| usize::try_from(l).unwrap_or(usize::MAX))
-        .ok_or(MailboxError::InvalidBody)
+        .map(|l| Some(usize::try_from(l).unwrap_or(usize::MAX)))
+        .ok_or(MailboxError::InvalidLimit)
 }
 
 /// The required `room` field: missing or empty is `invalid_room`, a

@@ -54,14 +54,16 @@ pub use model::{
     LeaveOutcome, RoomEntry, RoomInfo, RoomListing, DEFAULT_ROOM_CAPACITY, MAX_RETAINED_BYTES,
     MAX_ROOMS,
 };
-pub use model::{MAX_OVERVIEW_AGENTS, MAX_PAGE, MAX_ROOMS_PER_AGENT, MAX_ROOM_MEMBERS};
+pub use model::{
+    MAX_LIMITED_PAGE_BYTES, MAX_OVERVIEW_AGENTS, MAX_PAGE, MAX_ROOMS_PER_AGENT, MAX_ROOM_MEMBERS,
+};
 pub use snapshot::{remove_snapshot, SnapshotError};
 
 use clock::{now_ms, rfc3339_ms, unix_ms};
 use delivery::{history_page, history_rows};
 use log::{json_len, Msg};
 use park::{ParkGuard, Signal};
-use state::{Agent, Key, State};
+use state::{Agent, Key, Page, State};
 
 type MailErr = crate::errors::MailboxError;
 
@@ -380,7 +382,21 @@ impl Bus {
     /// Fails [`crate::errors::MailboxError::TooManyWaiters`] when
     /// [`MAX_WAITERS_PER_AGENT`] pulls are already parked for this name.
     pub async fn check_inbox(&self, name: &AgentName, wait_ms: u32) -> Result<InboxPage, MailErr> {
-        let (taken, mut signal) = self.pull_now(name)?;
+        self.check_inbox_limit(name, wait_ms, None).await
+    }
+
+    /// [`check_inbox`](Self::check_inbox) with a page size: `Some(n)` returns
+    /// up to `n` messages (1 to [`MAX_PAGE`]) within
+    /// [`MAX_LIMITED_PAGE_BYTES`], the first always included; `None` is the
+    /// usual page of [`MAX_BATCH`] messages within [`MAX_RETURN_BYTES`].
+    pub async fn check_inbox_limit(
+        &self,
+        name: &AgentName,
+        wait_ms: u32,
+        limit: Option<usize>,
+    ) -> Result<InboxPage, MailErr> {
+        let page = Page::limited(limit);
+        let (taken, mut signal) = self.pull_now(name, page)?;
         if wait_ms == 0 || taken.delivers() {
             return Ok(taken.into_page());
         }
@@ -396,7 +412,7 @@ impl Bus {
                 let notified = signal.notify.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
-                match self.pull_wait(name, &signal, deadline)? {
+                match self.pull_wait(name, &signal, deadline, page)? {
                     Pull::Ready(taken) => return Ok(taken.into_page()),
                     Pull::Retarget(fresh) => Some(fresh),
                     Pull::Park(_slot) => {
@@ -416,10 +432,10 @@ impl Bus {
     /// Take `name`'s next batch of unread mail now (an empty one when there
     /// is none), and hand back the agent's signal for a pull that goes on to
     /// wait.
-    fn pull_now(&self, name: &AgentName) -> Result<(Taken, Arc<Signal>), MailErr> {
+    fn pull_now(&self, name: &AgentName, page: Page) -> Result<(Taken, Arc<Signal>), MailErr> {
         let state = self.open()?;
         let agent = state.agent(name.as_str(), Key::fold(name.as_str()).as_str())?;
-        let taken = self.take(state, &agent, name)?;
+        let taken = self.take(state, &agent, name, page)?;
         Ok((
             taken.unwrap_or_else(|| Taken::empty(agent.name.clone())),
             agent.signal.clone(),
@@ -433,8 +449,9 @@ impl Bus {
         state: &State,
         agent: &Arc<Agent>,
         name: &AgentName,
+        page: Page,
     ) -> Result<Option<Taken>, MailErr> {
-        match state.pull(agent, now_ms()) {
+        match state.pull(agent, now_ms(), page) {
             None => Err(state.unregistered(name.as_str())),
             Some(batch) => Ok(batch.map(|batch| Taken {
                 agent: agent.name.clone(),
@@ -456,6 +473,7 @@ impl Bus {
         name: &AgentName,
         signal: &Arc<Signal>,
         deadline: Instant,
+        page: Page,
     ) -> Result<Pull, MailErr> {
         let state = self.open()?;
         // The agent was waiting all along; taking also records when the pull
@@ -467,7 +485,7 @@ impl Bus {
         // Counted as parked before the inbox is looked at, so a send that
         // lands in between wakes this pull (see `ParkGuard::try_new`).
         let slot = ParkGuard::try_new(signal.clone(), MAX_WAITERS_PER_AGENT);
-        if let Some(taken) = self.take(state, &agent, name)? {
+        if let Some(taken) = self.take(state, &agent, name, page)? {
             return Ok(Pull::Ready(taken));
         }
         if Instant::now() >= deadline {

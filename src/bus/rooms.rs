@@ -30,7 +30,7 @@ use parking_lot::Mutex;
 
 use super::log::{Msg, Target};
 use super::park::Signal;
-use super::state::{fitting, Agent, Key, State};
+use super::state::{fitting, Agent, Key, Page, State};
 use super::{
     MailErr, RoomEntry, RoomInfo, MAX_BATCH, MAX_ROOMS, MAX_ROOMS_PER_AGENT, MAX_ROOM_MEMBERS,
 };
@@ -153,8 +153,8 @@ pub(super) struct Waiting {
 }
 
 impl Room {
-    /// What `me` has waiting in this room; `None` when it is not a member.
-    pub(super) fn waiting(&self, me: &Agent) -> Option<Waiting> {
+    /// What `me` has waiting in this room (up to `limit` messages); `None` when it is not a member.
+    pub(super) fn waiting(&self, me: &Agent, limit: usize) -> Option<Waiting> {
         let st = self.inner.lock();
         let key = Key::fold(&me.name);
         let member = st.members.get(key.as_str())?;
@@ -163,7 +163,7 @@ impl Room {
             .log
             .range(start..)
             .filter(|m| !m.from.eq_ignore_ascii_case(&me.name))
-            .take(MAX_BATCH as usize)
+            .take(limit)
             .cloned()
             .collect();
         Some(Waiting {
@@ -558,7 +558,7 @@ impl State {
             .cloned()
             .collect();
         drop(st);
-        let take = fitting(rows.iter().map(|m| m.page_len()));
+        let take = fitting(rows.iter().map(|m| m.page_len()), Page::DEFAULT);
         let next = (rows.len() > take).then(|| rows[take - 1].id as i64);
         rows.truncate(take);
         rows.reverse();

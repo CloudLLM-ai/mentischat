@@ -148,6 +148,13 @@ UNRELEASED
     the others. Only this route accepts bodies above 1 MiB (up to 16 MiB), so a
     batch of large messages fits. It is not an MCP tool.
 
+  - feat(mcp): check_inbox (and GET /inboxes/{agent}?limit=) takes an optional
+    limit, 1-256 messages per page, to drain a backlog in fewer calls; a
+    limited page may hold up to 1 MiB of message JSON (the first message
+    always rides). Without limit the page is the same 8 messages / 16 KiB as
+    before. A bad limit is invalid_limit (400), on list_agents and list_rooms
+    too.
+
   - feat(tui): started from a terminal, the daemon paints a live view: the
     MENTIS CHAT banner, tiles for where it listens, messages sent, agents and
     uptime, a Logs pane (tool calls, never message bodies), and a Registered

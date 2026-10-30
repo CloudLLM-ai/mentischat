@@ -740,3 +740,53 @@ async fn in_the_composed_router_only_the_batch_route_may_exceed_one_mib() {
     .await;
     assert_eq!(s, 400, "{v}");
 }
+
+#[tokio::test]
+async fn pulls_take_a_limit_and_bad_limits_are_invalid_limit() {
+    let (_d, mut app) = app();
+    register_two(&mut app).await;
+    let item = r#"{"from":"a","to":"b","body":"x"}"#;
+    send(
+        &mut app,
+        post(
+            "/messages/batch",
+            &format!("[{}]", vec![item; 100].join(",")),
+        ),
+    )
+    .await;
+
+    let (s, v) = send(&mut app, req("GET", "/inboxes/b?limit=30")).await;
+    assert_eq!(
+        (s, v["messages"].as_array().unwrap().len(), &v["remaining"]),
+        (200, 30, &Value::from(70))
+    );
+    let (_, v) = send(&mut app, req("GET", "/inboxes/b")).await;
+    assert_eq!(
+        v["messages"].as_array().unwrap().len(),
+        8,
+        "no limit: the usual page"
+    );
+    let (_, v) = send(&mut app, req("GET", "/inboxes/b?limit=")).await;
+    assert_eq!(
+        v["messages"].as_array().unwrap().len(),
+        8,
+        "empty means none"
+    );
+    let (_, v) = send(&mut app, req("GET", "/inboxes/b?limit=9999")).await;
+    assert_eq!(
+        v["messages"].as_array().unwrap().len(),
+        54,
+        "capped at 256, 54 were left"
+    );
+
+    for bad in ["0", "-1", "x", "1.5", "99999999999999999999999"] {
+        let (s, v) = send(&mut app, req("GET", &format!("/inboxes/b?limit={bad}"))).await;
+        assert_eq!(
+            (s, v["error"].as_str()),
+            (400, Some("invalid_limit")),
+            "{bad}: {v}"
+        );
+    }
+    let (s, v) = send(&mut app, req("GET", "/agents?limit=0")).await;
+    assert_eq!((s, v["error"].as_str()), (400, Some("invalid_limit")));
+}

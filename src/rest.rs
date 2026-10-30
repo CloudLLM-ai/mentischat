@@ -173,7 +173,7 @@ async fn send_batch(State(bus): State<Ctx>, body: Result<Json<Value>, JsonReject
     ok_response(Value::Array(results))
 }
 
-/// `GET /inboxes/{agent}?wait_ms=` — same as check_inbox: returned messages
+/// `GET /inboxes/{agent}?wait_ms=&limit=` — same as check_inbox: returned messages
 /// are marked read.
 async fn pull(
     State(bus): State<Ctx>,
@@ -191,7 +191,13 @@ async fn pull(
         Ok(w) => w,
         Err(e) => return err_response(e),
     };
-    match bus.check_inbox(&agent, wait_ms).await {
+    let limit = match crate::tools::parse_limit(
+        q.get("limit").map(|l| Value::String(l.clone())).as_ref(),
+    ) {
+        Ok(l) => l,
+        Err(e) => return err_response(e),
+    };
+    match bus.check_inbox_limit(&agent, wait_ms, limit).await {
         Ok(page) => no_store_response(page),
         Err(e) => err_response(e),
     }

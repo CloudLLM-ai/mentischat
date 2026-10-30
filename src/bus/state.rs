@@ -61,7 +61,10 @@ use parking_lot::{Mutex, RwLock};
 use super::log::{Convo, Msg, Target};
 use super::park::Signal;
 use super::rooms::Room;
-use super::{MailErr, MAX_BATCH, MAX_PENDING_PER_AGENT, MAX_RETURN_BYTES, MAX_TOTAL_MESSAGES};
+use super::{
+    MailErr, MAX_BATCH, MAX_LIMITED_PAGE_BYTES, MAX_PAGE, MAX_PENDING_PER_AGENT, MAX_RETURN_BYTES,
+    MAX_TOTAL_MESSAGES,
+};
 use crate::errors::TakenReason;
 
 /// Shards per map. Sixteen is enough that a handful of busy conversations
@@ -409,18 +412,43 @@ pub(super) fn convo_has(key: &str, folded: &str) -> bool {
     key.split('\n').any(|side| side == folded)
 }
 
-/// How many of `sizes`, in order, fit [`MAX_BATCH`] and [`MAX_RETURN_BYTES`].
+/// How big a page of messages is: how many, and how many bytes of their JSON.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Page {
+    pub items: usize,
+    pub bytes: usize,
+}
+
+impl Page {
+    /// The contract's page: [`MAX_BATCH`] messages within
+    /// [`MAX_RETURN_BYTES`].
+    pub(super) const DEFAULT: Self = Self {
+        items: MAX_BATCH as usize,
+        bytes: MAX_RETURN_BYTES,
+    };
+
+    /// A page a caller asked for: `limit` messages (1 to [`MAX_PAGE`]) within
+    /// [`MAX_LIMITED_PAGE_BYTES`]. `None` is [`Page::DEFAULT`].
+    pub(super) fn limited(limit: Option<usize>) -> Self {
+        limit.map_or(Self::DEFAULT, |n| Self {
+            items: n.clamp(1, MAX_PAGE),
+            bytes: MAX_LIMITED_PAGE_BYTES,
+        })
+    }
+}
+
+/// How many of `sizes`, in order, fit `page`.
 /// The first always fits: progress must be possible.
 ///
 /// Size is each message's serialized JSON, not its raw body: escaping can
 /// make a body several times longer on the wire (a control character becomes
 /// six bytes), and the wire size is what has to stay under client truncation
 /// limits.
-pub(super) fn fitting(sizes: impl Iterator<Item = usize>) -> usize {
+pub(super) fn fitting(sizes: impl Iterator<Item = usize>, page: Page) -> usize {
     let mut take = 0usize;
     let mut bytes = 0usize;
-    for size in sizes.take(MAX_BATCH as usize) {
-        if take > 0 && bytes + size > MAX_RETURN_BYTES {
+    for size in sizes.take(page.items) {
+        if take > 0 && bytes + size > page.bytes {
             break;
         }
         bytes += size;
@@ -846,18 +874,23 @@ impl State {
     /// mail, marking it read at `now_ms`; `None` when nothing is unread.
     /// `unregistered` when the agent has left.
     ///
-    /// Up to [`MAX_BATCH`] messages within [`MAX_RETURN_BYTES`] of
-    /// serialized JSON, the first always included. Taking and marking happen
+    /// Up to `page.items` messages within `page.bytes` of serialized JSON,
+    /// the first always included. Taking and marking happen
     /// under the agent's lock in this one call, so a pull hands each message
     /// out exactly once.
-    pub(super) fn pull(&self, agent: &Arc<Agent>, now_ms: u64) -> Option<Option<Batch>> {
+    pub(super) fn pull(
+        &self,
+        agent: &Arc<Agent>,
+        now_ms: u64,
+        page: Page,
+    ) -> Option<Option<Batch>> {
         let mut st = agent.inner.lock();
         if st.removed {
             return None;
         }
         st.last_seen_ms = now_ms;
         if st.rooms.is_empty() {
-            let direct = self.take_direct(agent, &mut st, now_ms, MAX_BATCH as usize);
+            let direct = self.take_direct(agent, &mut st, now_ms, page);
             return Some(direct.map(|messages| Batch {
                 remaining: st.unread.len(),
                 messages,
@@ -865,7 +898,7 @@ impl State {
             }));
         }
         let rooms = st.rooms.clone();
-        Some(self.take_merged(agent, &mut st, &rooms, now_ms))
+        Some(self.take_merged(agent, &mut st, &rooms, now_ms, page))
     }
 
     /// Mark the first `n` (at most) of the agent's unread direct mail read at
@@ -875,9 +908,9 @@ impl State {
         agent: &Arc<Agent>,
         st: &mut AgentState,
         now_ms: u64,
-        n: usize,
+        page: Page,
     ) -> Option<Vec<Arc<Msg>>> {
-        let take = fitting(st.unread.iter().map(|m| m.page_len())).min(n);
+        let take = fitting(st.unread.iter().map(|m| m.page_len()), page);
         if take == 0 {
             return None;
         }
@@ -916,11 +949,12 @@ impl State {
         st: &mut AgentState,
         rooms: &[Arc<Room>],
         now_ms: u64,
+        page: Page,
     ) -> Option<Batch> {
         let waiting: Vec<_> = rooms
             .iter()
             .enumerate()
-            .filter_map(|(i, room)| room.waiting(agent).map(|w| (i, w)))
+            .filter_map(|(i, room)| room.waiting(agent, page.items).map(|w| (i, w)))
             .collect();
         if waiting.len() < rooms.len() {
             let member_of: Vec<&Arc<Room>> = waiting.iter().map(|(i, _)| &rooms[*i]).collect();
@@ -930,7 +964,7 @@ impl State {
         let mut candidates: Vec<(Arc<Msg>, Option<usize>)> = st
             .unread
             .iter()
-            .take(MAX_BATCH as usize)
+            .take(page.items)
             .map(|m| (m.clone(), None))
             .chain(
                 waiting
@@ -939,7 +973,7 @@ impl State {
             )
             .collect();
         candidates.sort_unstable_by_key(|(m, _)| m.id);
-        let take = fitting(candidates.iter().map(|(m, _)| m.page_len()));
+        let take = fitting(candidates.iter().map(|(m, _)| m.page_len()), page);
         if take == 0 && waiting.iter().all(|(_, w)| w.skipped == 0) {
             return None;
         }

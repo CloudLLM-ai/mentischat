@@ -15,6 +15,10 @@ pub const MAX_PENDING_PER_AGENT: i64 = 1024;
 pub const MAX_TOTAL_MESSAGES: i64 = 8192;
 /// Max messages returned by one `check_inbox` or `history` page.
 pub const MAX_BATCH: i64 = 8;
+/// Max summed serialized-JSON bytes of an inbox page when the caller asks for a
+/// `limit` (1 MiB; the first message always fits). Without a `limit` the page is
+/// [`MAX_BATCH`] messages within [`MAX_RETURN_BYTES`], exactly as before.
+pub const MAX_LIMITED_PAGE_BYTES: usize = 1024 * 1024;
 /// Max summed serialized-JSON bytes of the messages returned by one
 /// `check_inbox` or `history` page (first message always included).
 pub const MAX_RETURN_BYTES: usize = 16 * 1024;

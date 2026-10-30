@@ -42,6 +42,9 @@ pub enum MailboxError {
     },
     /// `before` is not a positive integer.
     InvalidCursor,
+    /// `limit` is not an integer of at least 1 (and is not a digit string
+    /// holding one).
+    InvalidLimit,
     /// `description` is not a string, is over
     /// [`crate::bus::MAX_DESCRIPTION_BYTES`], or holds control characters.
     InvalidDescription,
@@ -92,6 +95,7 @@ impl MailboxError {
             Self::InvalidWait => "invalid_wait",
             Self::InvalidDescription => "invalid_description",
             Self::InvalidCursor => "invalid_cursor",
+            Self::InvalidLimit => "invalid_limit",
             Self::NameTaken { .. } => "name_taken",
             Self::Unregistered { .. } => "unregistered",
             Self::QueueFull { .. } => "queue_full",
@@ -122,7 +126,8 @@ impl MailboxError {
             | Self::InvalidBody
             | Self::InvalidWait
             | Self::InvalidDescription
-            | Self::InvalidCursor => StatusCode::BAD_REQUEST,
+            | Self::InvalidCursor
+            | Self::InvalidLimit => StatusCode::BAD_REQUEST,
             Self::Unregistered { .. } | Self::RoomNotFound { .. } | Self::NotFound => {
                 StatusCode::NOT_FOUND
             }
@@ -149,7 +154,8 @@ impl MailboxError {
             Self::InvalidBody
             | Self::InvalidWait
             | Self::InvalidDescription
-            | Self::InvalidCursor => json!({ "error": self.code() }),
+            | Self::InvalidCursor
+            | Self::InvalidLimit => json!({ "error": self.code() }),
             Self::NameTaken {
                 agent,
                 reason,

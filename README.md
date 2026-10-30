@@ -54,11 +54,13 @@ Key behaviors:
   full budget makes room by deleting the oldest read message, then the oldest
   room message (room mail is lossy by design), and only then refuses with
   `storage_full`; unread direct mail is never evicted.
-- **Pull only** — nothing wakes an idle agent. Mail is read when its recipient
-  calls `check_inbox`: because you told it to check its messages, or because
+- **Pull only for agents** — nothing wakes an idle agent. Mail is read when its
+  recipient calls `check_inbox`: because you told it to check its messages, or because
   it is waiting for a reply. `check_inbox` with `wait_ms` parks up to 30 s
   and returns the moment mail lands; an agent waiting longer calls it again.
-  Timeout is an empty success, never an error.
+  Timeout is an empty success, never an error. Scripts, bridges and custom
+  runtimes that can hold a connection open may instead take a
+  [WebSocket stream](#streaming-over-websocket): mail is pushed as it lands.
 - **Wiped at start and stop** — SIGTERM/SIGINT (or `q` in the terminal view)
   discards the roster, held names, rooms and all mail, read or not, and startup
   does the same to whatever a crashed run left. `MENTISCHAT_PERSIST=1` keeps
@@ -244,6 +246,77 @@ follow the agent-name grammar, ignore case, and are a namespace of their own.
   room with no members is deleted. Under `MENTISCHAT_PERSIST=1` rooms (members,
   cursors, invitations, retained messages) are part of the snapshot.
 
+## Streaming over WebSocket
+
+`GET /ws?agent=NAME` upgrades to a WebSocket that pushes the agent's mail as
+it lands (no polling) and carries its sends. It is for scripts, bridges and
+custom runtimes; harness agents such as Claude Code keep pulling with
+`check_inbox`, since nothing in an MCP harness can listen on a socket. The
+route is behind the same loopback and `Origin` checks as every other: a page
+on another site cannot open a stream (browsers always send `Origin` on a
+WebSocket handshake), and an unregistered or invalid `agent` gets the contract
+error, status and JSON, before the upgrade.
+
+Frames are JSON text frames with a `type`.
+
+| Direction | Frame | Meaning |
+|---|---|---|
+| server to client | `{"type":"messages","messages":[...]}` | Mail pushed as it lands, direct and room, oldest first by id, each message as `check_inbox` returns it (`room` instead of `to` for room mail, `readAt` null) |
+| server to client | `{"type":"skipped","count":N}` | Room messages pushed out of a full room before they could be delivered |
+| server to client | `{"type":"receipt","ref":..,...}` / `{"type":"error","ref":..,"error":..}` | The reply to a `send`: the `send_message` receipt, or the contract error |
+| server to client | `{"type":"batch","ref":..,"results":[...]}` | The replies to a `batch`, one per item, in order |
+| client to server | `{"type":"ack","upTo":ID}` | Everything pushed with an id up to `ID` is now read (`readAt` = the ack time). Cumulative |
+| client to server | `{"type":"send","ref":..,"to":NAME,"body":TEXT}` or `"room":NAME` | Like `POST /messages`, always from the stream's agent (a `from` is ignored) |
+| client to server | `{"type":"batch","ref":..,"items":[{"to"/"room","body"}, ...]}` | Up to 256 sends, applied independently like `POST /messages/batch` |
+
+A malformed or unknown frame gets an `error` frame (with its `ref` if it had
+one) and the connection stays open. `ref` is any JSON value you choose and is
+echoed back.
+
+**Each message is still handed out once.** A pushed message is *leased*, not
+read: it is out of `check_inbox`'s reach, `history` still shows it as the
+recipient's unread mail, and nothing is marked read until you `ack` it. If the
+connection ends before the ack, however it ends (a close, an error, a dropped
+socket, a missed-ping timeout, a newer stream, a server shutdown), the
+unacknowledged messages return to the front of the inbox, or wind the room
+cursor back, in order, for `check_inbox` or the next stream. So a stream
+delivers at least once until you ack; ack what you have processed.
+
+- **Flow control.** At most 256 messages / 1 MiB are in flight unacknowledged
+  (the first message of a push always fits); pushing pauses until acks free
+  the window, so a slow client costs a bounded amount of memory.
+- **One stream per agent.** A new `/ws` for the same name takes over: the old
+  socket is closed with code 4000 and a reason, and its leases return first.
+  `check_inbox` may still run beside a stream and gets only mail that is not
+  leased.
+- **Liveness.** The server pings every 20 s and closes a connection it has
+  heard nothing from for 60 s. An open stream counts as activity for the idle
+  sweep, like a parked pull, and acks and sends refresh `lastSeen`.
+- **Shutdown.** Streams get a close frame (1001) and their leases return before
+  a `MENTISCHAT_PERSIST` snapshot is written.
+
+A minimal client (Python, `pip install websockets`):
+
+```python
+import asyncio, json, websockets
+
+async def main():
+    async with websockets.connect("ws://127.0.0.1:9480/ws?agent=Vega") as ws:
+        await ws.send(json.dumps({"type": "send", "ref": 1, "to": "Orion",
+                                  "body": "No reply needed: hello"}))
+        async for raw in ws:
+            frame = json.loads(raw)
+            if frame["type"] == "messages":
+                for m in frame["messages"]:
+                    print(m["from"], m["body"])
+                last = frame["messages"][-1]["id"]
+                await ws.send(json.dumps({"type": "ack", "upTo": int(last)}))
+            else:
+                print(frame)
+
+asyncio.run(main())
+```
+
 ## REST API
 
 Every tool maps to a route, for scripts:
@@ -266,7 +339,7 @@ inbox is refused (`405`), since a pull marks mail read. Browser requests are
 checked by header, each only when present, so curl and agents are unaffected:
 `Origin` must be loopback (`http://127.0.0.1`, `localhost`, `::1`), `Host`
 must name a loopback host, and `Sec-Fetch-Site` must be `same-origin` or
-`none`. The last stops a page on another site from consuming an inbox by
+`none` (this also refuses cross-site WebSocket handshakes). The last stops a page on another site from consuming an inbox by
 loading `/inboxes/{agent}` as an image, which sends no `Origin`.
 
 Request bodies:
@@ -423,6 +496,7 @@ Source of truth: `src/bus/model.rs`.
 | Suggested names offered | 5 |
 | Blocking pull (`wait_ms`) | 0–30000 ms |
 | Parked pulls per name | 8 |
+| Stream in flight | 256 messages / 1 MiB unacknowledged (one stream per agent) |
 
 ## launchd (optional)
 
@@ -454,11 +528,11 @@ launchd retries every 30 seconds until the port is free.
 | `src/main.rs` | Daemon entry: arguments, data directory, startup, graceful shutdown |
 | `src/lib.rs` | Router composition and the loopback guards |
 | `src/bus/` | The mailbox: `mod.rs` (the `Bus` API), `model.rs` (caps and public types), `state.rs` (roster, unread queues, conversation logs and the lock order), `log.rs`, `rooms.rs`, `park.rs` (blocking pulls), `delivery.rs` (history), `snapshot.rs`, `clock.rs` |
-| `src/rest.rs`, `src/tools.rs` | REST routes and the MCP tools over the same bus |
+| `src/rest.rs`, `src/tools.rs`, `src/ws.rs` | REST routes, the MCP tools and the WebSocket stream over the same bus (`src/bus/stream.rs` holds the leases) |
 | `src/instructions.rs` | What agents are told when they connect: names, reply markers, when to wait |
 | `src/errors.rs`, `src/names.rs` | Typed mailbox errors; agent-name validation and the suggested names |
 | `src/tui/` | The terminal view: `mod.rs` (dashboard), `banner.rs`, `log_buffer.rs`, `terminal.rs` |
-| `tests/` | `bus`, `names`, `history`, `retention`, `rooms`, `budget`, `scale`, `pull_limit`, `http`, `mcp`, `engine`, `snapshot`, `tui`; shared helpers in `common/` |
+| `tests/` | `bus`, `names`, `history`, `retention`, `rooms`, `budget`, `scale`, `pull_limit`, `stream`, `ws`, `http`, `mcp`, `engine`, `snapshot`, `tui`; shared helpers in `common/` |
 | `benches/`, `examples/` | Criterion benches (`bus`, `rest`) and the HTTP load generator `http_load` |
 | `launchd/`, `skills/` | Optional launchd service; engineering-style notes |
 | `changelog.txt` | Release notes |
@@ -507,6 +581,7 @@ magnitude; multi-pair numbers moved by about 30% between runs.
 | Engine, many pairs | same, 8 / 32 pairs on a worker per core | 1.3M to 1.7M messages/s in total |
 | Room fan-out | send to a room of 2 / 16 / 128 members | 2.4M / 2.1M / 1.5M sends/s |
 | REST handlers, no socket | `cargo bench --bench rest` | `POST /messages` about 0.5M req/s, batch of 64 about 0.9M messages/s |
+| Over WebSocket | `http_load --mode ws`, 64 clients each with a sender and a receiver stream | about 1.5M messages/s sent, 1.25M delivered end to end, push latency p50 3 ms and p99 10 ms (1 client: 0.21M delivered, p50 0.2 ms) |
 | Over loopback HTTP | `examples/http_load.rs`, 64 keep-alive clients | single sends about 66k req/s; batches of 64 about 3.8M messages/s (60k req/s); pulls with `limit=256` about 34k pulls/s returning 2.2M messages/s |
 
 The engine is not the limit: a request over HTTP costs about 15 microseconds
@@ -515,12 +590,12 @@ for the handler. To move many messages, send them with `POST /messages/batch`
 (up to 256 per request) and drain with `check_inbox` / `GET /inboxes/{agent}`
 and a `limit` (up to 256 per page).
 
-To reproduce the HTTP numbers:
+To reproduce the HTTP and WebSocket numbers:
 
 ```bash
 MENTISCHAT_PLAIN=1 MENTISCHAT_DIR=$(mktemp -d) target/release/mentischat &
 cargo run --release --example http_load -- --mode batch --clients 64 --seconds 5
-# --mode send | batch | pull; stop the daemon afterwards
+# --mode send | batch | pull | ws; stop the daemon afterwards
 ```
 
 ## Trust model & scope

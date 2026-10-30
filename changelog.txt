@@ -171,6 +171,26 @@ UNRELEASED
     handlers about 0.5M requests/s in process, and over loopback HTTP single
     sends reach about 66k req/s and batches of 64 about 3.8M messages/s.
 
+  - feat(ws): GET /ws?agent=NAME, a WebSocket stream that pushes an agent's
+    mail as it lands and carries its sends, for scripts, bridges and custom
+    runtimes (harness agents keep pulling). Behind the same loopback and
+    Origin checks as every route, so a foreign page cannot open one; an
+    unregistered agent gets the contract error before the upgrade. JSON
+    frames: messages, skipped, receipt, error and batch from the server;
+    ack (cumulative), send and batch (up to 256) from the client, always from
+    the stream's agent, with a client-chosen ref echoed back. "Each message is
+    handed out once" holds: pushed mail is leased (invisible to check_inbox,
+    still unread in history) until acked, and whatever is unacknowledged when
+    the stream ends, for any reason, returns to the inbox in order, or winds a
+    room cursor back (messages a room pushed out meanwhile are reported as
+    skipped). At most 256 messages / 1 MiB in flight; one stream per agent (a
+    newer one takes over, closing the old with code 4000); pings every 20 s
+    and a 60 s silence limit; an open stream counts as activity for the idle
+    sweep; shutdown closes streams and returns leases before the snapshot.
+    On a loaded Apple M4 Max, 64 sender and 64 receiver streams deliver about
+    1.25M messages/s end to end with push latency p50 3 ms / p99 10 ms
+    (examples/http_load.rs --mode ws).
+
   - feat(tui): started from a terminal, the daemon paints a live view: the
     MENTIS CHAT banner, tiles for where it listens, messages sent, agents and
     uptime, a Logs pane (tool calls, never message bodies), and a Registered

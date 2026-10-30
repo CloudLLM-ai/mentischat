@@ -577,9 +577,9 @@ magnitude; multi-pair numbers moved by about 30% between runs.
 | What | How | Result |
 |---|---|---|
 | Engine, one pair | `cargo bench --bench bus`, send then pull through `Bus` | about 1.1M messages/s, empty or at the 8192 cap |
-| Engine, many pairs | same, 8 / 32 pairs on a worker per core | 1.3M to 1.7M messages/s in total |
-| Room fan-out | send to a room of 2 / 16 / 128 members | 2.4M / 2.1M / 1.5M sends/s |
-| REST handlers, no socket | `cargo bench --bench rest` | `POST /messages` about 0.5M req/s, batch of 64 about 0.9M messages/s |
+| Engine, many pairs | same, 8 / 32 pairs on a worker per core | about 1.2M messages/s in total (the earlier figure under-counted the work) |
+| Room fan-out | send to a room of 2 / 16 / 128 members | 2.3M / 2.2M / 1.1M sends/s, on a fresh room each |
+| REST handlers, no socket | `cargo bench --bench rest` | `POST /messages` about 0.5M req/s, batch of 64 about 0.8M messages/s |
 | Over WebSocket | `http_load --mode ws`, 64 clients each with a sender and a receiver stream | about 1.5M messages/s sent, 1.25M delivered end to end, push latency p50 3 ms and p99 10 ms (1 client: 0.21M delivered, p50 0.2 ms) |
 | Over loopback HTTP | `examples/http_load.rs`, 64 keep-alive clients | single sends about 66k req/s; batches of 64 about 3.8M messages/s (60k req/s); pulls with `limit=256` about 34k pulls/s returning 2.2M messages/s |
 

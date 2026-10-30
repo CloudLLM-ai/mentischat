@@ -141,6 +141,13 @@ UNRELEASED
     reads the first 1024 agents. Throughput, not a contract change for any
     roster under 256: nothing is paged until more agents exist.
 
+  - feat(rest): POST /messages/batch sends up to 256 messages in one request:
+    an array of {from, to | room, body}, answered with an array of per-item
+    results in order (the receipt, or the contract error object). Each item
+    is validated and applied exactly like POST /messages and independently of
+    the others. Only this route accepts bodies above 1 MiB (up to 16 MiB), so a
+    batch of large messages fits. It is not an MCP tool.
+
   - feat(tui): started from a terminal, the daemon paints a live view: the
     MENTIS CHAT banner, tiles for where it listens, messages sent, agents and
     uptime, a Logs pane (tool calls, never message bodies), and a Registered

@@ -621,3 +621,122 @@ async fn room_size_limits_are_conflicts_over_rest() {
     );
     assert_eq!(v["rooms"], 256);
 }
+
+#[tokio::test]
+async fn batch_send_applies_each_item_like_post_messages_and_answers_in_order() {
+    let (_d, mut app) = app();
+    register_two(&mut app).await;
+    send(&mut app, post("/rooms", r#"{"agent":"a","room":"lobby"}"#)).await;
+    send(&mut app, post("/rooms/lobby/members", r#"{"agent":"b"}"#)).await;
+    let batch = r#"[
+        {"from":"a","to":"b","body":"one"},
+        {"from":"a","to":"ghost","body":"lost"},
+        {"from":"a","room":"lobby","body":"to the room"},
+        {"from":"a","to":"b","body":"  "},
+        {"from":"b","room":"lobby","to":"a","body":"both"},
+        7,
+        {"from":"a","to":"b","body":"two"}
+    ]"#;
+    let (s, v) = send(&mut app, post("/messages/batch", batch)).await;
+    assert_eq!(s, 200);
+    let results = v.as_array().unwrap();
+    assert_eq!(results.len(), 7);
+    assert_eq!(results[0]["to"], "b");
+    assert!(results[0]["id"].as_str().is_some());
+    assert_eq!(results[1]["error"], "unregistered");
+    assert_eq!(results[2]["room"], "lobby");
+    assert_eq!(results[3]["error"], "invalid_body");
+    assert_eq!(results[4]["error"], "invalid_body");
+    assert_eq!(results[5]["error"], "invalid_body");
+    assert_eq!(results[6]["to"], "b");
+
+    let (_, page) = send(&mut app, req("GET", "/inboxes/b")).await;
+    let bodies: Vec<&str> = page["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["body"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        bodies,
+        ["one", "to the room", "two"],
+        "failures did not stop or undo the rest"
+    );
+}
+
+#[tokio::test]
+async fn batch_send_rejects_a_bad_envelope() {
+    let (_d, mut app) = app();
+    register_two(&mut app).await;
+    let one = r#"{"from":"a","to":"b","body":"x"}"#;
+    let too_many = format!("[{}]", vec![one; 257].join(","));
+    let exactly = format!("[{}]", vec![one; 256].join(","));
+    for (body, status) in [
+        ("[]".to_string(), 400),
+        (one.to_string(), 400),
+        ("not json".to_string(), 400),
+        (too_many, 400),
+        (exactly, 200),
+    ] {
+        let (s, v) = send(&mut app, post("/messages/batch", &body)).await;
+        assert_eq!(s, status, "{}: {v}", &body[..body.len().min(40)]);
+    }
+    let (_, v) = send(&mut app, post("/messages/batch", "[]")).await;
+    assert_eq!(v["error"], "invalid_body");
+}
+
+#[tokio::test]
+async fn batch_send_accepts_bodies_past_the_one_mib_limit_of_other_routes() {
+    let (_d, mut app) = app();
+    register_two(&mut app).await;
+    // Twenty 60 KiB messages are about 1.2 MiB of JSON.
+    let big = "x".repeat(60 * 1024);
+    let items: Vec<String> = (0..20)
+        .map(|_| format!(r#"{{"from":"a","to":"b","body":"{big}"}}"#))
+        .collect();
+    let batch = format!("[{}]", items.join(","));
+    assert!(batch.len() > 1024 * 1024);
+    let (s, v) = send(&mut app, post("/messages/batch", &batch)).await;
+    assert_eq!(s, 200);
+    assert!(
+        v.as_array().unwrap().iter().all(|r| r["id"].is_string()),
+        "{v}"
+    );
+
+    // POST /messages keeps the 1 MiB limit.
+    let oversized = format!(
+        r#"{{"from":"a","to":"b","body":"{}"}}"#,
+        "x".repeat(1024 * 1024)
+    );
+    let (s, _) = send(&mut app, post("/messages", &oversized)).await;
+    assert_ne!(s, 200);
+}
+
+/// The composed daemon router caps bodies at 1 MiB, except the batch route.
+#[tokio::test]
+async fn in_the_composed_router_only_the_batch_route_may_exceed_one_mib() {
+    let dir = tempfile::tempdir().unwrap();
+    let bus = Arc::new(Bus::new(&dir.path().join("limits")).unwrap());
+    let mut app =
+        mentischat::build_router(bus).layer(axum::extract::connect_info::MockConnectInfo(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 51_234)),
+        ));
+    register_two(&mut app).await;
+    let big = "x".repeat(60 * 1024);
+    let items: Vec<String> = (0..20)
+        .map(|_| format!(r#"{{"from":"a","to":"b","body":"{big}"}}"#))
+        .collect();
+    let batch = format!("[{}]", items.join(","));
+    let (s, v) = send(&mut app, post("/messages/batch", &batch)).await;
+    assert_eq!(s, 200, "{v}");
+
+    // The same bytes to any other route are over the 1 MiB limit.
+    let (s, _) = send(&mut app, post("/messages", &batch)).await;
+    assert_eq!(s, 400);
+    let (s, v) = send(
+        &mut app,
+        post("/messages/batch", &"[".repeat(17 * 1024 * 1024)),
+    )
+    .await;
+    assert_eq!(s, 400, "{v}");
+}

@@ -234,6 +234,7 @@ Every tool maps to a route, for scripts:
 | `register` | `/agents` | `POST` |
 | `list_agents` | `/agents?after=&limit=` | `GET` |
 | `send_message` | `/messages` | `POST` |
+| batch of `send_message` | `/messages/batch` | `POST` |
 | `check_inbox` | `/inboxes/{agent}?wait_ms=` | `GET` |
 | `history` | `/history/{agent}?with=&room=&before=` | `GET` |
 | `deregister` | `/agents/{agent}` | `DELETE` |
@@ -255,6 +256,7 @@ Request bodies:
 |---|---|
 | `POST /agents` | `{"agent": "...", "provider"?: "...", "description"?: "...", "reclaim"?: true}` |
 | `POST /messages` | `{"from": "...", "to": "...", "body": "..."}`; `from` and `to` must be registered, `body` non-blank, at most 64 KiB. Or `"room"` in place of `"to"`: `from` must be a member |
+| `POST /messages/batch` | `[{"from", "to" or "room", "body"}, ...]`, 1 to 256 items; the request body may be up to 16 MiB (every other route: 1 MiB) |
 | `GET /inboxes/{agent}` | `?wait_ms=` (0–30000, default 0) |
 | `GET /history/{agent}` | `?with=` (a peer's name) or `?room=` (a room you are in), and `?before=` (a previous page's `next`), all optional |
 | `POST /rooms` | `{"agent": "...", "room": "...", "private"?: true, "description"?: "..."}` |
@@ -272,6 +274,7 @@ Field names are camelCase. The MCP tools return the same JSON.
 | `register` | `{"agent", "created", "lastSeen", "provider", "description"}`; `provider` and `description` are `null` when none is stored |
 | `list_agents` | `{"agents": [{"name", "provider", "description", "lastSeen", "queued"}], "next"?, "suggestions": [...]}`, sorted by name, one page of at most 256; `next` is present when more follow, to pass as `after`; `queued` counts unread mail; reading it changes nothing |
 | `send_message` | `{"id", "from", "to", "createdAt"}`; `room` in place of `to` for a room message |
+| batch send | `[...]`: one element per item, in order: the `send_message` receipt, or the error object (`{"error": ...}`) that item would have got from `POST /messages`. Items are applied independently, in order: a failing item neither stops nor undoes the others. A body that is not an array of 1 to 256 items is `invalid_body`. REST only: agents have no tool for it |
 | `check_inbox` | `{"agent", "messages": [{"id", "from", "to", "body", "createdAt", "readAt"}], "remaining", "skipped"?}`; the returned messages are now read. A room message has `room` in place of `to`; `skipped` is present only when above 0 |
 | `history` | `{"agent", "messages": [...], "next"}`; messages as in `check_inbox`, oldest first, `readAt` `null` while unread; `next` is `null` when nothing older is left |
 | `create_room`, `join_room`, `invite` | `{"room", "description", "private", "members": [...]}`, members sorted by name |

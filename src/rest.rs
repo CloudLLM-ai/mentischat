@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -22,12 +22,25 @@ use crate::names::AgentName;
 
 type Ctx = Arc<Bus>;
 
+/// Most messages in one `POST /messages/batch`.
+pub const MAX_BATCH_SEND: usize = 256;
+/// Largest `POST /messages/batch` request body: 16 MiB, room for a full batch
+/// of bodies of a few tens of KiB (the 1 MiB limit of every other route would
+/// cap a batch of large messages at 16 of them).
+pub const MAX_BATCH_BODY_BYTES: usize = 16 * 1024 * 1024;
+
 /// Build the REST router (merged into the app next to `/mcp`).
 pub fn router(bus: Ctx) -> Router {
     Router::new()
         .route("/agents", post(register).get(list))
         .route("/agents/{agent}", delete(deregister_one))
         .route("/messages", post(send_msg))
+        // A batch may carry many messages, so it alone gets a larger body
+        // limit than the 1 MiB the rest of the daemon allows.
+        .route(
+            "/messages/batch",
+            post(send_batch).layer(DefaultBodyLimit::max(MAX_BATCH_BODY_BYTES)),
+        )
         // A pull marks mail read, so HEAD (which axum would otherwise send to
         // the GET handler) is refused rather than consuming mail it does not
         // return.
@@ -134,6 +147,30 @@ async fn send_msg(State(bus): State<Ctx>, body: Result<Json<Value>, JsonRejectio
         Err(resp) => return resp,
     };
     respond(crate::tools::send_message(&bus, &v).await)
+}
+
+/// `POST /messages/batch` `[{ "from", "to" | "room", "body" }, ...]` — up to
+/// [`MAX_BATCH_SEND`] sends in one request. Each item is validated and
+/// applied exactly like `POST /messages`, in order, and answers with its
+/// receipt or its contract error object at the same position of the response
+/// array: one failing item does not stop or undo the others. A body that is
+/// not an array of 1 to [`MAX_BATCH_SEND`] items is `invalid_body`.
+async fn send_batch(State(bus): State<Ctx>, body: Result<Json<Value>, JsonRejection>) -> Response {
+    let items = match json_body(body) {
+        Ok(Value::Array(items)) if (1..=MAX_BATCH_SEND).contains(&items.len()) => items,
+        Ok(_) => return err_response(MailboxError::InvalidBody),
+        Err(resp) => return resp,
+    };
+    let mut results = Vec::with_capacity(items.len());
+    for item in &items {
+        let outcome = if item.is_object() {
+            crate::tools::send_message(&bus, item).await
+        } else {
+            Err(MailboxError::InvalidBody)
+        };
+        results.push(outcome.unwrap_or_else(|e| e.to_json()));
+    }
+    ok_response(Value::Array(results))
 }
 
 /// `GET /inboxes/{agent}?wait_ms=` — same as check_inbox: returned messages

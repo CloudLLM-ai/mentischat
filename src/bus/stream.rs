@@ -25,7 +25,6 @@ use std::sync::Arc;
 
 use tokio::sync::futures::Notified;
 
-use super::clock::now_ms;
 use super::park::ParkGuard;
 use super::state::{Agent, AgentState, Key, Page, State, Take};
 use super::{Bus, MailErr, Message, MAX_STREAM_BYTES, MAX_STREAM_IN_FLIGHT};
@@ -130,6 +129,7 @@ impl State {
         &self,
         agent: &Arc<Agent>,
         epoch: u64,
+        now: u64,
     ) -> Result<Option<super::state::Batch>, ()> {
         let mut st = agent.inner.lock();
         if st.removed {
@@ -140,7 +140,6 @@ impl State {
         if st.stream_epoch != epoch || items == 0 || bytes == 0 {
             return Ok(None);
         }
-        let now = now_ms();
         st.last_seen_ms = now;
         let rooms = st.rooms.clone();
         Ok(self.take_merged(agent, &mut st, &rooms, Take::Lease, Page { items, bytes }))
@@ -148,12 +147,11 @@ impl State {
 
     /// Acknowledge everything leased to the stream `epoch` with an id up to
     /// `up_to`: direct mail becomes read now. Returns how many.
-    fn stream_ack(&self, agent: &Arc<Agent>, epoch: u64, up_to: u64) -> usize {
+    fn stream_ack(&self, agent: &Arc<Agent>, epoch: u64, up_to: u64, now: u64) -> usize {
         let mut st = agent.inner.lock();
         if st.removed || st.stream_epoch != epoch {
             return 0;
         }
-        let now = now_ms();
         st.last_seen_ms = now;
         let (acked, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut st.leased)
             .into_iter()
@@ -230,7 +228,7 @@ impl Bus {
     pub fn stream_push(&self, session: &StreamSession) -> Result<Option<Push>, MailErr> {
         let state = self.open()?;
         let leased = state
-            .stream_lease(&session.agent, session.epoch)
+            .stream_lease(&session.agent, session.epoch, self.now_ms())
             .map_err(|()| state.unregistered(&session.agent.name))?;
         Ok(leased.map(|batch| Push {
             messages: batch.messages.iter().map(|m| m.to_wire()).collect(),
@@ -247,6 +245,6 @@ impl Bus {
     /// `shutting_down`.
     pub fn stream_ack(&self, session: &StreamSession, up_to: u64) -> Result<usize, MailErr> {
         let state = self.open()?;
-        Ok(state.stream_ack(&session.agent, session.epoch, up_to))
+        Ok(state.stream_ack(&session.agent, session.epoch, up_to, self.now_ms()))
     }
 }

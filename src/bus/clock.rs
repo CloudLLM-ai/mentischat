@@ -1,5 +1,6 @@
 //! UTC timestamps without a date-time dependency.
 
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Current time as UTC RFC 3339 with millisecond precision.
@@ -16,8 +17,33 @@ pub(super) fn unix_ms(t: SystemTime) -> u64 {
 }
 
 /// [`unix_ms`] of the current time.
-pub(super) fn now_ms() -> u64 {
+fn system_ms() -> u64 {
     unix_ms(SystemTime::now())
+}
+
+/// Where a [`crate::bus::Bus`] reads the time: the system clock, or a
+/// function the caller supplies (see [`crate::bus::Bus::with_clock`]).
+///
+/// An enum rather than a boxed closure only so the default costs a branch,
+/// not an indirect call, on every send and pull.
+#[derive(Clone, Default)]
+pub(super) enum Clock {
+    /// `SystemTime::now()`.
+    #[default]
+    System,
+    /// Milliseconds since the Unix epoch from the caller.
+    Custom(Arc<dyn Fn() -> u64 + Send + Sync>),
+}
+
+impl Clock {
+    /// Milliseconds since the Unix epoch now.
+    #[inline]
+    pub(super) fn now_ms(&self) -> u64 {
+        match self {
+            Self::System => system_ms(),
+            Self::Custom(f) => f(),
+        }
+    }
 }
 
 /// `ms` (milliseconds since the Unix epoch) as UTC RFC 3339.

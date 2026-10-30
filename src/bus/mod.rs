@@ -27,7 +27,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::time::Instant;
 
@@ -63,7 +63,7 @@ pub use model::{
 pub use snapshot::{remove_snapshot, SnapshotError};
 pub use stream::{Push, StreamSession};
 
-use clock::{now_ms, rfc3339_ms, unix_ms};
+use clock::{rfc3339_ms, unix_ms, Clock};
 use delivery::{history_page, history_rows};
 use log::{json_len, Msg};
 use park::{ParkGuard, Signal};
@@ -123,6 +123,9 @@ pub struct Bus {
     /// Where [`close`](Self::close) writes its snapshot and [`new`](Self::new)
     /// looks for one.
     data_dir: PathBuf,
+    /// Where the engine reads the time; the system clock unless
+    /// [`with_clock`](Self::with_clock) replaced it.
+    clock: Clock,
 }
 
 impl Bus {
@@ -156,6 +159,7 @@ impl Bus {
             state,
             retention,
             data_dir: data_dir.to_path_buf(),
+            clock: Clock::System,
         })
     }
 
@@ -171,6 +175,36 @@ impl Bus {
     pub fn with_byte_budget(mut self, bytes: usize) -> Self {
         self.state.byte_budget = bytes;
         self
+    }
+
+    /// Read the time from `now_ms` (milliseconds since the Unix epoch)
+    /// instead of the system clock: for tests and fuzzing, so mail ages,
+    /// names are held and agents go idle by moving a counter rather than by
+    /// sleeping. Every timestamp the bus stamps and every expiry
+    /// [`sweep`](Self::sweep) computes comes from it. Waits and deadlines of
+    /// a blocking pull still run on real time.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::{atomic::{AtomicU64, Ordering}, Arc};
+    /// # let dir = std::env::temp_dir().join("mentischat_with_clock_doc");
+    /// let now = Arc::new(AtomicU64::new(1_000));
+    /// let tick = now.clone();
+    /// let bus = mentischat::bus::Bus::new(&dir)
+    ///     .unwrap()
+    ///     .with_clock(move || tick.load(Ordering::Relaxed));
+    /// now.store(2_000, Ordering::Relaxed);
+    /// # drop(bus);
+    /// ```
+    pub fn with_clock(mut self, now_ms: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
+        self.clock = Clock::Custom(Arc::new(now_ms));
+        self
+    }
+
+    /// Milliseconds since the Unix epoch by this bus's clock.
+    fn now_ms(&self) -> u64 {
+        self.clock.now_ms()
     }
 
     /// How long read mail and idle agents are kept, and released names held.
@@ -214,7 +248,7 @@ impl Bus {
         let description = opts.description.map(validate_description).transpose()?;
         let provider = opts.provider.map(|p| p.as_str().to_string());
         let state = self.open()?;
-        let now = now_ms();
+        let now = self.now_ms();
         let key = name.folded();
         // Membership changes are serialized by `holds`.
         let mut holds = state.holds.lock();
@@ -261,7 +295,7 @@ impl Bus {
     /// [`Retention::name_hold`].
     pub async fn deregister(&self, name: &AgentName) -> Result<DiscardOutcome, MailErr> {
         let state = self.open()?;
-        let until_ms = now_ms() + self.retention.name_hold.as_millis() as u64;
+        let until_ms = self.now_ms() + self.retention.name_hold.as_millis() as u64;
         match state.remove_agent(&name.folded(), until_ms) {
             Some((agent, discarded)) => Ok(DiscardOutcome {
                 agent: agent.name.to_string(),
@@ -292,7 +326,7 @@ impl Bus {
         let (page, more) = state.agents_page(after.as_deref(), limit.clamp(1, MAX_PAGE));
         let rows: Vec<_> = page.iter().map(|a| roster_row(state, a)).collect();
         let next = more.then(|| rows.last().map(|r| r.name.clone())).flatten();
-        let suggestions = state.free_suggestions(&state.holds.lock(), now_ms());
+        let suggestions = state.free_suggestions(&state.holds.lock(), self.now_ms());
         let agents = rows
             .into_iter()
             .map(|row| RosterEntry {
@@ -323,7 +357,7 @@ impl Bus {
     ///
     /// `shutting_down` once the bus is closed.
     pub async fn overview(&self) -> Result<Overview, MailErr> {
-        let now = now_ms();
+        let now = self.now_ms();
         let state = self.open()?;
         let agents = state
             .agents_page(None, MAX_OVERVIEW_AGENTS)
@@ -358,9 +392,13 @@ impl Bus {
     ) -> Result<SendReceipt, MailErr> {
         let body_json_len = validate_body(&body)?;
         let body = body.into_boxed_str();
-        let msg = self
-            .open()?
-            .send(from.as_str(), to.as_str(), body, body_json_len, now_ms())?;
+        let msg = self.open()?.send(
+            from.as_str(),
+            to.as_str(),
+            body,
+            body_json_len,
+            self.now_ms(),
+        )?;
         Ok(SendReceipt::from(&*msg))
     }
 
@@ -446,7 +484,7 @@ impl Bus {
         name: &AgentName,
         page: Page,
     ) -> Result<Option<Taken>, MailErr> {
-        match state.pull(agent, now_ms(), page) {
+        match state.pull(agent, self.now_ms(), page) {
             Pulled::Gone => Err(state.unregistered(name.as_str())),
             Pulled::Nothing => Ok(None),
             Pulled::Batch(batch) => Ok(Some(Taken {
@@ -642,7 +680,7 @@ impl Bus {
             room,
             body.into_boxed_str(),
             body_json_len,
-            now_ms(),
+            self.now_ms(),
         )?;
         Ok(SendReceipt::from(&*msg))
     }
@@ -678,7 +716,7 @@ impl Bus {
                 drop(st);
                 return Err(state.unregistered(name.as_str()));
             }
-            st.last_seen_ms = now_ms();
+            st.last_seen_ms = self.now_ms();
         }
         Ok((state, agent))
     }
@@ -688,7 +726,8 @@ impl Bus {
     /// addressed to them), as of now. Unread mail is never expired. The
     /// daemon runs this on a timer; see [`sweep_at`](Self::sweep_at).
     pub async fn sweep(&self) -> Result<SweepOutcome, MailErr> {
-        self.sweep_at(SystemTime::now()).await
+        self.sweep_at(UNIX_EPOCH + Duration::from_millis(self.now_ms()))
+            .await
     }
 
     /// [`sweep`](Self::sweep) as of `now` (injectable for tests).

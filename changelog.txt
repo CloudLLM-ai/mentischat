@@ -164,6 +164,12 @@ UNRELEASED
     before. A bad limit is invalid_limit (400), on list_agents and list_rooms
     too.
 
+  - feat(bus): Bus::with_clock(f) reads every engine timestamp (last seen,
+    read time, expiry, name holds) from f, milliseconds since the Unix epoch,
+    instead of the system clock, so tests and fuzzers age mail by moving a
+    counter instead of sleeping. Also removes the unused private_room error
+    code, which was documented as reserved and never sent.
+
   - test(bench): benches/bus.rs (engine, contention, room fan-out), benches/rest.rs
     (handlers without a socket) and examples/http_load.rs (keep-alive HTTP
     clients: single sends, batches of 64, pulls with limit 256). On a loaded

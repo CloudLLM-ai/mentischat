@@ -388,6 +388,7 @@ Source of truth: `src/bus/model.rs`.
 | Roster agents | 256 |
 | Rooms | 256 |
 | Messages a room keeps | 1024 (the oldest is pushed out; `skipped` reports it) |
+| Message bodies held at once, direct and room | 256 MiB. A direct send past it deletes the oldest read message, a room send pushes out its room's oldest, and `storage_full` (507) follows when nothing can give way: unread direct mail is never evicted |
 | Batch per pull or history page | 8 msgs / 16 KiB of message JSON |
 | Suggested names offered | 5 |
 | Blocking pull (`wait_ms`) | 0–30000 ms |

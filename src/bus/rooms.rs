@@ -96,21 +96,24 @@ impl RoomState {
         }
     }
 
-    /// Append `msg` (its id exceeds every id in the log), pushing the oldest
-    /// message out at `capacity`, and count it unread for every member but
-    /// its sender, waking a pull parked on each.
-    fn append(&mut self, msg: Arc<Msg>, capacity: usize) {
-        while self.log.len() >= capacity {
-            let Some(oldest) = self.log.pop_front() else {
-                break;
-            };
-            for member in self.members.values_mut() {
-                if oldest.id > member.cursor && !oldest.from.eq_ignore_ascii_case(&member.name) {
-                    member.unread -= 1;
-                    member.skipped += 1;
-                }
+    /// Push the oldest message out, telling every member that had not taken
+    /// it that it missed one. Returns the bytes freed; `None` when the log is
+    /// empty.
+    fn evict_oldest(&mut self) -> Option<usize> {
+        let oldest = self.log.pop_front()?;
+        for member in self.members.values_mut() {
+            if oldest.id > member.cursor && !oldest.from.eq_ignore_ascii_case(&member.name) {
+                member.unread -= 1;
+                member.skipped += 1;
             }
         }
+        Some(oldest.body.len())
+    }
+
+    /// Append `msg` (its id exceeds every id in the log; the caller has made
+    /// room), and count it unread for every member but its sender, waking a
+    /// pull parked on each.
+    fn append(&mut self, msg: Arc<Msg>) {
         for member in self.members.values_mut() {
             if msg.from.eq_ignore_ascii_case(&member.name) {
                 continue;
@@ -329,6 +332,9 @@ impl State {
         self.rooms.retain(|room| {
             let mut st = room.inner.lock();
             st.retired = st.members.is_empty();
+            if st.retired {
+                self.release_bytes(st.log.iter().map(|m| m.body.len()).sum());
+            }
             !st.retired
         });
     }
@@ -372,6 +378,36 @@ impl State {
                     room: found.name.to_string(),
                 });
             }
+            // Make room: first the room's own capacity, then the byte budget,
+            // each by pushing out this room's oldest message.
+            let len = body.len();
+            while st.log.len() >= self.room_capacity {
+                let freed = st.evict_oldest().unwrap_or(0);
+                self.release_bytes(freed);
+            }
+            let mut checked = false;
+            while !self.try_reserve_bytes(len) {
+                // Pushing out this whole room cannot help when the rest of
+                // the budget is held elsewhere: fail before evicting anything.
+                if !checked {
+                    checked = true;
+                    let own: usize = st.log.iter().map(|m| m.body.len()).sum();
+                    let others = self.bytes.0.load(Relaxed).saturating_sub(own);
+                    if others.saturating_add(len) > self.byte_budget {
+                        return Err(MailErr::StorageFull {
+                            pending: self.unread.0.load(Relaxed) as i64,
+                        });
+                    }
+                }
+                match st.evict_oldest() {
+                    Some(n) => self.release_bytes(n),
+                    None => {
+                        return Err(MailErr::StorageFull {
+                            pending: self.unread.0.load(Relaxed) as i64,
+                        });
+                    }
+                }
+            }
             // Under the room's lock, so the log stays sorted by id.
             let id = self.next_id.0.fetch_add(1, Relaxed);
             let msg = Arc::new(Msg::new(
@@ -386,7 +422,7 @@ impl State {
                 body_json_len,
                 now_ms,
             ));
-            st.append(msg.clone(), self.room_capacity);
+            st.append(msg.clone());
             msg
         };
         let mut from_state = sender.inner.lock();

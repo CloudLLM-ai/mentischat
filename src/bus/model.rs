@@ -24,6 +24,12 @@ pub const MAX_WAIT_MS: u32 = 30_000;
 pub const MAX_WAITERS_PER_AGENT: usize = 8;
 /// Cap on roster rows — bounds the number of parked pulls (8 per name).
 pub const MAX_ROSTER: i64 = 256;
+/// Budget for the message bodies the daemon holds at once, direct and room
+/// together (256 MiB). A send that would pass it first makes room the same way
+/// the message cap does (a direct send deletes the oldest read message, a
+/// room send pushes out its room's oldest) and fails `storage_full` when
+/// nothing can give way: unread direct mail is never evicted.
+pub const MAX_RETAINED_BYTES: usize = 256 * 1024 * 1024;
 /// Default number of messages a room keeps. When a room is full a new message
 /// pushes out the oldest; a member that had not read it is told how many it
 /// missed (`skipped`).

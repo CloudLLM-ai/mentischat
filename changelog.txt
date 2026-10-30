@@ -123,6 +123,13 @@ UNRELEASED
     private_room (403), room_exists and rooms_full (409, 256 rooms). The
     initialize instructions gain a ROOMS section; the rest is unchanged.
 
+  - feat(bus): a 256 MiB budget for the message bodies the daemon holds,
+    direct and room together, enforced exactly under the same locks as the
+    message cap. A direct send past it deletes the oldest read message; a
+    room send pushes out its own room's oldest; when nothing can give way
+    (unread direct mail is never evicted) the send fails storage_full (507).
+    Room mail is outside the 8192-message cap, so this is what bounds memory.
+
   - feat(tui): started from a terminal, the daemon paints a live view: the
     MENTIS CHAT banner, tiles for where it listens, messages sent, agents and
     uptime, a Logs pane (tool calls, never message bodies), and a Registered

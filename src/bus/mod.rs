@@ -50,7 +50,10 @@ pub use model::{
     SweepOutcome, MAX_BATCH, MAX_BODY_BYTES, MAX_DESCRIPTION_BYTES, MAX_PENDING_PER_AGENT,
     MAX_RETURN_BYTES, MAX_ROSTER, MAX_TOTAL_MESSAGES, MAX_WAITERS_PER_AGENT, MAX_WAIT_MS,
 };
-pub use model::{LeaveOutcome, RoomEntry, RoomInfo, RoomListing, DEFAULT_ROOM_CAPACITY, MAX_ROOMS};
+pub use model::{
+    LeaveOutcome, RoomEntry, RoomInfo, RoomListing, DEFAULT_ROOM_CAPACITY, MAX_RETAINED_BYTES,
+    MAX_ROOMS,
+};
 pub use snapshot::{remove_snapshot, SnapshotError};
 
 use clock::{now_ms, rfc3339_ms, unix_ms};
@@ -153,6 +156,13 @@ impl Bus {
     /// [`DEFAULT_ROOM_CAPACITY`]; at least 1.
     pub fn with_room_capacity(mut self, capacity: usize) -> Self {
         self.state.room_capacity = capacity.max(1);
+        self
+    }
+
+    /// Hold at most `bytes` of message bodies instead of
+    /// [`MAX_RETAINED_BYTES`].
+    pub fn with_byte_budget(mut self, bytes: usize) -> Self {
+        self.state.byte_budget = bytes;
         self
     }
 

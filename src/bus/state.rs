@@ -397,10 +397,19 @@ pub(super) fn fitting(sizes: impl Iterator<Item = usize>) -> usize {
 struct Outgoing<'a> {
     /// The conversation it belongs to, see [`convo_key`].
     key: &'a str,
-    body: Box<str>,
+    /// The body, taken once the message is filed.
+    body: &'a mut Option<Box<str>>,
     /// The body's JSON-escaped size.
     body_json_len: usize,
     now_ms: u64,
+}
+
+/// Why `deliver` did not queue a message.
+enum Refused {
+    /// A contract error: the send fails with it.
+    Error(MailErr),
+    /// The byte budget is full: delete the oldest read message and retry.
+    NoRoom,
 }
 
 /// Mail taken by a pull.
@@ -433,6 +442,10 @@ pub(super) struct State {
     pub total: Padded<AtomicUsize>,
     /// Live unread messages.
     pub unread: Padded<AtomicUsize>,
+    /// Bytes of message bodies held, direct and room.
+    pub bytes: Padded<AtomicUsize>,
+    /// What `bytes` may reach.
+    pub byte_budget: usize,
     /// Id of the next message.
     pub next_id: Padded<AtomicU64>,
     /// Generation of the next registration.
@@ -456,6 +469,8 @@ impl State {
             no_agent: "".into(),
             total: Padded(AtomicUsize::new(0)),
             unread: Padded(AtomicUsize::new(0)),
+            bytes: Padded(AtomicUsize::new(0)),
+            byte_budget: super::MAX_RETAINED_BYTES,
             next_id: Padded(AtomicU64::new(1)),
             next_gen: AtomicU64::new(1),
             sent_by_gone: AtomicU64::new(0),
@@ -565,25 +580,36 @@ impl State {
         let sender = self.agent(from, from_key.as_str())?;
         let recipient = self.agent(to, to_key.as_str())?;
         let key = convo_key(&from_key, &to_key);
-        let delivered = {
-            let mut to_state = recipient.inner.lock();
-            if to_state.removed {
-                None
-            } else {
-                let out = Outgoing {
-                    key: key.as_str(),
-                    body,
-                    body_json_len,
-                    now_ms,
-                };
-                Some(self.deliver(&mut to_state, &sender, &recipient, out))
+        let mut body = Some(body);
+        let (msg, at_cap) = loop {
+            let delivered = {
+                let mut to_state = recipient.inner.lock();
+                if to_state.removed {
+                    None
+                } else {
+                    let out = Outgoing {
+                        key: key.as_str(),
+                        body: &mut body,
+                        body_json_len,
+                        now_ms,
+                    };
+                    Some(self.deliver(&mut to_state, &sender, &recipient, out))
+                }
+            };
+            // The roster is only read, and another agent only locked (to
+            // prune), once the recipient's lock is released.
+            match delivered {
+                None => return Err(self.unregistered(to)),
+                Some(Ok(done)) => break done,
+                Some(Err(Refused::Error(e))) => return Err(e),
+                Some(Err(Refused::NoRoom)) => {
+                    if !self.prune_oldest_read() {
+                        return Err(MailErr::StorageFull {
+                            pending: self.unread.0.load(Relaxed) as i64,
+                        });
+                    }
+                }
             }
-        };
-        // The roster is only read once the recipient's lock is released: the
-        // roster comes first in the lock order.
-        let (msg, at_cap) = match delivered {
-            Some(result) => result?,
-            None => return Err(self.unregistered(to)),
         };
         // The live count was raised with the message; at the cap the oldest
         // read message makes room. Unread mail is under the cap, so there is
@@ -612,15 +638,22 @@ impl State {
         sender: &Agent,
         recipient: &Agent,
         out: Outgoing<'_>,
-    ) -> Result<(Arc<Msg>, bool), MailErr> {
+    ) -> Result<(Arc<Msg>, bool), Refused> {
         let pending = to_state.unread.len();
         if pending >= MAX_PENDING_PER_AGENT as usize {
-            return Err(MailErr::QueueFull {
+            return Err(Refused::Error(MailErr::QueueFull {
                 to: recipient.name.to_string(),
                 pending: pending as i64,
-            });
+            }));
         }
-        let at_cap = self.reserve()?;
+        let len = out.body.as_ref().map_or(0, |b| b.len());
+        if !self.try_reserve_bytes(len) {
+            return Err(Refused::NoRoom);
+        }
+        let at_cap = self.reserve().map_err(|e| {
+            self.release_bytes(len);
+            Refused::Error(e)
+        })?;
         let msg = self.file(out, sender, recipient);
         to_state.unread.push_back(msg.clone());
         if recipient.signal.parked() > 0 {
@@ -657,23 +690,54 @@ impl State {
         Ok(self.total.0.fetch_add(1, Relaxed) >= MAX_TOTAL_MESSAGES as usize)
     }
 
+    /// Count `n` more body bytes, unless that passes the budget.
+    pub(super) fn try_reserve_bytes(&self, n: usize) -> bool {
+        let mut held = self.bytes.0.load(Relaxed);
+        loop {
+            if held.saturating_add(n) > self.byte_budget {
+                return false;
+            }
+            match self
+                .bytes
+                .0
+                .compare_exchange_weak(held, held + n, Relaxed, Relaxed)
+            {
+                Ok(_) => return true,
+                Err(now) => held = now,
+            }
+        }
+    }
+
+    /// Give `n` body bytes back (never below zero).
+    pub(super) fn release_bytes(&self, n: usize) {
+        let mut held = self.bytes.0.load(Relaxed);
+        while let Err(now) =
+            self.bytes
+                .0
+                .compare_exchange_weak(held, held.saturating_sub(n), Relaxed, Relaxed)
+        {
+            held = now;
+        }
+    }
+
     /// Delete the message that has been read longest, comparing the read
     /// times the agents publish and locking only the one that holds it.
     /// Retries when it lost a race for that message to another prune or a
-    /// sweep.
-    fn prune_oldest_read(&self) {
+    /// sweep. False when no read message is left to delete.
+    fn prune_oldest_read(&self) -> bool {
         loop {
             let oldest = self.roster.min_by_rank(|a| {
                 let read_ms = a.oldest_read.0.load(Relaxed);
                 (read_ms != NEVER).then(|| (read_ms, a.oldest_read.1.load(Relaxed)))
             });
-            let Some(agent) = oldest else { return };
+            let Some(agent) = oldest else { return false };
             let mut st = agent.inner.lock();
-            let killed = st.read.pop_front().is_some_and(|m| m.kill());
+            let killed = st.read.pop_front().filter(|m| m.kill());
             agent.publish_oldest_read(&st);
-            if killed {
+            if let Some(msg) = killed {
                 self.total.0.fetch_sub(1, Relaxed);
-                return;
+                self.release_bytes(msg.body.len());
+                return true;
             }
         }
     }
@@ -687,6 +751,7 @@ impl State {
             body_json_len,
             now_ms,
         } = out;
+        let body = body.take().unwrap_or_default();
         loop {
             let convo = self.convo(key);
             let mut log = convo.log.lock();
@@ -850,8 +915,9 @@ impl State {
                 if front.read_at_ms().is_some_and(|ms| ms >= cutoff_ms) {
                     break;
                 }
-                if st.read.pop_front().is_some_and(|m| m.kill()) {
+                if let Some(msg) = st.read.pop_front().filter(|m| m.kill()) {
                     self.total.0.fetch_sub(1, Relaxed);
+                    self.release_bytes(msg.body.len());
                     expired += 1;
                 }
             }
@@ -899,17 +965,17 @@ impl State {
     /// killed.
     fn discard_mail_to(&self, key: &str, gen: u64) -> usize {
         let convos = self.convos.values_where(|k| convo_has(k, key));
-        let mut discarded = 0;
+        let (mut discarded, mut freed) = (0, 0);
         for convo in convos {
             let mut log = convo.log.lock();
-            discarded += log
-                .live()
-                .filter(|m| m.to_gen == gen)
-                .filter(|m| m.kill())
-                .count();
+            for msg in log.live().filter(|m| m.to_gen == gen && m.kill()) {
+                discarded += 1;
+                freed += msg.body.len();
+            }
             log.compact();
         }
         self.reap_empty_convos();
+        self.release_bytes(freed);
         discarded
     }
 
@@ -963,6 +1029,7 @@ impl State {
         }
         self.total.0.store(0, Relaxed);
         self.unread.0.store(0, Relaxed);
+        self.bytes.0.store(0, Relaxed);
         counts
     }
 }

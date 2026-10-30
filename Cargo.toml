@@ -17,7 +17,7 @@ exclude = ["/target", "/.github", "/launchd"]
 
 [dependencies]
 async-trait = "0.1.92"
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 # Pinned exactly: this crate builds against upstream's ToolProtocol and
 # streamable_http_router surface, which is not yet stable across minors.
 cloudllm_mcp = { version = "=0.3.6", features = ["server"] }
@@ -31,9 +31,11 @@ tracing-subscriber = "0.3.23"
 uuid = { version = "1.25.0", features = ["v4"] }
 
 [dev-dependencies]
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 http = "1"
 http-body-util = "0.1.5"
 tempfile = "3.27.0"
+tokio-tungstenite = "0.29"
 tower = { version = "0.5.3", features = ["util"] }
 
 # Criterion without its plotting and parallel-iterator extras: the bench only

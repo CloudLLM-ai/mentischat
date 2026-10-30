@@ -29,6 +29,7 @@ pub mod names;
 pub mod rest;
 pub mod tools;
 pub mod tui;
+pub mod ws;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;

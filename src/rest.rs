@@ -50,13 +50,14 @@ pub fn router(bus: Ctx) -> Router {
         .route("/rooms/{room}/members", post(join_room))
         .route("/rooms/{room}/members/{agent}", delete(leave_room))
         .route("/rooms/{room}/invitations", post(invite))
+        .route("/ws", get(crate::ws::upgrade))
         .route("/health", get(health))
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .with_state(bus)
 }
 
-fn err_response(e: MailboxError) -> Response {
+pub(crate) fn err_response(e: MailboxError) -> Response {
     (e.http_status(), Json(e.to_json())).into_response()
 }
 

@@ -185,6 +185,11 @@ impl State {
 }
 
 impl Bus {
+    /// True once the bus has been closed or shut down.
+    pub fn is_closed(&self) -> bool {
+        self.state.closed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Fail `unregistered` unless `name` is on the roster: the check a stream
     /// route makes before it upgrades the connection.
     pub fn check_registered(&self, name: &AgentName) -> Result<(), MailErr> {

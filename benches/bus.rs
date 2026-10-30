@@ -144,9 +144,7 @@ fn bench_contention(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(3));
     for tasks in [1u64, 2, 4, 8, 16, 32] {
         group.bench_function(format!("{tasks}_pairs"), |b| {
-            b.iter_custom(|iters| {
-                rt.block_on(contended(bus.clone(), tasks, iters, &body))
-            });
+            b.iter_custom(|iters| rt.block_on(contended(bus.clone(), tasks, iters, &body)));
         });
     }
     group.finish();

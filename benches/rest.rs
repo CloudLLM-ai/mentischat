@@ -100,10 +100,7 @@ fn bench_rest(c: &mut Criterion) {
             || {
                 rt.block_on(async {
                     for _ in 0..8 {
-                        pull_bus
-                            .send(&s, &r, BODY.to_string())
-                            .await
-                            .expect("send");
+                        pull_bus.send(&s, &r, BODY.to_string()).await.expect("send");
                     }
                 });
                 let req = Request::builder()
@@ -113,7 +110,9 @@ fn bench_rest(c: &mut Criterion) {
                 (pull_app.clone(), req)
             },
             |(app, req)| {
-                rt.block_on(async { std::hint::black_box(app.oneshot(req).await.expect("response")) })
+                rt.block_on(async {
+                    std::hint::black_box(app.oneshot(req).await.expect("response"))
+                })
             },
             BatchSize::PerIteration,
         );

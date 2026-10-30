@@ -3,6 +3,9 @@
 
 default: help
 CARGO_CMD=/usr/bin/env cargo
+# cargo-sweep (cargo install cargo-sweep), when installed, deletes whatever an older build
+# left in target/ that this build didn't use, so only fresh release artifacts remain.
+SWEEP := $(shell command -v cargo-sweep >/dev/null 2>&1 && echo cargo sweep)
 MENTISCHAT_PORT?=9480
 MSRV?=1.88
 
@@ -11,8 +14,10 @@ MSRV?=1.88
 # ----------------------------------------------------------------------------------------------------------------------
 
 # Build the crate. Does not reformat: build targets should not rewrite sources.
-build: ## Build the crate in release mode
+build: ## Build the crate in release mode, then sweep stale artifacts
+	$(if $(SWEEP),$(SWEEP) --stamp)
 	${CARGO_CMD} build --release
+	$(if $(SWEEP),$(SWEEP) --file)
 
 # Full release process (ensures everything runs in the correct order)
 release: fmt check clippy build test doc ## Perform a full release (fmt, check, clippy, build, test, doc)

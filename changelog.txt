@@ -119,9 +119,10 @@ UNRELEASED
     local agents, not a boundary: identity is still the name a caller
     supplies. A room with no members is deleted, deregistering or idling out
     leaves every room, and rooms are part of the MENTISCHAT_PERSIST snapshot.
-    New errors: invalid_room (400), room_not_found (404), not_a_member and
-    private_room (403), room_exists and rooms_full (409). The
-    initialize instructions gain a ROOMS section; the rest is unchanged.
+    New errors: invalid_room (400), room_not_found (404), not_a_member (403;
+    a private room answers room_not_found to outsiders instead), room_exists
+    and rooms_full (409). The initialize instructions gain a ROOMS section;
+    the rest is unchanged.
 
   - feat(bus): a 256 MiB budget for the memory of the messages the daemon
     holds (each body plus 160 bytes of overhead), direct and room together,

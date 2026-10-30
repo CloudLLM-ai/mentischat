@@ -746,7 +746,7 @@ async fn room_tool_failures_are_contract_errors() {
         (
             "join_room",
             json!({"agent": "b", "room": "den"}),
-            "private_room",
+            "room_not_found",
         ),
         (
             "join_room",
@@ -777,7 +777,7 @@ async fn room_tool_failures_are_contract_errors() {
         (
             "invite",
             json!({"agent": "b", "room": "den", "invitee": "a"}),
-            "not_a_member",
+            "room_not_found",
         ),
         (
             "invite",
@@ -787,12 +787,12 @@ async fn room_tool_failures_are_contract_errors() {
         (
             "leave_room",
             json!({"agent": "b", "room": "den"}),
-            "not_a_member",
+            "room_not_found",
         ),
         (
             "history",
             json!({"agent": "b", "room": "den"}),
-            "not_a_member",
+            "room_not_found",
         ),
         (
             "history",
@@ -802,7 +802,7 @@ async fn room_tool_failures_are_contract_errors() {
         (
             "send_message",
             json!({"from": "b", "room": "den", "body": "x"}),
-            "not_a_member",
+            "room_not_found",
         ),
         (
             "send_message",

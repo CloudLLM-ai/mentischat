@@ -128,11 +128,11 @@ async fn a_private_room_is_invite_only_and_unlisted() {
     assert_eq!(seen("b").await, ["plaza"], "den is unlisted");
     assert!(matches!(
         bus.join_room(&name("b"), &room("den")).await,
-        Err(MailboxError::PrivateRoom { .. })
+        Err(MailboxError::RoomNotFound { .. })
     ));
     assert!(matches!(
         bus.invite(&name("b"), &room("den"), &name("c")).await,
-        Err(MailboxError::NotAMember { .. })
+        Err(MailboxError::RoomNotFound { .. })
     ));
 
     bus.invite(&name("a"), &room("den"), &name("b"))
@@ -486,4 +486,63 @@ async fn invitations_are_bounded_and_forgotten_when_the_invitee_leaves() {
     bus.invite(&name("owner"), &room("den"), &name("late"))
         .await
         .unwrap();
+}
+
+/// A private room does not admit it exists: every call by an agent that is
+/// neither a member nor invited gets room_not_found, the same as for a name
+/// no room has. Public rooms, and invitees, still learn they are not members.
+#[tokio::test]
+async fn a_private_room_answers_room_not_found_to_outsiders() {
+    let (_d, bus) = fresh_bus("hidden");
+    register(&bus, &["a", "b", "c"]).await;
+    bus.create_room(&name("a"), &room("den"), true, None)
+        .await
+        .unwrap();
+    bus.create_room(&name("a"), &room("plaza"), false, None)
+        .await
+        .unwrap();
+    bus.invite(&name("a"), &room("den"), &name("c"))
+        .await
+        .unwrap();
+
+    let not_found = |e: MailboxError| matches!(e, MailboxError::RoomNotFound { .. });
+    assert!(not_found(
+        bus.join_room(&name("b"), &room("den")).await.unwrap_err()
+    ));
+    assert!(not_found(
+        bus.send_room(&name("b"), &room("den"), "x".into())
+            .await
+            .unwrap_err()
+    ));
+    assert!(not_found(
+        bus.room_history(&name("b"), &room("den"), None)
+            .await
+            .unwrap_err()
+    ));
+    assert!(not_found(
+        bus.invite(&name("b"), &room("den"), &name("c"))
+            .await
+            .unwrap_err()
+    ));
+    assert!(not_found(
+        bus.leave_room(&name("b"), &room("den")).await.unwrap_err()
+    ));
+    // The same call for a room that does not exist looks identical.
+    let ghost = bus
+        .join_room(&name("b"), &room("nowhere"))
+        .await
+        .unwrap_err();
+    let hidden = bus.join_room(&name("b"), &room("den")).await.unwrap_err();
+    assert_eq!(ghost.code(), hidden.code());
+    assert_eq!(ghost.http_status(), hidden.http_status());
+
+    // A public room says what it is; so does a private one to its invitee.
+    assert!(matches!(
+        bus.send_room(&name("b"), &room("plaza"), "x".into()).await,
+        Err(MailboxError::NotAMember { .. })
+    ));
+    assert!(matches!(
+        bus.send_room(&name("c"), &room("den"), "x".into()).await,
+        Err(MailboxError::NotAMember { .. })
+    ));
 }

@@ -477,7 +477,7 @@ async fn private_rooms_are_joined_by_invitation_over_rest() {
     )
     .await;
     let (s, v) = send(&mut app, post("/rooms/den/members", r#"{"agent":"b"}"#)).await;
-    assert_eq!((s, &v["error"]), (403, &Value::from("private_room")));
+    assert_eq!((s, &v["error"]), (404, &Value::from("room_not_found")));
     let (_, listed) = send(&mut app, req("GET", "/rooms?agent=b")).await;
     assert_eq!(listed["rooms"], serde_json::json!([]));
 

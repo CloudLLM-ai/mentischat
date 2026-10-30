@@ -171,6 +171,24 @@ impl RoomState {
     }
 }
 
+/// The error for `agent` using a room it is not in. A private room answers
+/// `room_not_found` unless the agent was invited, so asking about a name
+/// cannot tell a private room from none; `create_room`'s `room_exists` can
+/// still reveal that a name is taken.
+fn not_in_room(room: &Room, st: &RoomState, agent: &Agent, asked: &RoomName) -> MailErr {
+    let invited = st.invited.contains(Key::fold(&agent.name).as_str());
+    if st.retired || (room.private && !invited) {
+        MailErr::RoomNotFound {
+            room: asked.to_string(),
+        }
+    } else {
+        MailErr::NotAMember {
+            agent: agent.name.to_string(),
+            room: room.name.to_string(),
+        }
+    }
+}
+
 /// Room mail waiting for one agent, as one pull sees it.
 pub(super) struct Waiting {
     /// The oldest unread messages, at most a page's worth, oldest first.
@@ -321,8 +339,10 @@ impl State {
                     });
                 }
                 if found.private && !st.invited.remove(key.as_str()) {
-                    return Err(MailErr::PrivateRoom {
-                        room: found.name.to_string(),
+                    // A private room does not admit it exists to an agent
+                    // that was not invited.
+                    return Err(MailErr::RoomNotFound {
+                        room: room.to_string(),
                     });
                 }
                 let member = st.member_for(agent);
@@ -345,10 +365,7 @@ impl State {
         let found = self.live_room(room)?;
         let mut st = found.inner.lock();
         if st.retired || st.member(agent).is_none() {
-            return Err(MailErr::NotAMember {
-                agent: agent.name.to_string(),
-                room: found.name.to_string(),
-            });
+            return Err(not_in_room(&found, &st, agent, room));
         }
         let invitee_key = Key::fold(&invitee.name);
         if !st.members.contains_key(invitee_key.as_str())
@@ -372,12 +389,10 @@ impl State {
         let found = self.live_room(room)?;
         let emptied = {
             let mut st = found.inner.lock();
-            if st.retired || st.members.remove(Key::fold(&agent.name).as_str()).is_none() {
-                return Err(MailErr::NotAMember {
-                    agent: agent.name.to_string(),
-                    room: found.name.to_string(),
-                });
+            if st.retired || st.member(agent).is_none() {
+                return Err(not_in_room(&found, &st, agent, room));
             }
+            st.members.remove(Key::fold(&agent.name).as_str());
             st.members.is_empty()
         };
         agent.inner.lock().rooms.retain(|r| !Arc::ptr_eq(r, &found));
@@ -495,10 +510,7 @@ impl State {
         let msg = {
             let mut st = found.inner.lock();
             if st.retired || st.member(sender).is_none() {
-                return Err(MailErr::NotAMember {
-                    agent: sender.name.to_string(),
-                    room: found.name.to_string(),
-                });
+                return Err(not_in_room(&found, &st, sender, room));
             }
             // Make room: first the room's own capacity, then the byte budget,
             // each by pushing out this room's oldest message.
@@ -626,10 +638,7 @@ impl State {
         let found = self.live_room(room)?;
         let st = found.inner.lock();
         if st.retired || st.member(agent).is_none() {
-            return Err(MailErr::NotAMember {
-                agent: agent.name.to_string(),
-                room: found.name.to_string(),
-            });
+            return Err(not_in_room(&found, &st, agent, room));
         }
         let before = before.map(|b| u64::try_from(b).unwrap_or(0));
         let end = before.map_or(st.log.len(), |b| st.log.partition_point(|m| m.id < b));

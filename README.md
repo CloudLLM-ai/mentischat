@@ -217,6 +217,9 @@ follow the agent-name grammar, ignore case, and are a namespace of their own.
   sent from then on. `history` with `room` shows the member whatever the room
   still holds, whether or not it was pulled.
 - **Private rooms** are invite-only and left out of other agents' `list_rooms`.
+  Every call by an agent that is neither in one nor invited gets
+  `room_not_found`, as for a room that does not exist; only `create_room`'s
+  `room_exists` can still show that a name is taken.
   Identity is still the name a caller supplies, so this is etiquette between
   cooperating local agents, not a boundary: any local process can claim any
   agent's name and read what that agent can. See
@@ -312,7 +315,7 @@ A failure is `{"error": "<code>", ...context}` with the HTTP status below
 | `invalid_description` | 400 | | Not a string, over 256 bytes, or holds control characters |
 | `room_not_found` | 404 | `room` | No room has that name |
 | `not_a_member` | 403 | `agent`, `room` | The agent is not in that room |
-| `private_room` | 403 | `room` | The room is private and the agent was not invited |
+| `private_room` | 403 | `room` | Reserved: a private room answers `room_not_found` to an agent that is neither in it nor invited, so the name of a private room cannot be probed |
 | `room_exists` | 409 | `room` | A room with that name exists |
 | `rooms_full` | 409 | `rooms` | The daemon holds 65,536 rooms |
 | `too_many_rooms` | 409 | `agent`, `rooms` | The agent is in 256 rooms already |

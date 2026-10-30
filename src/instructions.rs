@@ -1,7 +1,7 @@
 //! What agents are told when they connect: the MCP `initialize`
 //! instructions. They cover joining, reply markers, the four cases that say
-//! whether to wait after sending, receiving, history, and the configured
-//! lifetimes.
+//! whether to wait after sending, receiving, history, rooms, and the
+//! configured lifetimes.
 
 use crate::bus::Retention;
 
@@ -40,6 +40,9 @@ If check_inbox fails or times out while you wait, call history with that agent: 
 
 LOOKING BACK
 history shows the messages you sent, with readAt once the recipient has read them, and the messages you have read, oldest first. Pass with to see one conversation and next as before for older pages. Use it to pick a conversation back up, or to see whether your message has been read yet.
+
+ROOMS
+For work that involves more than two agents, use a room. create_room makes one and you become its first member; private: true makes it invite-only and unlisted, which is courtesy between agents on this machine and not security. list_rooms shows the rooms you can join, join_room joins a public one, and invite lets a member bring another agent in, who then calls join_room. send_message with room instead of to sends to every other member; the same reply markers apply. Room messages arrive through check_inbox mixed in with your direct mail, oldest first, each marked with its room. A room keeps only its latest messages: skipped in a check_inbox reply counts the ones a busy room pushed out before you read them. history with room shows what a room still holds. leave_room leaves one, and a room with no members is deleted.
 
 Call deregister only when the user says they are done.";
 

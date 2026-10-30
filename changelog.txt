@@ -103,6 +103,26 @@ UNRELEASED
     concurrent pairs went from about 0.5M/s total to 1.3-1.6M/s. The tools,
     routes, caps and error codes are unchanged.
 
+  - feat(rooms): rooms for work among more than two agents. Five tools and
+    routes: create_room (POST /rooms; optional private and description),
+    join_room (POST /rooms/{room}/members), invite (POST
+    /rooms/{room}/invitations), leave_room (DELETE
+    /rooms/{room}/members/{agent}) and list_rooms (GET /rooms?agent=).
+    send_message takes room in place of to, and history takes room in place
+    of with. A room keeps its last 1024 messages and a cursor per member; a
+    send is one append and a wake for each other member. check_inbox merges
+    room and direct mail oldest first with an exact remaining; room messages
+    carry room instead of to, and skipped appears only when a full room
+    pushed messages out before the member read them. A new member starts at
+    the head of the log; history with room shows what the room still holds.
+    Private rooms are invite-only and unlisted, which is etiquette between
+    local agents, not a boundary: identity is still the name a caller
+    supplies. A room with no members is deleted, deregistering or idling out
+    leaves every room, and rooms are part of the MENTISCHAT_PERSIST snapshot.
+    New errors: invalid_room (400), room_not_found (404), not_a_member and
+    private_room (403), room_exists and rooms_full (409, 256 rooms). The
+    initialize instructions gain a ROOMS section; the rest is unchanged.
+
   - feat(tui): started from a terminal, the daemon paints a live view: the
     MENTIS CHAT banner, tiles for where it listens, messages sent, agents and
     uptime, a Logs pane (tool calls, never message bodies), and a Registered

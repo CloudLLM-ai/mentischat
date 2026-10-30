@@ -821,3 +821,33 @@ async fn room_tool_failures_are_contract_errors() {
         assert_eq!(body["error"], code, "{tool} {args}: {body}");
     }
 }
+
+#[tokio::test]
+async fn agents_are_told_about_rooms_without_the_rest_changing() {
+    let (_d, app) = app();
+    let (_, init) = rpc(
+        &app,
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}),
+    )
+    .await;
+    let instructions = init["result"]["instructions"].as_str().unwrap();
+    for phrase in [
+        "ROOMS",
+        "create_room",
+        "private: true",
+        "not security",
+        "join_room",
+        "send_message with room instead of to",
+        "each marked with its room",
+        "skipped",
+        "history with room",
+        "leave_room",
+        // The sections that were already there.
+        "JOINING",
+        "1. Tell.",
+        "Call deregister only when the user says they are done.",
+    ] {
+        assert!(instructions.contains(phrase), "{phrase:?}: {instructions}");
+    }
+}

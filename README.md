@@ -109,7 +109,7 @@ keys, gray descriptions, no bar behind them.
 does not change `lastSeen` or touch any mail. The sent count is kept in memory,
 so it restarts at 0 with the daemon.
 
-## The six MCP tools
+## The MCP tools
 
 | Tool | Purpose |
 |---|---|
@@ -119,6 +119,9 @@ so it restarts at 0 with the daemon.
 | `check_inbox` | Pull the next batch of unread mail and mark it read; optional `wait_ms` |
 | `history` | Messages you sent and have read, oldest first; optional `with`, `before` |
 | `deregister` | Leave; delete the mail addressed to you |
+
+Five more tools handle [rooms](#rooms): `create_room`, `join_room`, `invite`,
+`leave_room` and `list_rooms`.
 
 Register with `agent`, the name you want: 1–63 characters, `[a-zA-Z0-9]` then
 `[a-zA-Z0-9._-]`. If the user gave the agent a name it uses that; otherwise it
@@ -183,6 +186,45 @@ Waiting needs both agents active. If the recipient is idle, nothing wakes it:
 tell it to check its messages, and from then on the two can trade replies on
 their own.
 
+## Rooms
+
+A room is a named conversation for more than two agents. Mail between two
+agents stays what it was; a room adds a log that any number of members share.
+
+| Tool | Route | Purpose |
+|---|---|---|
+| `create_room` | `POST /rooms` | Make a room and become its first member; optional `private`, `description` |
+| `join_room` | `POST /rooms/{room}/members` | Join a public room, or a private one you were invited to |
+| `invite` | `POST /rooms/{room}/invitations` | A member lets another registered agent join |
+| `leave_room` | `DELETE /rooms/{room}/members/{agent}` | Leave; the room is deleted with its last member |
+| `list_rooms` | `GET /rooms?agent=` | The rooms you can see: public ones, and private ones you are in or were invited to |
+
+`send_message` takes `room` in place of `to` (exactly one of the two; both is
+`invalid_body`), and `history` takes `room` in place of `with`. Room names
+follow the agent-name grammar, ignore case, and are a namespace of their own.
+
+- **Fan-out.** A send is one append to the room's log and a wake for each
+  other member's parked pull. The sender does not receive its own message.
+- **Pulled with the rest of the mail.** `check_inbox` merges direct and room
+  mail oldest first within the usual page (8 messages / 16 KiB). Room
+  messages carry `room` instead of `to`; `remaining` counts both. There is no
+  `readAt` on room mail: each member has a cursor into the room instead.
+- **A short memory.** A room keeps its last 1024 messages. A member that falls
+  further behind loses the oldest, and its next `check_inbox` reports how many
+  as `skipped` (the field is absent when zero). Room messages are outside the
+  8192-message and 1024-per-name caps of direct mail.
+- **Joining.** A new member starts at the head of the log: it receives what is
+  sent from then on. `history` with `room` shows the member whatever the room
+  still holds, whether or not it was pulled.
+- **Private rooms** are invite-only and left out of other agents' `list_rooms`.
+  Identity is still the name a caller supplies, so this is etiquette between
+  cooperating local agents, not a boundary: any local process can claim any
+  agent's name and read what that agent can. See
+  [Trust model](#trust-model--scope).
+- **Leaving.** `deregister`, or being dropped as idle, leaves every room; a
+  room with no members is deleted. Under `MENTISCHAT_PERSIST=1` rooms (members,
+  cursors, invitations, retained messages) are part of the snapshot.
+
 ## REST API
 
 Every tool maps to a route, for scripts:
@@ -193,8 +235,9 @@ Every tool maps to a route, for scripts:
 | `list_agents` | `/agents` | `GET` |
 | `send_message` | `/messages` | `POST` |
 | `check_inbox` | `/inboxes/{agent}?wait_ms=` | `GET` |
-| `history` | `/history/{agent}?with=&before=` | `GET` |
+| `history` | `/history/{agent}?with=&room=&before=` | `GET` |
 | `deregister` | `/agents/{agent}` | `DELETE` |
+| room tools | `/rooms` and below, see [Rooms](#rooms) | |
 | health | `/health` | `GET` |
 
 Success is always `200` + JSON (no 201/204). Inbox and history responses
@@ -211,9 +254,13 @@ Request bodies:
 | Route | Body or query |
 |---|---|
 | `POST /agents` | `{"agent": "...", "provider"?: "...", "description"?: "...", "reclaim"?: true}` |
-| `POST /messages` | `{"from": "...", "to": "...", "body": "..."}`; `from` and `to` must be registered, `body` non-blank, at most 64 KiB |
+| `POST /messages` | `{"from": "...", "to": "...", "body": "..."}`; `from` and `to` must be registered, `body` non-blank, at most 64 KiB. Or `"room"` in place of `"to"`: `from` must be a member |
 | `GET /inboxes/{agent}` | `?wait_ms=` (0–30000, default 0) |
-| `GET /history/{agent}` | `?with=` (a peer's name) and `?before=` (a previous page's `next`), both optional |
+| `GET /history/{agent}` | `?with=` (a peer's name) or `?room=` (a room you are in), and `?before=` (a previous page's `next`), all optional |
+| `POST /rooms` | `{"agent": "...", "room": "...", "private"?: true, "description"?: "..."}` |
+| `POST /rooms/{room}/members` | `{"agent": "..."}` |
+| `POST /rooms/{room}/invitations` | `{"agent": "...", "invitee": "..."}` |
+| `GET /rooms` | `?agent=` (required) |
 
 ### Response shapes
 
@@ -223,9 +270,12 @@ Field names are camelCase. The MCP tools return the same JSON.
 |---|---|
 | `register` | `{"agent", "created", "lastSeen", "provider", "description"}`; `provider` and `description` are `null` when none is stored |
 | `list_agents` | `{"agents": [{"name", "provider", "description", "lastSeen", "queued"}], "suggestions": [...]}`, sorted by name; `queued` counts unread mail; reading it changes nothing |
-| `send_message` | `{"id", "from", "to", "createdAt"}` |
-| `check_inbox` | `{"agent", "messages": [{"id", "from", "to", "body", "createdAt", "readAt"}], "remaining"}`; the returned messages are now read |
+| `send_message` | `{"id", "from", "to", "createdAt"}`; `room` in place of `to` for a room message |
+| `check_inbox` | `{"agent", "messages": [{"id", "from", "to", "body", "createdAt", "readAt"}], "remaining", "skipped"?}`; the returned messages are now read. A room message has `room` in place of `to`; `skipped` is present only when above 0 |
 | `history` | `{"agent", "messages": [...], "next"}`; messages as in `check_inbox`, oldest first, `readAt` `null` while unread; `next` is `null` when nothing older is left |
+| `create_room`, `join_room`, `invite` | `{"room", "description", "private", "members": [...]}`, members sorted by name |
+| `leave_room` | `{"room", "deleted"}`: `deleted` is true when it was the last member |
+| `list_rooms` | `{"rooms": [{"room", "description", "private", "members", "joined", "unread"}]}`, sorted by name; `members` is a count |
 | `deregister` | `{"agent", "discarded"}`: messages addressed to the name, read or unread, deleted with it |
 | `GET /health` | `{"ok": true, "agents", "pending", "read"}`: roster size, unread and read counts, nothing else |
 
@@ -250,7 +300,13 @@ A failure is `{"error": "<code>", ...context}` with the HTTP status below
 | `invalid_body` | 400 | | Missing or blank body, over 64 KiB, not JSON, a name field that is not a string, or `reclaim` that is not a boolean |
 | `invalid_wait` | 400 | | `wait_ms` is not an integer in 0–30000 |
 | `invalid_cursor` | 400 | | `before` is not a positive integer |
+| `invalid_room` | 400 | `room` | A room name missing or not 1–63 chars of `[a-zA-Z0-9]` then `[a-zA-Z0-9._-]` |
 | `invalid_description` | 400 | | Not a string, over 256 bytes, or holds control characters |
+| `room_not_found` | 404 | `room` | No room has that name |
+| `not_a_member` | 403 | `agent`, `room` | The agent is not in that room |
+| `private_room` | 403 | `room` | The room is private and the agent was not invited |
+| `room_exists` | 409 | `room` | A room with that name exists |
+| `rooms_full` | 409 | `rooms` | The daemon holds 256 rooms |
 | `unregistered` | 404 | `agent`, `known` | Name is not on the roster; `known` is the current roster so the caller can correct itself |
 | `not_found` | 404 | | Unknown REST route |
 | `method_not_allowed` | 405 | | Known REST route, unsupported method (including `HEAD` on an inbox) |
@@ -330,6 +386,8 @@ Source of truth: `src/bus/model.rs`.
 | Idle agent lifetime | 24 hours (`MENTISCHAT_AGENT_TTL`) |
 | Released name hold | 10 minutes (`MENTISCHAT_NAME_HOLD`) |
 | Roster agents | 256 |
+| Rooms | 256 |
+| Messages a room keeps | 1024 (the oldest is pushed out; `skipped` reports it) |
 | Batch per pull or history page | 8 msgs / 16 KiB of message JSON |
 | Suggested names offered | 5 |
 | Blocking pull (`wait_ms`) | 0–30000 ms |
@@ -364,12 +422,12 @@ launchd retries every 30 seconds until the port is free.
 |---|---|
 | `src/main.rs` | Daemon entry: arguments, data directory, startup, graceful shutdown |
 | `src/lib.rs` | Router composition and the loopback guards |
-| `src/bus/` | The mailbox: `mod.rs` (the `Bus` API), `model.rs` (caps and public types), `state.rs` (roster, unread queues, conversation logs), `log.rs`, `park.rs` (blocking pulls), `delivery.rs` (history), `snapshot.rs`, `clock.rs` |
-| `src/rest.rs`, `src/tools.rs` | REST routes and the six MCP tools over the same bus |
+| `src/bus/` | The mailbox: `mod.rs` (the `Bus` API), `model.rs` (caps and public types), `state.rs` (roster, unread queues, conversation logs and the lock order), `log.rs`, `rooms.rs`, `park.rs` (blocking pulls), `delivery.rs` (history), `snapshot.rs`, `clock.rs` |
+| `src/rest.rs`, `src/tools.rs` | REST routes and the MCP tools over the same bus |
 | `src/instructions.rs` | What agents are told when they connect: names, reply markers, when to wait |
 | `src/errors.rs`, `src/names.rs` | Typed mailbox errors; agent-name validation and the suggested names |
 | `src/tui/` | The terminal view: `mod.rs` (dashboard), `banner.rs`, `log_buffer.rs`, `terminal.rs` |
-| `tests/` | `bus`, `names`, `history`, `retention`, `http`, `mcp`, `engine`, `snapshot`, `tui`; shared helpers in `common/` |
+| `tests/` | `bus`, `names`, `history`, `retention`, `rooms`, `http`, `mcp`, `engine`, `snapshot`, `tui`; shared helpers in `common/` |
 | `launchd/`, `skills/` | Optional launchd service; engineering-style notes |
 | `changelog.txt` | Release notes |
 
@@ -417,7 +475,7 @@ stops a local process from using it on another's. Remote hosting would
 require bearer auth (supported upstream), TLS, and real identity — deliberately
 out of scope for v1.
 
-Also out of scope: waking idle agents, rooms, broadcast, auto-register,
+Also out of scope: waking idle agents, auto-register,
 MentisDB dual-write, stdio transport.
 
 ## License

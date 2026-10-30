@@ -188,8 +188,11 @@ pub struct AgentOverview {
 /// Built by [`crate::bus::Bus::overview`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Overview {
-    /// Registered agents, sorted by name.
+    /// Registered agents, sorted by name: the first [`MAX_OVERVIEW_AGENTS`].
     pub agents: Vec<AgentOverview>,
+    /// Agents on the roster in all, which exceeds `agents.len()` once the
+    /// roster passes [`MAX_OVERVIEW_AGENTS`].
+    pub agents_total: usize,
     /// Messages accepted by `send` since this daemon process started.
     /// Expired, discarded and wiped mail still counts; the number never goes
     /// down and restarts at 0 with the process.

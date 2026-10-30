@@ -225,3 +225,12 @@ async fn deleting_rooms_and_agents_in_bulk_stays_correct() {
     );
     assert_eq!(bus.stats().await.unwrap().unread, 0);
 }
+
+#[tokio::test]
+async fn the_overview_reads_a_bounded_number_of_rows_but_counts_the_whole_roster() {
+    let (_d, bus) = fresh_bus("overview");
+    register_many(&bus, 1100).await;
+    let ov = bus.overview().await.unwrap();
+    assert_eq!(ov.agents.len(), mentischat::bus::MAX_OVERVIEW_AGENTS);
+    assert_eq!(ov.agents_total, 1100);
+}

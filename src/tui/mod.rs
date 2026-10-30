@@ -245,7 +245,7 @@ impl Dashboard {
         let tiles = [
             ("LISTEN", self.info.url.clone()),
             ("MESSAGES SENT", self.overview.messages_sent.to_string()),
-            ("AGENTS", self.overview.agents.len().to_string()),
+            ("AGENTS", self.overview.agents_total.to_string()),
             ("UPTIME", elapsed_clock(self.started.elapsed())),
         ];
         let areas: [Rect; 4] = Layout::horizontal([

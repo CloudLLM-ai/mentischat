@@ -334,6 +334,7 @@ impl Bus {
             .collect();
         Ok(Overview {
             agents,
+            agents_total: state.roster.len(),
             messages_sent: state.messages_sent(),
         })
     }

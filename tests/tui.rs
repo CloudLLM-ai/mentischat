@@ -33,6 +33,7 @@ fn agent(name: &str, secs: i64, queued: i64) -> AgentOverview {
 
 fn overview(sent: u64, agents: Vec<AgentOverview>) -> Overview {
     Overview {
+        agents_total: agents.len(),
         agents,
         messages_sent: sent,
     }
@@ -540,4 +541,19 @@ fn key_guide_is_white_keys_and_gray_descriptions_with_no_bar() {
         "{text:?}"
     );
     assert!(text.contains("Tab") && text.contains("quit"));
+}
+
+/// The AGENTS tile shows the roster's size, not how many rows the view holds.
+#[test]
+fn the_agents_tile_counts_the_whole_roster_past_the_rows_it_reads() {
+    let mut dash = dashboard();
+    let mut ov = overview(0, vec![agent("a", 1, 0)]);
+    ov.agents_total = 70_000;
+    dash.update(Vec::new(), ov);
+    let text: String = painted(&mut dash, 120, 30)
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(text.contains("70000"), "{text}");
 }

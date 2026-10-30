@@ -351,7 +351,17 @@ impl State {
             });
         }
         let invitee_key = Key::fold(&invitee.name);
-        if !st.members.contains_key(invitee_key.as_str()) {
+        if !st.members.contains_key(invitee_key.as_str())
+            && !st.invited.contains(invitee_key.as_str())
+        {
+            // Invitations count toward the room's size, so a room cannot be
+            // made to remember an unbounded list of names.
+            if st.members.len() + st.invited.len() >= MAX_ROOM_MEMBERS {
+                return Err(MailErr::RoomFull {
+                    room: found.name.to_string(),
+                    members: st.members.len() as i64,
+                });
+            }
             st.invited.insert(invitee_key.as_str().to_string());
         }
         Ok(st.info(&found))
@@ -407,6 +417,29 @@ impl State {
             if let Some(freed) = st.evict_oldest() {
                 self.release_bytes(freed);
                 return true;
+            }
+        }
+    }
+
+    /// Forget invitations to agents that have left the roster. The sweep calls
+    /// this, so churn of invited names cannot grow a room without bound.
+    pub(super) fn prune_invites(&self) {
+        for (_, room) in self.rooms.entries() {
+            let invited: Vec<String> = room.inner.lock().invited.iter().cloned().collect();
+            if invited.is_empty() {
+                continue;
+            }
+            // The roster is read with no room lock held (it comes first in the
+            // lock order).
+            let gone: Vec<String> = invited
+                .into_iter()
+                .filter(|name| self.roster.get(name).is_none())
+                .collect();
+            if !gone.is_empty() {
+                let mut st = room.inner.lock();
+                for name in &gone {
+                    st.invited.remove(name);
+                }
             }
         }
     }

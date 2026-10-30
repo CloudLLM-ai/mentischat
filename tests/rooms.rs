@@ -450,3 +450,40 @@ async fn room_mail_does_not_count_against_the_direct_mail_caps() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn invitations_are_bounded_and_forgotten_when_the_invitee_leaves() {
+    let (_d, bus) = fresh_bus("invites");
+    register(&bus, &["owner"]).await;
+    bus.create_room(&name("owner"), &room("den"), true, None)
+        .await
+        .unwrap();
+    let cap = mentischat::bus::MAX_ROOM_MEMBERS;
+    // Fill the room's allowance of names with invitees that then leave.
+    for i in 0..cap - 1 {
+        let who = name(&format!("guest{i}"));
+        bus.register(&who).await.unwrap();
+        bus.invite(&name("owner"), &room("den"), &who)
+            .await
+            .unwrap();
+        bus.deregister(&who).await.unwrap();
+    }
+    bus.register(&name("late")).await.unwrap();
+    assert!(
+        matches!(
+            bus.invite(&name("owner"), &room("den"), &name("late"))
+                .await,
+            Err(MailboxError::RoomFull { .. })
+        ),
+        "the invitation list is full"
+    );
+    // The sweep forgets the invitees that left, making room again.
+    bus.sweep().await.unwrap();
+    bus.invite(&name("owner"), &room("den"), &name("late"))
+        .await
+        .expect("stale invitations were pruned");
+    // Inviting the same agent twice does not use a second slot.
+    bus.invite(&name("owner"), &room("den"), &name("late"))
+        .await
+        .unwrap();
+}

@@ -747,6 +747,7 @@ impl Bus {
         if !out.is_empty() {
             state.compact_convos();
         }
+        state.prune_invites();
         Ok(out)
     }
 

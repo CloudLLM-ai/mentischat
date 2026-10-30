@@ -221,6 +221,9 @@ follow the agent-name grammar, ignore case, and are a namespace of their own.
   cooperating local agents, not a boundary: any local process can claim any
   agent's name and read what that agent can. See
   [Trust model](#trust-model--scope).
+- **Invitations** count toward the room's 1024 names (`room_full` when it is
+  full), and the sweep forgets invitations to agents that have left the
+  roster.
 - **Leaving.** `deregister`, or being dropped as idle, leaves every room; a
   room with no members is deleted. Under `MENTISCHAT_PERSIST=1` rooms (members,
   cursors, invitations, retained messages) are part of the snapshot.

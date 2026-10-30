@@ -41,10 +41,19 @@ pub(super) struct ParkGuard {
 }
 
 impl ParkGuard {
-    /// Count a pull as parked on `signal`.
-    pub(super) fn new(signal: Arc<Signal>) -> Self {
-        signal.parked.fetch_add(1, Relaxed);
-        Self { signal }
+    /// Count a pull as parked on `signal`, unless `max` are parked already
+    /// (then the number that were).
+    ///
+    /// A pull takes its slot *before* it looks at the inbox: a send that
+    /// lands in between then sees the pull as parked and wakes it, instead
+    /// of skipping the wake because nobody was counted yet.
+    pub(super) fn try_new(signal: Arc<Signal>, max: usize) -> Result<Self, usize> {
+        let before = signal.parked.fetch_add(1, Relaxed);
+        let guard = Self { signal };
+        if before >= max {
+            return Err(before);
+        }
+        Ok(guard)
     }
 }
 

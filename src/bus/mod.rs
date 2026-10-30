@@ -439,22 +439,22 @@ impl Bus {
         if !Arc::ptr_eq(&agent.signal, signal) {
             return Ok(Pull::Retarget(agent.signal.clone()));
         }
+        // Counted as parked before the inbox is looked at, so a send that
+        // lands in between wakes this pull (see `ParkGuard::try_new`).
+        let slot = ParkGuard::try_new(signal.clone(), MAX_WAITERS_PER_AGENT);
         if let Some(taken) = self.take(state, &agent, name)? {
             return Ok(Pull::Ready(taken));
         }
         if Instant::now() >= deadline {
             return Ok(Pull::Ready(Taken::empty(agent.name.clone())));
         }
-        // Raised only here, so a burst of pulls can overshoot the cap by the
-        // number racing; the guard counts every one that parks.
-        let waiting = signal.parked();
-        if waiting >= MAX_WAITERS_PER_AGENT {
-            return Err(MailErr::TooManyWaiters {
+        match slot {
+            Ok(slot) => Ok(Pull::Park(slot)),
+            Err(waiting) => Err(MailErr::TooManyWaiters {
                 agent: agent.name.to_string(),
                 waiting,
-            });
+            }),
         }
-        Ok(Pull::Park(ParkGuard::new(signal.clone())))
     }
 
     /// One page of `name`'s history since it registered: messages it sent

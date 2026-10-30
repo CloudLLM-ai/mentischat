@@ -181,3 +181,109 @@ async fn counts_stay_consistent_while_agents_come_and_go() {
     assert_eq!(stats.unread, queued, "unread counter matches the queues");
     assert!(stats.unread + stats.read <= 8192, "the cap held: {stats:?}");
 }
+
+/// A pull that parks while a send lands must be woken, not left to sleep to
+/// its deadline. The window is a few instructions wide, so this races a send
+/// against a fresh blocking pull thousands of times and gives each one a
+/// generous but finite time to finish (a lost wake costs the full 30 s).
+/// Probabilistic: it fails reliably only when the bug is present and the
+/// threads interleave, which on a multi-core machine they do within the loop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_send_racing_a_parking_pull_is_never_slept_through() {
+    let (_d, bus) = fresh_bus("lost_wake");
+    bus.register(&name("a")).await.unwrap();
+    bus.register(&name("b")).await.unwrap();
+    for round in 0..3_000 {
+        let puller = bus.clone();
+        let pull = tokio::spawn(async move { puller.check_inbox(&name("b"), 30_000).await });
+        let sender = bus.clone();
+        let send = tokio::spawn(async move {
+            sender
+                .send(&name("a"), &name("b"), "x".into())
+                .await
+                .unwrap();
+        });
+        send.await.unwrap();
+        let page = tokio::time::timeout(std::time::Duration::from_secs(2), pull)
+            .await
+            .unwrap_or_else(|_| panic!("round {round}: the pull slept through its wake"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.messages.len(), 1, "round {round}");
+    }
+}
+
+/// Sends racing a `clear` must not leave a live-message count behind: when
+/// every agent is gone the mailbox is empty, whatever was in flight.
+/// Probabilistic, like the test above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_clear_racing_sends_leaves_no_phantom_count() {
+    let (_d, bus) = fresh_bus("phantom");
+    for round in 0..500 {
+        for who in ["a", "b"] {
+            bus.register(&name(who)).await.unwrap();
+        }
+        let senders: Vec<_> = (0..4)
+            .map(|_| {
+                let bus = bus.clone();
+                tokio::spawn(async move {
+                    for _ in 0..50 {
+                        let _ = bus.send(&name("a"), &name("b"), "x".into()).await;
+                    }
+                })
+            })
+            .collect();
+        tokio::task::yield_now().await;
+        bus.clear().await.unwrap();
+        for task in senders {
+            task.await.unwrap();
+        }
+        assert_eq!(
+            bus.stats().await.unwrap(),
+            common::stats(0, 0, 0),
+            "round {round}"
+        );
+    }
+}
+
+/// Agents leaving while they send must not make the sent counter drift from
+/// the number of sends that succeeded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_sent_counter_matches_the_sends_that_succeeded_through_churn() {
+    let (_d, bus) = fresh_bus("sent_count");
+    for who in ["flaky", "s0", "s1"] {
+        bus.register(&name(who)).await.unwrap();
+    }
+    let ok = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let senders: Vec<_> = ["flaky", "s0", "s1"]
+        .into_iter()
+        .map(|who| {
+            let (bus, ok) = (bus.clone(), ok.clone());
+            tokio::spawn(async move {
+                for _ in 0..2_000 {
+                    if bus.send(&name(who), &name("s0"), "x".into()).await.is_ok() {
+                        ok.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            })
+        })
+        .collect();
+    let churn = {
+        let bus = bus.clone();
+        tokio::spawn(async move {
+            for _ in 0..200 {
+                let _ = bus.deregister(&name("flaky")).await;
+                let _ = bus.register_with(&name("flaky"), common::reclaim()).await;
+                let _ = bus.overview().await;
+            }
+        })
+    };
+    for task in senders {
+        task.await.unwrap();
+    }
+    churn.await.unwrap();
+    assert_eq!(
+        bus.overview().await.unwrap().messages_sent,
+        ok.load(std::sync::atomic::Ordering::Relaxed)
+    );
+}

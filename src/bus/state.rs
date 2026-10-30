@@ -202,8 +202,8 @@ pub(super) fn sorted_by_key<T>(mut entries: Vec<(String, T)>) -> Vec<T> {
     entries.into_iter().map(|(_, value)| value).collect()
 }
 
-/// Longest folded name: [`crate::names::AgentName`] caps names at 63 bytes.
-const NAME_MAX: usize = 63;
+/// Longest folded name: [`crate::names::AgentName`] caps names at this.
+const NAME_MAX: usize = crate::names::MAX_NAME_LEN;
 
 /// A folded name or a conversation key built on the stack, so the hot path
 /// looks names up without allocating.

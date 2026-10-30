@@ -4,6 +4,9 @@ use std::fmt;
 
 use crate::errors::MailboxError;
 
+/// Longest agent or room name, in bytes (names are ASCII).
+pub const MAX_NAME_LEN: usize = 63;
+
 /// A roster name: 1–63 chars, starting `[a-zA-Z0-9]`, then
 /// `[a-zA-Z0-9._-]`. The roster keeps the spelling it was registered with
 /// but compares names without regard to case, so `Vega` and `vega` are the
@@ -34,7 +37,7 @@ impl AgentName {
         let mut chars = raw.chars();
         let head_ok = chars.next().is_some_and(|c| c.is_ascii_alphanumeric());
         let tail_ok = chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-        if head_ok && tail_ok && raw.len() <= 63 {
+        if head_ok && tail_ok && raw.len() <= MAX_NAME_LEN {
             Ok(Self(raw.to_string()))
         } else {
             Err(MailboxError::InvalidName { agent: echo(raw) })

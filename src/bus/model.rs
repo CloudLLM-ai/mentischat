@@ -41,6 +41,11 @@ pub const MAX_RETAINED_BYTES: usize = 256 * 1024 * 1024;
 /// message (524k of them in 512 rooms: 8 to 87 MB), rounded up. Without it a
 /// million tiny messages would cost far more than the budget says.
 pub const MESSAGE_OVERHEAD_BYTES: usize = 160;
+/// Most messages a stream may have pushed and not yet acknowledged.
+pub const MAX_STREAM_IN_FLIGHT: usize = 256;
+/// Most message-JSON bytes a stream may have in flight (the first message of a
+/// push always fits).
+pub const MAX_STREAM_BYTES: usize = 1024 * 1024;
 /// Default number of messages a room keeps. When a room is full a new message
 /// pushes out the oldest; a member that had not read it is told how many it
 /// missed (`skipped`).

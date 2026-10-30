@@ -242,6 +242,26 @@ impl Room {
     }
 }
 
+impl Room {
+    /// Take back what a stream had leased from this room and not yet
+    /// acknowledged: `ids` ascending. The member's cursor goes back before
+    /// the first of them and they count as unread again, except those pushed
+    /// out of the room meanwhile, which are reported as skipped instead.
+    pub(super) fn rewind(&self, me: &Agent, ids: &[u64]) {
+        let mut st = self.inner.lock();
+        let front = st.log.front().map_or(u64::MAX, |m| m.id);
+        let key = Key::fold(&me.name);
+        let Some(member) = st.members.get_mut(key.as_str()) else {
+            return;
+        };
+        let Some(&first) = ids.first() else { return };
+        let retained = ids.iter().filter(|&&id| id >= front).count();
+        member.cursor = member.cursor.min(first.saturating_sub(1));
+        member.unread += retained;
+        member.skipped += (ids.len() - retained) as u64;
+    }
+}
+
 impl State {
     /// A room under `key`, treating a retired one as absent.
     fn live_room(&self, room: &RoomName) -> Result<Arc<Room>, MailErr> {

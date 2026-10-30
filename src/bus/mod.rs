@@ -42,6 +42,7 @@ mod park;
 mod rooms;
 mod snapshot;
 mod state;
+mod stream;
 
 pub use clock::{now_rfc3339, rfc3339};
 pub use model::{
@@ -56,8 +57,10 @@ pub use model::{
 };
 pub use model::{
     MAX_LIMITED_PAGE_BYTES, MAX_OVERVIEW_AGENTS, MAX_PAGE, MAX_ROOMS_PER_AGENT, MAX_ROOM_MEMBERS,
+    MAX_STREAM_BYTES, MAX_STREAM_IN_FLIGHT,
 };
 pub use snapshot::{remove_snapshot, SnapshotError};
+pub use stream::{Push, StreamSession};
 
 use clock::{now_ms, rfc3339_ms, unix_ms};
 use delivery::{history_page, history_rows};
@@ -780,6 +783,7 @@ impl Bus {
     /// engine it replaced.
     pub async fn shutdown(&self) -> Result<(), MailErr> {
         self.state.closed.store(true, Ordering::Relaxed);
+        self.state.release_all_streams();
         self.state.clear();
         Ok(())
     }
@@ -792,6 +796,9 @@ impl Bus {
     pub async fn close(&self) {
         self.state.closed.store(true, Ordering::Relaxed);
         self.state.wake_all();
+        // Leases go back before the snapshot is taken, so what streams had in
+        // flight is in it as unread mail.
+        self.state.release_all_streams();
         let snapshot = snapshot::capture(&self.state);
         if let Err(e) = snapshot::save(&self.data_dir, &snapshot) {
             tracing::error!(error = %e, "could not write the mailbox snapshot");
@@ -859,6 +866,6 @@ fn roster_row(state: &State, agent: &Agent) -> RosterRow {
         provider: st.provider.clone(),
         description: st.description.clone(),
         last_seen_ms: st.last_seen_ms,
-        queued: (st.unread.len() + state.room_unread(agent, &st.rooms)) as i64,
+        queued: (st.unread.len() + st.leased_direct() + state.room_unread(agent, &st.rooms)) as i64,
     }
 }

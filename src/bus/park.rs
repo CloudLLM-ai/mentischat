@@ -41,6 +41,14 @@ pub(super) struct ParkGuard {
 }
 
 impl ParkGuard {
+    /// Count a long-lived waiter (a stream) as parked on `signal`, with no
+    /// cap: it holds one slot for as long as the guard lives, so sends wake it
+    /// and the sweep leaves its agent alone.
+    pub(super) fn held(signal: Arc<Signal>) -> Self {
+        signal.parked.fetch_add(1, Relaxed);
+        Self { signal }
+    }
+
     /// Count a pull as parked on `signal`, unless `max` are parked already
     /// (then the number that were).
     ///

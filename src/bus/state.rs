@@ -269,6 +269,22 @@ pub(super) struct Hold {
     pub registered_ms: u64,
 }
 
+/// A message pushed to a stream and awaiting its acknowledgement.
+#[derive(Debug)]
+pub(super) struct Leased {
+    pub msg: Arc<Msg>,
+    /// The room it came from; `None` for direct mail.
+    pub room: Option<Arc<Room>>,
+}
+
+impl AgentState {
+    /// Direct messages leased: still unread, so still counted against the
+    /// recipient's queue.
+    pub(super) fn leased_direct(&self) -> usize {
+        self.leased.iter().filter(|l| l.room.is_none()).count()
+    }
+}
+
 /// What changes about an agent while it is on the roster.
 #[derive(Debug)]
 pub(super) struct AgentState {
@@ -285,6 +301,15 @@ pub(super) struct AgentState {
     pub sent: u64,
     /// The rooms this agent is in (a hint: each room's member list decides).
     pub rooms: Vec<Arc<Room>>,
+    /// Messages a stream has pushed to this agent and not had acknowledged
+    /// yet, in the order they were pushed. Direct mail leaves `unread` for
+    /// here (and still counts as unread); a room message stays counted as
+    /// taken by the member's cursor, which a release winds back.
+    pub leased: Vec<Leased>,
+    /// Serialized size of everything in `leased`.
+    pub leased_bytes: usize,
+    /// Which stream owns the leases; a new stream takes over by raising it.
+    pub stream_epoch: u64,
     /// Folded names of rooms this agent was invited to (a hint, bounded, so
     /// `list_rooms` can show them without searching every room; the room's
     /// own invitation list decides).
@@ -309,6 +334,8 @@ pub(super) struct Agent {
     /// Whether the agent is in `State::readers`. Changed only under the
     /// agent's lock.
     pub indexed: AtomicBool,
+    /// Woken when a new stream takes over from the current one.
+    pub takeover: tokio::sync::Notify,
     pub inner: Mutex<AgentState>,
 }
 
@@ -330,6 +357,7 @@ impl Agent {
             signal: Arc::new(Signal::default()),
             oldest_read: (AtomicU64::new(NEVER), AtomicU64::new(NEVER)),
             indexed: AtomicBool::new(false),
+            takeover: tokio::sync::Notify::new(),
             inner: Mutex::new(AgentState {
                 provider,
                 description,
@@ -339,6 +367,9 @@ impl Agent {
                 read: VecDeque::new(),
                 sent: 0,
                 rooms: Vec::new(),
+                leased: Vec::new(),
+                leased_bytes: 0,
+                stream_epoch: 0,
                 invited_to: Default::default(),
                 removed: false,
             }),
@@ -732,7 +763,7 @@ impl State {
         recipient: &Agent,
         out: Outgoing<'_>,
     ) -> Result<(Arc<Msg>, bool), Refused> {
-        let pending = to_state.unread.len();
+        let pending = to_state.unread.len() + to_state.leased_direct();
         if pending >= MAX_PENDING_PER_AGENT as usize {
             return Err(Refused::Error(MailErr::QueueFull {
                 to: recipient.name.to_string(),
@@ -907,7 +938,7 @@ impl State {
             }));
         }
         let rooms = st.rooms.clone();
-        Some(self.take_merged(agent, &mut st, &rooms, now_ms, page))
+        Some(self.take_merged(agent, &mut st, &rooms, now_ms, page, false))
     }
 
     /// Mark the first `n` (at most) of the agent's unread direct mail read at
@@ -935,7 +966,20 @@ impl State {
         now_ms: u64,
     ) -> Vec<Arc<Msg>> {
         let batch: Vec<Arc<Msg>> = st.unread.drain(..take).collect();
-        for msg in &batch {
+        self.mark_read(agent, st, &batch, now_ms);
+        batch
+    }
+
+    /// Mark direct `batch` (already out of the unread queue) read at `now_ms`:
+    /// stamp it, queue it in read order and index the agent as a reader.
+    pub(super) fn mark_read(
+        &self,
+        agent: &Arc<Agent>,
+        st: &mut AgentState,
+        batch: &[Arc<Msg>],
+        now_ms: u64,
+    ) {
+        for msg in batch {
             msg.read_ms.store(now_ms, Relaxed);
         }
         st.read.extend(batch.iter().cloned());
@@ -944,21 +988,21 @@ impl State {
             self.readers
                 .insert(Key::fold(&agent.name).as_str().to_string(), agent.clone());
         }
-        self.unread.0.fetch_sub(take, Relaxed);
-        batch
+        self.unread.0.fetch_sub(batch.len(), Relaxed);
     }
 
     /// A pull for an agent that is in rooms: the oldest unread messages of
     /// its direct mail and every room, merged by id, within the batch caps.
     /// Direct mail is marked read; each room's cursor advances past what was
     /// taken, and its skipped count is reported and reset.
-    fn take_merged(
+    pub(super) fn take_merged(
         &self,
         agent: &Arc<Agent>,
         st: &mut AgentState,
         rooms: &[Arc<Room>],
         now_ms: u64,
         page: Page,
+        lease: bool,
     ) -> Option<Batch> {
         let waiting: Vec<_> = rooms
             .iter()
@@ -988,7 +1032,25 @@ impl State {
         }
         let chosen = &candidates[..take];
         let direct = chosen.iter().filter(|(_, room)| room.is_none()).count();
-        self.read_first(agent, st, direct, now_ms);
+        if lease {
+            // Pushed, not read: out of the queue but unread, until acked.
+            let moved: Vec<Arc<Msg>> = st.unread.drain(..direct).collect();
+            for msg in moved {
+                st.leased_bytes += msg.page_len();
+                st.leased.push(Leased { msg, room: None });
+            }
+            for (msg, room) in chosen {
+                if let Some(i) = room {
+                    st.leased_bytes += msg.page_len();
+                    st.leased.push(Leased {
+                        msg: msg.clone(),
+                        room: Some(rooms[*i].clone()),
+                    });
+                }
+            }
+        } else {
+            self.read_first(agent, st, direct, now_ms);
+        }
         let (mut remaining, mut skipped) = (st.unread.len(), 0);
         for (i, w) in &waiting {
             let ids: Vec<u64> = chosen
@@ -1070,7 +1132,10 @@ impl State {
                     registered_ms: st.registered_ms,
                 },
             );
-            std::mem::take(&mut st.unread).len()
+            let direct = st.leased_direct();
+            st.leased.clear();
+            st.leased_bytes = 0;
+            std::mem::take(&mut st.unread).len() + direct
         };
         drop(holds);
         self.leave_all_rooms(&agent, rooms);

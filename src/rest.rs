@@ -232,13 +232,24 @@ fn body_with_room(
     Ok(v)
 }
 
+/// The JSON body of a `/rooms/{room}/...` request with the path's room set
+/// in it.
+#[allow(clippy::result_large_err)]
+fn room_request(
+    path: Result<Path<String>, PathRejection>,
+    body: Result<Json<Value>, JsonRejection>,
+) -> Result<Value, Response> {
+    let room = path_room(path)?;
+    body_with_room(body, room)
+}
+
 /// `POST /rooms/{room}/members` `{ "agent" }` — same as join_room.
 async fn join_room(
     State(bus): State<Ctx>,
     path: Result<Path<String>, PathRejection>,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Response {
-    let v = match path_room(path).and_then(|room| body_with_room(body, room)) {
+    let v = match room_request(path, body) {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -251,7 +262,7 @@ async fn invite(
     path: Result<Path<String>, PathRejection>,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Response {
-    let v = match path_room(path).and_then(|room| body_with_room(body, room)) {
+    let v = match room_request(path, body) {
         Ok(v) => v,
         Err(resp) => return resp,
     };

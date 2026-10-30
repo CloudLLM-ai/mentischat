@@ -35,3 +35,11 @@ http = "1"
 http-body-util = "0.1.5"
 tempfile = "3.27.0"
 tower = { version = "0.5.3", features = ["util"] }
+
+# Criterion without its plotting and parallel-iterator extras: the bench only
+# needs the numbers.
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "bus"
+harness = false

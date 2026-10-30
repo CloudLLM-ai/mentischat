@@ -1,8 +1,8 @@
 ---
 name: rust-performance-reviewer
-description: Use when reviewing Rust code for micro-optimizations and performance — hot-path audits, allocation/cache footprint review, API design for speed, Criterion-backed regressions, or flat profiles with no obvious hotspot. Inspired by Abseil Performance Hints (Jeff Dean & Sanjay Ghemawat). Pair with rust-engineer (standards, in this repo's skills/ folder).
-tags: [rust, performance, micro-optimization, code-review, cache, allocations, criterion, hot-path, abseil, sqlite]
-triggers: [performance review, micro-optimize, hot path, allocation profile, cache miss, flat profile, speed up rust, reduce allocations, criterion, pprof, perf, SmallVec, zero-copy, bulk API, rust performance, sqlite slow, EXPLAIN QUERY PLAN, cron thrash, N+1]
+description: Use when reviewing Rust code for micro-optimizations and performance — hot-path audits, allocation/cache footprint review, API design for speed, Criterion-backed regressions, or flat profiles with no obvious hotspot. Inspired by Abseil Performance Hints (Jeff Dean & Sanjay Ghemawat). Pair with rust-engineer (standards), rust-concurrency-patterns (locks, the store, Notify) and rust-criterion-benchmarking (measurement), all in this repo's skills/ folder.
+tags: [rust, performance, micro-optimization, code-review, cache, allocations, criterion, hot-path, abseil, in-memory-store, locks, sqlite]
+triggers: [performance review, micro-optimize, hot path, allocation profile, cache miss, flat profile, speed up rust, reduce allocations, criterion, pprof, perf, SmallVec, zero-copy, bulk API, rust performance, lock contention, Arc clone, wake latency, sqlite slow, EXPLAIN QUERY PLAN, cron thrash, N+1]
 ---
 
 # rust-performance-reviewer
@@ -24,8 +24,9 @@ code is on a **hot path**, and proposes one concrete fix. Unmeasured
 "this looks slow" off a cold path is Minor at most.
 
 Companion skills:
-- `rust-engineer` — idioms, types, workflow (this repo: `skills/rust-engineer.md`)
-- `rust-criterion-benchmarking`, `rust-concurrency-patterns` — measurement and locking patterns
+- [`rust-engineer.md`](rust-engineer.md) — idioms, types, workflow
+- [`rust-criterion-benchmarking.md`](rust-criterion-benchmarking.md) — how to measure
+- [`rust-concurrency-patterns.md`](rust-concurrency-patterns.md) — locks, lock order, `Notify`, cursors
 
 ---
 
@@ -75,12 +76,22 @@ work. Diagnose with live state before rewriting loops.
 | Compress 1KB (Snappy-class) | 1 µs |
 | SSD 4KB read | 20 µs |
 | Same-DC network RTT | 50 µs |
+| 1MB over 100Gbps net | 100 µs |
 | 1MB sequential DRAM | 64 µs |
 | Disk seek | 5 ms |
 | Transcontinental RTT | 150 ms |
 
-Track *your* higher-level costs too: SQL point read, HTTP hop, serde of a
-typical payload. Without numbers you cannot estimate.
+Track *your* higher-level costs too: a store lock section, a loopback HTTP
+hop, serde of a typical message, a SQL point read where a database is on the
+path. Without numbers you cannot estimate.
+
+**Worked example (Abseil method, Rust framing):** scanning 1M strings for a
+prefix. Data ~50MB ⇒ memory-bound floor ≈ 50MB / 16GB/s ≈ 3ms. If the compare
+branch is data-dependent, ~50% of 1M branches mispredict ⇒ 0.5M × 5ns ≈ 2.5ms
+extra. Conclusion: bandwidth and mispredicts are the same order — so (a) keep
+the data compact (arena/`Box<str>`, not `Vec<String>` with capacity slack), and
+(b) a SIMD/memchr-style scan that removes the branch can roughly halve the
+time. That estimate decides the fix *before* writing any code.
 
 ---
 
@@ -96,7 +107,8 @@ typical payload. Without numbers you cannot estimate.
    `dhat` or alloc counters if available).
 5. **Apply lenses below** in order: algorithmic → memory representation →
    allocations → avoid work → compiler help → code size → concurrency →
-   serialization → Rust containers.
+   serialization → Rust containers; then the domain lenses (store, SQLite,
+   scheduled work) that match the code under review.
 6. **Report** with severity, evidence, estimated impact class, one fix.
 7. **Gate claims** with a bench or profile delta when Important+.
 
@@ -144,7 +156,7 @@ Rust notes:
   `sort_by_cached_key` when the key is expensive to compute.
 - `VecDeque` for ring-buffer / pop-front patterns, not `Vec::remove(0)`.
 - Ordered lookups on moderate N: sorted `Vec` + `binary_search` often beats
-  `BTreeMap` on cache behavior.
+  `BTreeMap` on cache behavior. `blart` (ART) for large ordered string keys.
 - Build structures in bulk (`extend`, `from_iter`, `collect`) instead of
   repeated insert with rebalancing/rehash churn when input is known.
 
@@ -157,7 +169,7 @@ Touch fewer cache lines; cut memory bus traffic (helps neighbors on the machine)
 ### Compact data structures
 - Smaller integer types when domain fits (`u8`/`u16`/`u32` vs `usize`/`u64`)
 - `#[repr(u8)]` enums instead of pointer-sized discriminants when it matters
-- Bitflags / bitsets instead of `HashSet<SmallId>`
+- Bitflags / `bitvec` / manual bitsets instead of `HashSet<SmallId>`
 - Dense arrays indexed by small IDs instead of maps
 - `Box<str>` / `Box<[T]>` for immutable stored data (drops the capacity field,
   8 bytes per value) — `String::into_boxed_str`, `Vec::into_boxed_slice`
@@ -173,6 +185,8 @@ Touch fewer cache lines; cut memory bus traffic (helps neighbors on the machine)
 - Check sizes with `static_assertions::assert_eq_size!` in tests and
   `cargo +nightly rustc -- -Zprint-type-sizes` for full layout dumps
 - `#[repr(align(64))]` for false-sharing fixes — easy to bloat; measure
+- Use `#[repr(C)]` + manual packing only inside well-tested modules; validate
+  with benches — packing can hurt if it causes under-aligned hot loads
 
 ### Indices instead of pointers
 - On 64-bit, rich pointer graphs waste memory and scatter cache lines
@@ -219,6 +233,7 @@ Checklist:
 - [ ] Prefer stack (`ArrayVec`, small arrays) when lifetime is scoped
 - [ ] `Vec::with_capacity` / `reserve` when size known — never grow one-by-one
   in a loop without reserve
+- [ ] Prefer `reserve` + `push` over `resize` + assign when element construct is dear
 - [ ] Move (`std::mem::take`, `swap`, ownership transfer) instead of `clone`
 - [ ] Store `&T` / indices / `Arc` in transient structures instead of deep clones
 - [ ] Hoist buffers out of loops; reuse `Vec`/`String`/`BytesMut` with `clear`
@@ -266,6 +281,8 @@ Often the biggest win: don't do it.
 ### Fast paths for common cases
 - Structure code so the common case is branch-predictable and allocation-free
 - Keep slow path cold (`#[cold]`, separate function) so it does not pollute I-cache
+- e.g. push when capacity remains; nothing new since the cursor → return the
+  empty response without building anything
 
 ### Precompute once
 - Expensive properties, lookup tables, fingerprints of large blobs
@@ -309,9 +326,11 @@ Techniques:
   elides bounds checks and enables autovectorization
 - Copy small hot data into locals to end aliasing doubts (aids vectorization)
 - Explicit SIMD: `std::simd` (nightly portable SIMD), `wide`, or `core::arch`
-  intrinsics for bulk byte/number work
+  intrinsics for bulk byte/number work (`packed_simd` is deprecated — don't
+  recommend it)
 - Process chunks of 4/8/16 items with `chunks_exact` when alignment allows
 - Careful `#[inline]` — helps tiny hot getters; hurts when code size explodes
+- `#[inline(never)]` on rare error paths
 - Limit monomorphization blowup: convert type params to trait objects or
   function pointers for cold bulky code; keep hot kernels monomorphized
 
@@ -347,6 +366,9 @@ Especially important for **widely used generics and macros**.
 
 ## Lens 7 — Parallelization and synchronization
 
+Correctness rules (lock order, no guard at `.await`, lost wakeups) live in
+`rust-concurrency-patterns`; this lens is about cost.
+
 - Parallelize independent items (`rayon` for CPU-bound, `tokio` task batches
   for I/O-bound) when spare cores/memory bandwidth exist — measure; bandwidth
   saturation can make parallel *slower*
@@ -361,6 +383,11 @@ Especially important for **widely used generics and macros**.
 - Prefer bounded channels / batching over per-item task spawn (context switches)
 - Lock-free only via proven structures (`crossbeam`, `arc-swap`) — not
   hand-rolled atomics unless expert + tested
+- Thread-compatible (external sync) by default for library types; internal sync
+  only when typical use needs it (so uncontended callers don't pay)
+- Wakeups: `notify_waiters` (or many `notify_one`s) on a shared `Notify` wakes
+  every parked pull to find nothing — a thundering herd. One `Notify` per
+  agent wakes only the recipient
 
 ---
 
@@ -392,11 +419,12 @@ Prefer:
 |---|---|---|
 | `std::vector` | `Vec<T>` | pre-`reserve`; `SmallVec`/`ArrayVec` if small |
 | `absl::InlinedVector` | — | `smallvec`, `arrayvec`, `tinyvec` |
-| `std::unordered_map` | `HashMap` (hashbrown) | `FxHashMap` / `foldhash` for internal keys |
+| `std::unordered_map` | `HashMap` (hashbrown) | `FxHashMap` (rustc-hash 2.x) / `foldhash` for internal keys |
 | `absl::flat_hash_map` | hashbrown (open addressing) | same; good hasher; bulk insert; `entry` API |
-| `std::map` | `BTreeMap` | sorted `Vec` + `binary_search` |
+| `std::map` | `BTreeMap` | sorted `Vec` + `binary_search`; `blart` for string keys |
 | bit sets | `HashSet` of ids | `bitvec`, `fixedbitset`, integer bitmasks |
-| intrusive list | `LinkedList` (rare) | usually better as `Vec`+indices |
+| `gtl::small_map` | — | `SmallVec` of pairs linear scan; `heapless::FnvIndexMap` |
+| intrusive list | `LinkedList` (rare) | `intrusive-collections`; usually better as `Vec`+indices |
 | arenas | — | `bumpalo`, `typed-arena`, `slab`, `slotmap` |
 | indices vs pointers | — | `slab` / `slotmap` with `u32` keys |
 
@@ -423,6 +451,7 @@ Prefer:
 | faster mutex | `std::sync::Mutex` | `parking_lot` (sync code) |
 | stats counters | `Mutex<u64>` | `AtomicU64` (relaxed) |
 | allocator | system malloc | `mimalloc` / `tikv-jemallocator` |
+| `Status`/`StatusOr` tax | `Result<T,E>` | on ultra-hot infallible paths, don't force `Result` |
 
 API design (Abseil "API considerations"):
 - **Bulk APIs** — `lookup_many`, `delete_many`, batch encode/decode; amortize
@@ -453,14 +482,14 @@ When CPU profile has no tall towers:
 
 | Need | Tool |
 |---|---|
-| Microbench | `criterion`; `divan` as lighter alternative |
+| Microbench | `criterion` (see `rust-criterion-benchmarking`); `divan` as lighter alternative |
 | CI-stable regression gate | `iai-callgrind` (instruction counts, noise-immune) |
 | CPU profile | `samply record`, `perf record` + `cargo flamegraph` |
 | Assembly | `cargo-show-asm`, Godbolt |
 | Allocations | `dhat`, `heaptrack` |
 | Cache/branch | `perf stat -e cache-misses,branches,branch-misses` |
 | Lock contention (async) | `tokio-console` |
-| Binary size | `cargo bloat` |
+| Binary size | `cargo bloat` (`twiggy` is wasm-only) |
 | Monomorphization bloat | `cargo llvm-lines` |
 | Type layouts | `cargo +nightly rustc -- -Zprint-type-sizes` |
 | PGO | `cargo-pgo` |
@@ -472,12 +501,13 @@ Rules:
 - Distrust single-run deltas; use Criterion CI and baselines
 - Microbenches can lie — validate important wins on realistic workloads
 
-Prefer these **before** Criterion on SQLite/cron pipelines:
+Prefer these **before** Criterion on store-backed or scheduled pipelines:
 
 | Tool | Use |
 |---|---|
-| `EXPLAIN QUERY PLAN …` | Prove `SEARCH` vs `SCAN`; `LIKE` vs `=` |
+| `EXPLAIN QUERY PLAN …` (when SQLite is on the path) | Prove `SEARCH` vs `SCAN`; `LIKE` vs `=` |
 | Wall-clock on **full production data** | Serial full-workload timer |
+| Live state inspection | Roster size, unread counts, log lengths via the REST mirror or the terminal view |
 | `/usr/bin/time -f 'elapsed=%e max_rss_kb=%M'` | Per-binary after install |
 | `PRAGMA integrity_check` after index surgery | Catch broken indexes |
 
@@ -485,9 +515,38 @@ Microbenches of `format!` vs `write!` are noise next to a 75× SQL plan fix.
 
 ---
 
-## Lens 10 — SQLite / local DB pipelines
+## Lens 10 — In-memory mailbox store
 
-Highest leverage on local-store daemons after pure algorithms.
+The mailbox store is per-conversation append-only logs of `Arc`'d messages,
+per-reader cursors, short `parking_lot` sections, and a per-agent `Notify`.
+Its costs are lock hold time, copies, and wakeups, not I/O.
+
+Checklist:
+- [ ] **Pull cost is O(new), not O(log)** — a pull reads from the cursor; any
+  scan of the whole conversation (or every conversation) per pull is
+  Critical at scale
+- [ ] **No body copies** — sends, pulls, history and the terminal view clone
+  `Arc<Message>` (or `Arc<str>`), never `String` bodies
+- [ ] **Short sections** — under the lock: append, or read past the cursor and
+  advance it. JSON, logging, formatting and timestamps happen after release
+- [ ] **One lock acquisition per batch** — a pull of N messages takes the
+  conversation lock once, not N times
+- [ ] **Targeted wakeups** — notify only the recipient's `Notify`; a send never
+  wakes pulls that cannot have mail
+- [ ] **Retention is amortized** — pruning read mail is bounded per pass and
+  compacts in chunks (`VecDeque::drain(..k)`), never one `remove(0)` at a time
+- [ ] **Bounded growth** — unread mail never expires, so caps (per agent,
+  per body, per process) are what bound memory; check they still hold
+- [ ] **History reads don't stall sends** — `RwLock` read sections or a
+  snapshot of `Arc`s, released before serializing
+- [ ] **Measure with the companion benches**: pull/send/history at 1–1000
+  messages, contention at 1–8 tasks, wake latency
+
+## Lens 11 — SQLite / local DB pipelines
+
+Applies wherever a SQLite store is on the path (sibling crates, or a
+durable mode here). Highest leverage on local-store daemons after pure
+algorithms.
 
 Checklist:
 - [ ] **`=` not `LIKE`** for exact keys — measured on real prod data:
@@ -510,6 +569,24 @@ Checklist:
 - [ ] Backup before live schema changes; idempotent `CREATE INDEX IF NOT EXISTS`
 
 ---
+
+## Lens 12 — Scheduled and multi-stage work
+
+Cadence multiplies waste: a periodic sweep that does N× work before noticing
+it has nothing to do is a production cost, not a micro-opt.
+
+Checklist:
+- [ ] **Order work cheapest → dearest**: killswitch / nothing-to-do check →
+  load state → only then I/O or heavy computation
+- [ ] **Don't pay N× work over the whole queue** when this pass only advances
+  one item
+- [ ] **Atomic publish of artifacts** consumers read mid-write
+  (`write tmp` + `rename`)
+- [ ] **Logging**: one summary line per pass; `debug`/`trace` for per-item
+- [ ] **Reuse loaded inputs** across steps in the same process
+- [ ] **Timeouts on every external call** so a hung peer can't stall the pass
+- [ ] **No CWD-relative paths** in anything run by launchd/cron — absolute
+  paths only
 
 ## Field lessons — measured production wins (2026-08)
 
@@ -593,15 +670,18 @@ Push back on "optimize everything" — prioritize the critical 3%.
 ## Quick hot-path checklist (print this mentally on every file)
 
 1. Per-item / per-run / per-request? If no → deprioritize.
-2. **Structural first:** wrong SQL plan, N+1 HTTP/SQL, unbounded queue, full
-   re-scan before throttle? Fix those before alloc polish.
-3. SQLite: `=` not `LIKE`? Composite index match? One txn per batch? Prepared
-   stmts? `EXPLAIN QUERY PLAN` on prod-sized data?
+2. **Structural first:** full log scan per pull, N+1 lock acquisitions,
+   wrong SQL plan, unbounded queue, full re-scan before throttle? Fix those
+   before alloc polish.
+3. Store: `Arc` clones not body copies? Work done after releasing the lock?
+   Only the recipient woken? Where SQLite is on the path: `=` not `LIKE`,
+   composite index match, one txn per batch, prepared stmts, `EXPLAIN QUERY
+   PLAN` on prod-sized data?
 4. Any alloc/copy that could be borrow, move, or reuse? `with_capacity` /
    `write!` vs `format!`+= in multi-thousand-item loops?
 5. Any `HashMap`/`BTreeMap`/`Regex`/`format!` that could be simpler/denser?
-6. Locks / threadpools: scope minimal? `busy_timeout`? worker cap on shared
-   hosts? lock held over I/O?
+6. Locks / threadpools: scope minimal? Taken once per batch? lock held over
+   I/O or `.await`? `busy_timeout` and a worker cap where SQLite is shared?
 7. Pipeline order: cheap gates before expensive I/O?
 8. Logging/stats on the path — per-item `info!` × N? Atomic file publish?
 9. Correctness of the predicate that gates work — live state inspection, not
@@ -621,3 +701,16 @@ Rust mappings, severity taxonomy, review workflow, and field lessons are
 project-specific for agent use in this workspace and related Rust codebases.
 Update the field lessons section when a measured production win or footgun is
 confirmed (with numbers).
+
+## Version history
+
+- **2026-08-22** — Initial mentischat version, generalized from DiarioBitcoin
+  `rust-performance-reviewer`.
+- **2026-10-30** — Refreshed from the newer DiarioBitcoin version (worked
+  estimate example, packing and `reserve` notes, `blart`, small-map and
+  intrusive-list rows, `Result` tax, `twiggy` caveat, thread-compatible
+  defaults). Added Lens 10 for the in-memory store (O(new) pulls, `Arc`
+  sharing, short sections, targeted wakeups, amortized retention); SQLite
+  lens kept as Lens 11 for wherever a database is on the path; Lens 12
+  generalizes the cron-pipeline lens. Links the new concurrency and
+  Criterion companions.

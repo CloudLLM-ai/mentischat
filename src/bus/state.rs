@@ -39,6 +39,9 @@
 //! 3. an agent
 //! 4. a room-map shard, or a conversation-map shard
 //! 5. a room, or a conversation log
+//! 6. leaf locks, held with nothing else taken: an agent's hot-room set
+//!    (`Signal::hot`, which a room's send fills under the room's lock) and a
+//!    conversation-index set (`convos.rs`)
 //!
 //! Two agents are never locked at once, nor two conversation logs, nor two
 //! rooms, nor two shards of one map. A send locks its recipient, then the conversation, and
@@ -59,7 +62,7 @@ use parking_lot::{Mutex, RwLock};
 
 use super::convos::ConvoMap;
 use super::log::{Convo, Msg, Target};
-use super::park::Signal;
+use super::park::{Hot, Signal};
 use super::rooms::Room;
 use super::sharded::{Padded, Sharded};
 use super::{
@@ -792,7 +795,8 @@ impl State {
             return Pulled::Gone;
         }
         st.last_seen_ms = now_ms;
-        let batch = if st.rooms.is_empty() {
+        let hot = agent.signal.take_hot();
+        let batch = if !hot.all && hot.rooms.is_empty() {
             self.take_direct(agent, &mut st, now_ms, page)
                 .map(|messages| Batch {
                     remaining: st.unread.len(),
@@ -800,8 +804,7 @@ impl State {
                     skipped: 0,
                 })
         } else {
-            let rooms = st.rooms.clone();
-            self.take_merged(agent, &mut st, &rooms, Take::Read(now_ms), page)
+            self.take_merged(agent, &mut st, hot, Take::Read(now_ms), page)
         };
         batch.map_or(Pulled::Nothing, Pulled::Batch)
     }
@@ -864,10 +867,12 @@ impl State {
         &self,
         agent: &Arc<Agent>,
         st: &mut AgentState,
-        rooms: &[Arc<Room>],
+        hot: Hot,
         how: Take,
         page: Page,
     ) -> Option<Batch> {
+        let rooms = self.hot_rooms(st, hot);
+        let rooms = rooms.as_slice();
         let waiting: Vec<_> = rooms
             .iter()
             .enumerate()
@@ -875,8 +880,10 @@ impl State {
             .collect();
         if waiting.len() < rooms.len() {
             let member_of: Vec<&Arc<Room>> = waiting.iter().map(|(i, _)| &rooms[*i]).collect();
-            st.rooms
-                .retain(|r| member_of.iter().any(|m| Arc::ptr_eq(m, r)));
+            st.rooms.retain(|r| {
+                member_of.iter().any(|m| Arc::ptr_eq(m, r))
+                    || !rooms.iter().any(|m| Arc::ptr_eq(m, r))
+            });
         }
         let mut candidates: Vec<(Arc<Msg>, Option<usize>)> = st
             .unread
@@ -892,6 +899,11 @@ impl State {
         candidates.sort_unstable_by_key(|(m, _)| m.id);
         let take = fitting(candidates.iter().map(|(m, _)| m.page_len()), page);
         if take == 0 && waiting.iter().all(|(_, w)| w.skipped == 0) {
+            for (i, w) in &waiting {
+                if w.unread > 0 {
+                    agent.signal.mark_room(&rooms[*i].name);
+                }
+            }
             return None;
         }
         let chosen = &candidates[..take];
@@ -909,19 +921,39 @@ impl State {
                 .filter(|(_, room)| *room == Some(*i))
                 .map(|(m, _)| m.id)
                 .collect();
-            if ids.is_empty() && w.skipped == 0 {
-                remaining += w.unread;
-                continue;
+            let left = if ids.is_empty() && w.skipped == 0 {
+                w.unread
+            } else {
+                let (unread, lost) = rooms[*i].commit(agent, &ids);
+                skipped += lost;
+                unread
+            };
+            if left > 0 {
+                agent.signal.mark_room(&rooms[*i].name);
             }
-            let (unread, lost) = rooms[*i].commit(agent, &ids);
-            remaining += unread;
-            skipped += lost;
+            remaining += left;
         }
         Some(Batch {
             messages: chosen.iter().map(|(m, _)| m.clone()).collect(),
             remaining,
             skipped,
         })
+    }
+
+    /// The rooms a pull has to look at: all the agent is in, or those
+    /// named in `hot` that exist (once each).
+    fn hot_rooms(&self, st: &AgentState, hot: Hot) -> Vec<Arc<Room>> {
+        if hot.all {
+            return st.rooms.clone();
+        }
+        let mut rooms: Vec<Arc<Room>> = hot
+            .rooms
+            .iter()
+            .filter_map(|name| self.rooms.get(Key::fold(name).as_str()))
+            .collect();
+        rooms.sort_unstable_by_key(|r| Arc::as_ptr(r) as usize);
+        rooms.dedup_by(|a, b| Arc::ptr_eq(a, b));
+        rooms
     }
 
     /// Delete read mail read before `cutoff_ms`. Returns how many.

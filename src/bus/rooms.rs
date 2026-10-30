@@ -144,10 +144,13 @@ impl RoomState {
     /// Append `msg` (its id exceeds every id in the log; the caller has made
     /// room), and count it unread for every member but its sender, waking a
     /// pull parked on each.
-    fn append(&mut self, msg: Arc<Msg>) {
+    fn append(&mut self, msg: Arc<Msg>, room: &Arc<str>) {
         for member in self.members.values_mut() {
             if msg.from.eq_ignore_ascii_case(&member.name) {
                 continue;
+            }
+            if member.unread == 0 && member.skipped == 0 {
+                member.signal.mark_room(room);
             }
             member.unread += 1;
             if member.signal.parked() > 0 {
@@ -257,6 +260,7 @@ impl Room {
         let Some(&first) = ids.first() else { return };
         let retained = ids.iter().filter(|&&id| id >= front).count();
         member.cursor = member.cursor.min(first.saturating_sub(1));
+        me.signal.mark_room(&self.name);
         member.unread += retained;
         member.skipped += (ids.len() - retained) as u64;
     }
@@ -598,7 +602,7 @@ impl State {
                 body_json_len,
                 now_ms,
             ));
-            st.append(msg.clone());
+            st.append(msg.clone(), &found.name);
             msg
         };
         self.note_sent(sender, now_ms);

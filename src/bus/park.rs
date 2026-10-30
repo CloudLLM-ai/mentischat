@@ -4,7 +4,34 @@
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
 
+use parking_lot::Mutex;
 use tokio::sync::Notify;
+
+/// The rooms an agent may have unread or skipped mail in, so a pull looks at
+/// those instead of every room the agent is in.
+///
+/// Invariant: a member with unread or skipped room messages is in `rooms`, or
+/// `all` is set, or a pull holding the taken set is about to put it back. The
+/// room adds its name when a member goes from nothing waiting to something
+/// (under the room's lock), and a pull puts back each room it leaves
+/// something in. Names may repeat or go stale; a pull tolerates both. `all`
+/// starts set so mail restored from a snapshot is found by the first pull.
+#[derive(Debug)]
+pub(super) struct Hot {
+    /// Look at every room the agent is in.
+    pub all: bool,
+    /// Names (as the room was created) of rooms to look at.
+    pub rooms: Vec<Arc<str>>,
+}
+
+impl Default for Hot {
+    fn default() -> Self {
+        Self {
+            all: true,
+            rooms: Vec::new(),
+        }
+    }
+}
 
 /// What a send wakes. Lives as long as its agent is on the roster; a pull
 /// holds an [`Arc`] to it so it can wait without holding the bus lock.
@@ -19,9 +46,27 @@ pub(super) struct Signal {
     /// Pulls parked right now. Raised under the bus lock (so the cap holds)
     /// and lowered by [`ParkGuard`] from wherever the pull ends.
     parked: AtomicUsize,
+    /// See [`Hot`]. A leaf lock: nothing is locked while it is held.
+    hot: Mutex<Hot>,
 }
 
 impl Signal {
+    /// Note that `room` has something waiting for this agent.
+    pub(super) fn mark_room(&self, room: &Arc<str>) {
+        self.hot.lock().rooms.push(room.clone());
+    }
+
+    /// Take the set of rooms to look at, leaving it empty.
+    pub(super) fn take_hot(&self) -> Hot {
+        std::mem::replace(
+            &mut *self.hot.lock(),
+            Hot {
+                all: false,
+                rooms: Vec::new(),
+            },
+        )
+    }
+
     /// Pulls parked right now.
     pub(super) fn parked(&self) -> usize {
         self.parked.load(Relaxed)

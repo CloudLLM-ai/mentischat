@@ -141,8 +141,8 @@ impl State {
             return Ok(None);
         }
         st.last_seen_ms = now;
-        let rooms = st.rooms.clone();
-        Ok(self.take_merged(agent, &mut st, &rooms, Take::Lease, Page { items, bytes }))
+        let hot = agent.signal.take_hot();
+        Ok(self.take_merged(agent, &mut st, hot, Take::Lease, Page { items, bytes }))
     }
 
     /// Acknowledge everything leased to the stream `epoch` with an id up to

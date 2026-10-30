@@ -170,6 +170,11 @@ UNRELEASED
     counter instead of sleeping. Also removes the unused private_room error
     code, which was documented as reserved and never sent.
 
+  - refactor(rest,ws,tools): MailboxError is an IntoResponse (no more
+    result_large_err allows), REST pull/history/deregister call the tools,
+    one send_batch and one digit-string parser, and the WebSocket parses
+    frames into a public ClientFrame enum (ws::parse_frame). Wire unchanged.
+
   - test(bench): benches/bus.rs (engine, contention, room fan-out), benches/rest.rs
     (handlers without a socket) and examples/http_load.rs (keep-alive HTTP
     clients: single sends, batches of 64, pulls with limit 256). On a loaded

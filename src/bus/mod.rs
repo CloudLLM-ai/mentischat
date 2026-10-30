@@ -356,21 +356,12 @@ impl Bus {
         to: &AgentName,
         body: String,
     ) -> Result<SendReceipt, MailErr> {
-        if body.len() > MAX_BODY_BYTES || body.trim().is_empty() {
-            return Err(MailErr::InvalidBody);
-        }
-        let body_json_len = json_len(&body);
+        let body_json_len = validate_body(&body)?;
         let body = body.into_boxed_str();
         let msg = self
             .open()?
             .send(from.as_str(), to.as_str(), body, body_json_len, now_ms())?;
-        Ok(SendReceipt {
-            id: msg.id.to_string(),
-            from: msg.from.to_string(),
-            to: msg.to.to_string(),
-            room: msg.room.as_ref().map(ToString::to_string),
-            created_at: rfc3339_ms(msg.created_ms),
-        })
+        Ok(SendReceipt::from(&*msg))
     }
 
     /// Pull (and optionally block for) the next batch of unread mail for
@@ -524,16 +515,7 @@ impl Bus {
         with: Option<&AgentName>,
         before: Option<i64>,
     ) -> Result<HistoryPage, MailErr> {
-        let state = self.open()?;
-        let agent = state.agent(name.as_str(), Key::fold(name.as_str()).as_str())?;
-        {
-            let mut st = agent.inner.lock();
-            if st.removed {
-                drop(st);
-                return Err(state.unregistered(name.as_str()));
-            }
-            st.last_seen_ms = now_ms();
-        }
+        let (state, agent) = self.active(name)?;
         let with = with.map(AgentName::folded);
         let (rows, next) = history_rows(state, &agent, with.as_deref(), before);
         Ok(history_page(&agent.name, &rows, next))
@@ -652,10 +634,7 @@ impl Bus {
         room: &RoomName,
         body: String,
     ) -> Result<SendReceipt, MailErr> {
-        if body.len() > MAX_BODY_BYTES || body.trim().is_empty() {
-            return Err(MailErr::InvalidBody);
-        }
-        let body_json_len = json_len(&body);
+        let body_json_len = validate_body(&body)?;
         let (state, sender) = self.active(from)?;
         let msg = state.send_room(
             &sender,
@@ -664,13 +643,7 @@ impl Bus {
             body_json_len,
             now_ms(),
         )?;
-        Ok(SendReceipt {
-            id: msg.id.to_string(),
-            from: msg.from.to_string(),
-            to: String::new(),
-            room: msg.room.as_ref().map(ToString::to_string),
-            created_at: rfc3339_ms(msg.created_ms),
-        })
+        Ok(SendReceipt::from(&*msg))
     }
 
     /// One page of what `room` still holds, for a member: the newest
@@ -809,6 +782,15 @@ impl Bus {
 
 /// Trims a register description and enforces [`MAX_DESCRIPTION_BYTES`] and
 /// no control characters; `""` stays `""` (it clears the stored one).
+/// Check a message body and return its JSON-escaped length: at most
+/// [`MAX_BODY_BYTES`] and not blank. Shared by direct and room sends.
+fn validate_body(body: &str) -> Result<usize, MailErr> {
+    if body.len() > MAX_BODY_BYTES || body.trim().is_empty() {
+        return Err(MailErr::InvalidBody);
+    }
+    Ok(json_len(body))
+}
+
 fn validate_description(raw: String) -> Result<String, MailErr> {
     let trimmed = raw.trim();
     if trimmed.len() > MAX_DESCRIPTION_BYTES || trimmed.chars().any(char::is_control) {

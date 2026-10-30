@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use super::log::Msg;
-use super::state::{convo_has, convo_key, fitting, Agent, Key, Page, State};
+use super::state::{convo_has, convo_key, page_from_newest, Agent, Key, State};
 use super::{HistoryPage, MAX_BATCH};
 
 /// One history page's messages for `me` (see `Bus::history`) and the
@@ -69,11 +69,7 @@ pub(super) fn history_rows(
         let Some((_, i)) = newest else { break };
         rows.extend(streams[i].next());
     }
-    let take = fitting(rows.iter().map(|m| m.page_len()), Page::DEFAULT);
-    let next = (rows.len() > take).then(|| rows[take - 1].id as i64);
-    rows.truncate(take);
-    rows.reverse();
-    (rows, next)
+    page_from_newest(rows)
 }
 
 /// The wire page for `me` from [`history_rows`]' output. Builds the strings,

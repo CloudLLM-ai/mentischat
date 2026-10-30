@@ -301,6 +301,17 @@ pub(super) fn fitting(sizes: impl Iterator<Item = usize>, page: Page) -> usize {
     take
 }
 
+/// A history page from `rows`, the newest messages first (one more than a
+/// page, if there are more): trims them to what fits [`Page::DEFAULT`], the
+/// cursor for the next (older) page, and the page oldest first.
+pub(super) fn page_from_newest(mut rows: Vec<Arc<Msg>>) -> (Vec<Arc<Msg>>, Option<i64>) {
+    let take = fitting(rows.iter().map(|m| m.page_len()), Page::DEFAULT);
+    let next = (rows.len() > take).then(|| rows[take - 1].id as i64);
+    rows.truncate(take);
+    rows.reverse();
+    (rows, next)
+}
+
 /// A message on its way: what `send` hands down once both names resolve.
 struct Outgoing<'a> {
     /// The conversation it belongs to, see [`convo_key`].
@@ -551,6 +562,14 @@ impl State {
         }
         // Sending is activity: an agent that only sends must not age off the
         // roster.
+        self.note_sent(&sender, now_ms);
+        Ok(msg)
+    }
+
+    /// Count a send against `sender` and mark it seen: sending is activity.
+    /// A sender that left the roster meanwhile is counted in `sent_by_gone`
+    /// so [`State::messages_sent`] stays exact.
+    pub(super) fn note_sent(&self, sender: &Agent, now_ms: u64) {
         let mut from_state = sender.inner.lock();
         if from_state.removed {
             self.sent_by_gone.fetch_add(1, Relaxed);
@@ -558,7 +577,6 @@ impl State {
             from_state.last_seen_ms = now_ms;
             from_state.sent += 1;
         }
-        Ok(msg)
     }
 
     /// Queue a message for `recipient`, whose state `to_state` is locked by the

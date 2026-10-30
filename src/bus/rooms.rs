@@ -30,7 +30,7 @@ use parking_lot::Mutex;
 
 use super::log::{Msg, Target};
 use super::park::Signal;
-use super::state::{fitting, Agent, Key, Page, State};
+use super::state::{page_from_newest, Agent, Key, State};
 use super::{
     MailErr, RoomEntry, RoomInfo, MAX_BATCH, MAX_ROOMS, MAX_ROOMS_PER_AGENT, MAX_ROOM_MEMBERS,
 };
@@ -594,13 +594,7 @@ impl State {
             st.append(msg.clone());
             msg
         };
-        let mut from_state = sender.inner.lock();
-        if from_state.removed {
-            self.sent_by_gone.fetch_add(1, Relaxed);
-        } else {
-            from_state.last_seen_ms = now_ms;
-            from_state.sent += 1;
-        }
+        self.note_sent(sender, now_ms);
         Ok(msg)
     }
 
@@ -693,7 +687,7 @@ impl State {
         }
         let before = before.map(|b| u64::try_from(b).unwrap_or(0));
         let end = before.map_or(st.log.len(), |b| st.log.partition_point(|m| m.id < b));
-        let mut rows: Vec<Arc<Msg>> = st
+        let rows: Vec<Arc<Msg>> = st
             .log
             .range(..end)
             .rev()
@@ -701,11 +695,7 @@ impl State {
             .cloned()
             .collect();
         drop(st);
-        let take = fitting(rows.iter().map(|m| m.page_len()), Page::DEFAULT);
-        let next = (rows.len() > take).then(|| rows[take - 1].id as i64);
-        rows.truncate(take);
-        rows.reverse();
-        Ok((rows, next))
+        Ok(page_from_newest(rows))
     }
 
     /// Unread room messages for `agent`, over every room it is in.

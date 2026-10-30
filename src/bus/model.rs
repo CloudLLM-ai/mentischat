@@ -5,6 +5,9 @@ use std::time::Duration;
 
 use serde::Serialize;
 
+use super::clock::rfc3339_ms;
+use super::log::Msg;
+
 /// Maximum UTF-8 byte length of a message body.
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
 /// Per-recipient cap on unread messages.
@@ -131,6 +134,19 @@ pub struct SendReceipt {
     pub room: Option<String>,
     /// UTC RFC 3339 creation timestamp.
     pub created_at: String,
+}
+
+impl From<&Msg> for SendReceipt {
+    /// The receipt for a message just sent; a room message has no `to`.
+    fn from(msg: &Msg) -> Self {
+        Self {
+            id: msg.id.to_string(),
+            from: msg.from.to_string(),
+            to: msg.to.to_string(),
+            room: msg.room.as_ref().map(ToString::to_string),
+            created_at: rfc3339_ms(msg.created_ms),
+        }
+    }
 }
 
 /// Register outcome.

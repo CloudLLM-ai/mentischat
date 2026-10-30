@@ -436,3 +436,52 @@ async fn shutdown_closes_every_stream_and_a_stream_keeps_its_agent_alive() {
     assert!(ended.is_ok(), "the connection ends");
     assert!(closed, "with a close frame that says why");
 }
+
+/// `parse_frame` turns each client frame shape into its variant, keeping the
+/// `ref`, and a numeric or digit-string `upTo` both read as an id.
+#[test]
+fn parse_frame_reads_each_client_frame() {
+    use mentischat::ws::{parse_frame, ClientFrame};
+
+    assert_eq!(
+        parse_frame(r#"{"type":"ack","upTo":"7","ref":1}"#),
+        Ok(ClientFrame::Ack {
+            up_to: 7,
+            reference: Some(json!(1))
+        })
+    );
+    assert!(matches!(
+        parse_frame(r#"{"type":"send","to":"b","body":"x"}"#),
+        Ok(ClientFrame::Send {
+            reference: None,
+            ..
+        })
+    ));
+    assert!(matches!(
+        parse_frame(r#"{"type":"batch","items":[{}, 3]}"#),
+        Ok(ClientFrame::Batch { items, .. }) if items.len() == 2
+    ));
+}
+
+/// Refusals are typed and carry the `ref` when the frame was an object.
+#[test]
+fn parse_frame_refuses_with_a_typed_error_and_the_ref() {
+    use mentischat::errors::MailboxError;
+    use mentischat::ws::parse_frame;
+
+    let err = |text| parse_frame(text).unwrap_err();
+    assert_eq!(err("not json").error, MailboxError::InvalidBody);
+    assert_eq!(err("[1]").reference, None);
+    assert_eq!(
+        err(r#"{"type":"nope","ref":"r"}"#).reference,
+        Some(json!("r"))
+    );
+    assert_eq!(
+        err(r#"{"type":"ack","upTo":-1,"ref":2}"#).error,
+        MailboxError::InvalidCursor
+    );
+    assert_eq!(
+        err(r#"{"type":"batch","items":"x"}"#).error,
+        MailboxError::InvalidBody
+    );
+}

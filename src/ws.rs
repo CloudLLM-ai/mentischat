@@ -137,62 +137,95 @@ async fn serve(bus: &Bus, session: &StreamSession, socket: &mut WebSocket) -> En
         let gone = session.takeover();
         tokio::pin!(gone);
         gone.as_mut().enable();
-        if bus.is_closed() {
-            return Ending::Close(1001, "server shutting down");
+        if let Some(ending) = stop_reason(bus, session) {
+            return ending;
         }
-        if session.taken_over() {
-            return Ending::Close(4000, "replaced by a newer stream for this agent");
+        match push_mail(bus, session, socket).await {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(ending) => return ending,
         }
-        match bus.stream_push(session) {
-            Ok(Some(push)) => {
-                if send_push(socket, push).await.is_err() {
-                    return Ending::Dropped;
-                }
-                continue;
-            }
-            Ok(None) => {}
-            Err(MailboxError::ShuttingDown) => return Ending::Close(1001, "server shutting down"),
-            Err(e) => {
-                let _ = send_json(socket, error_frame(&e, None)).await;
-                return Ending::Close(1011, "stream ended");
-            }
-        }
-        tokio::select! {
-            () = &mut wake => {}
-            () = &mut gone => {}
-            _ = ping.tick() => {
-                if last_heard.elapsed() > SILENCE_LIMIT {
-                    return Ending::Close(1008, "no answer to pings");
-                }
-                if send_frame(socket, Frame::Ping(Vec::new().into())).await.is_err() {
-                    return Ending::Dropped;
-                }
-            }
+        let ended = tokio::select! {
+            () = &mut wake => None,
+            () = &mut gone => None,
+            _ = ping.tick() => on_ping(socket, last_heard).await,
             frame = socket.recv() => match frame {
-                None | Some(Err(_)) => return Ending::Dropped,
+                None | Some(Err(_)) => Some(Ending::Dropped),
                 Some(Ok(frame)) => {
                     last_heard = Instant::now();
-                    match frame {
-                        Frame::Text(text) => {
-                            let reply = handle_text(bus, session, text.as_str()).await;
-                            if let Some(reply) = reply {
-                                if send_json(socket, reply).await.is_err() {
-                                    return Ending::Dropped;
-                                }
-                            }
-                        }
-                        Frame::Binary(_) => {
-                            let reply = error_frame(&MailboxError::InvalidBody, None);
-                            if send_json(socket, reply).await.is_err() {
-                                return Ending::Dropped;
-                            }
-                        }
-                        Frame::Close(_) => return Ending::Dropped,
-                        Frame::Ping(_) | Frame::Pong(_) => {}
-                    }
+                    on_frame(bus, session, socket, frame).await
                 }
             },
+        };
+        if let Some(ending) = ended {
+            return ending;
         }
+    }
+}
+
+/// Why the stream must end now, if it must: the server is shutting down or a
+/// newer stream took this agent over.
+fn stop_reason(bus: &Bus, session: &StreamSession) -> Option<Ending> {
+    if bus.is_closed() {
+        return Some(Ending::Close(1001, "server shutting down"));
+    }
+    session.taken_over().then_some(Ending::Close(
+        4000,
+        "replaced by a newer stream for this agent",
+    ))
+}
+
+/// Send the next push, if one is ready: `Ok(true)` when it was sent (look
+/// again), `Ok(false)` when there was nothing to push.
+async fn push_mail(
+    bus: &Bus,
+    session: &StreamSession,
+    socket: &mut WebSocket,
+) -> Result<bool, Ending> {
+    match bus.stream_push(session) {
+        Ok(Some(push)) => send_push(socket, push)
+            .await
+            .map(|()| true)
+            .map_err(|()| Ending::Dropped),
+        Ok(None) => Ok(false),
+        Err(MailboxError::ShuttingDown) => Err(Ending::Close(1001, "server shutting down")),
+        Err(e) => {
+            let _ = send_json(socket, error_frame(&e, None)).await;
+            Err(Ending::Close(1011, "stream ended"))
+        }
+    }
+}
+
+/// A ping tick: close a peer silent past [`SILENCE_LIMIT`], else ping it.
+async fn on_ping(socket: &mut WebSocket, last_heard: Instant) -> Option<Ending> {
+    if last_heard.elapsed() > SILENCE_LIMIT {
+        return Some(Ending::Close(1008, "no answer to pings"));
+    }
+    send_frame(socket, Frame::Ping(Vec::new().into()))
+        .await
+        .err()
+        .map(|()| Ending::Dropped)
+}
+
+/// One received WebSocket message; `Some` when it ends the stream.
+async fn on_frame(
+    bus: &Bus,
+    session: &StreamSession,
+    socket: &mut WebSocket,
+    frame: Frame,
+) -> Option<Ending> {
+    let reply = match frame {
+        Frame::Text(text) => reply_to(bus, session, text.as_str()).await,
+        Frame::Binary(_) => Some(error_frame(&MailboxError::InvalidBody, None)),
+        Frame::Close(_) => return Some(Ending::Dropped),
+        Frame::Ping(_) | Frame::Pong(_) => None,
+    };
+    match reply {
+        Some(reply) => send_json(socket, reply)
+            .await
+            .err()
+            .map(|()| Ending::Dropped),
+        None => None,
     }
 }
 
@@ -238,29 +271,97 @@ fn typed(kind: &str, body: Value, reference: Option<&Value>) -> Value {
     Value::Object(object)
 }
 
-/// Handle one client frame; the reply to send, if any.
-async fn handle_text(bus: &Bus, session: &StreamSession, text: &str) -> Option<Value> {
-    let Ok(Value::Object(frame)) = serde_json::from_str::<Value>(text) else {
-        return Some(error_frame(&MailboxError::InvalidBody, None));
+/// A frame a client may send, validated by [`parse_frame`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClientFrame {
+    /// `{"type":"ack","upTo":ID}`: everything pushed up to `up_to` is read.
+    Ack {
+        /// The highest message id acknowledged.
+        up_to: u64,
+        /// The frame's `ref`, echoed on an error.
+        reference: Option<Value>,
+    },
+    /// `{"type":"send","to"|"room":..,"body":..}`: one send from this
+    /// stream's agent.
+    Send {
+        /// The frame's `ref`, echoed on the reply.
+        reference: Option<Value>,
+        /// The whole frame object, whose `to`, `room` and `body` are read.
+        item: Value,
+    },
+    /// `{"type":"batch","items":[..]}`: sends applied in order.
+    Batch {
+        /// The frame's `ref`, echoed on the reply.
+        reference: Option<Value>,
+        /// The send objects; their count is checked when applied.
+        items: Vec<Value>,
+    },
+}
+
+/// Why a client frame was refused, with its `ref` if it had one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FrameError {
+    /// The contract error to answer with.
+    pub error: MailboxError,
+    /// The frame's `ref`, if it was an object that had one.
+    pub reference: Option<Value>,
+}
+
+/// Parse one client text frame.
+///
+/// # Errors
+///
+/// `invalid_body` for text that is not a JSON object, an unknown or missing
+/// `type`, or a `batch` without an `items` array; `invalid_cursor` for an
+/// `ack` whose `upTo` is not an id (a number, or a string of digits).
+pub fn parse_frame(text: &str) -> Result<ClientFrame, FrameError> {
+    let Ok(Value::Object(mut frame)) = serde_json::from_str::<Value>(text) else {
+        return Err(FrameError {
+            error: MailboxError::InvalidBody,
+            reference: None,
+        });
     };
-    let reference = frame.get("ref");
+    let reference = frame.get("ref").cloned();
+    let refuse = |error| FrameError {
+        error,
+        reference: reference.clone(),
+    };
     match frame.get("type").and_then(Value::as_str) {
-        Some("ack") => ack(bus, session, &frame)
-            .err()
-            .map(|e| error_frame(&e, reference)),
-        Some("send") => Some(send_one(bus, session, &frame, reference).await),
-        Some("batch") => Some(send_batch(bus, session, &frame, reference).await),
-        _ => Some(error_frame(&MailboxError::InvalidBody, reference)),
+        Some("ack") => frame
+            .get("upTo")
+            .and_then(crate::tools::uint)
+            .map(|up_to| ClientFrame::Ack {
+                up_to,
+                reference: reference.clone(),
+            })
+            .ok_or_else(|| refuse(MailboxError::InvalidCursor)),
+        Some("send") => Ok(ClientFrame::Send {
+            reference: reference.clone(),
+            item: Value::Object(frame),
+        }),
+        Some("batch") => match frame.remove("items") {
+            Some(Value::Array(items)) => Ok(ClientFrame::Batch { reference, items }),
+            _ => Err(refuse(MailboxError::InvalidBody)),
+        },
+        _ => Err(refuse(MailboxError::InvalidBody)),
     }
 }
 
-/// Apply an `ack` frame: `upTo` is an id (a number, or a string of digits).
-fn ack(bus: &Bus, session: &StreamSession, frame: &Map<String, Value>) -> Result<(), MailboxError> {
-    let up_to = frame
-        .get("upTo")
-        .and_then(crate::tools::uint)
-        .ok_or(MailboxError::InvalidCursor)?;
-    bus.stream_ack(session, up_to).map(|_| ())
+/// Handle one client text frame; the reply to send, if any.
+async fn reply_to(bus: &Bus, session: &StreamSession, text: &str) -> Option<Value> {
+    match parse_frame(text) {
+        Err(e) => Some(error_frame(&e.error, e.reference.as_ref())),
+        Ok(ClientFrame::Ack { up_to, reference }) => bus
+            .stream_ack(session, up_to)
+            .err()
+            .map(|e| error_frame(&e, reference.as_ref())),
+        Ok(ClientFrame::Send { reference, item }) => {
+            Some(send_one(bus, session, &item, reference.as_ref()).await)
+        }
+        Ok(ClientFrame::Batch { reference, items }) => {
+            Some(send_batch(bus, session, &items, reference.as_ref()).await)
+        }
+    }
 }
 
 /// The `send_message` parameters for one send from this stream's agent.
@@ -276,11 +377,10 @@ fn send_params(session: &StreamSession, item: &Value) -> Value {
 async fn send_one(
     bus: &Bus,
     session: &StreamSession,
-    frame: &Map<String, Value>,
+    item: &Value,
     reference: Option<&Value>,
 ) -> Value {
-    let item = Value::Object(frame.clone());
-    match crate::tools::send_message(bus, &send_params(session, &item)).await {
+    match crate::tools::send_message(bus, &send_params(session, item)).await {
         Ok(receipt) => typed("receipt", receipt, reference),
         Err(e) => error_frame(&e, reference),
     }
@@ -289,12 +389,9 @@ async fn send_one(
 async fn send_batch(
     bus: &Bus,
     session: &StreamSession,
-    frame: &Map<String, Value>,
+    items: &[Value],
     reference: Option<&Value>,
 ) -> Value {
-    let Some(Value::Array(items)) = frame.get("items") else {
-        return error_frame(&MailboxError::InvalidBody, reference);
-    };
     match crate::tools::send_batch(bus, items, |item| Cow::Owned(send_params(session, item))).await
     {
         Ok(results) => typed("batch", json!({ "results": results }), reference),

@@ -42,6 +42,7 @@
 //! connection it has heard nothing from for 60 s. However a stream ends, what
 //! it had not acknowledged returns to the inbox in order.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -55,7 +56,7 @@ use tokio::time::Instant;
 use crate::bus::{Bus, Push, StreamSession};
 use crate::errors::MailboxError;
 use crate::names::AgentName;
-use crate::rest::{MAX_BATCH_BODY_BYTES, MAX_BATCH_SEND};
+use crate::rest::MAX_BATCH_BODY_BYTES;
 
 /// How often the server pings.
 const PING_EVERY: Duration = Duration::from_secs(20);
@@ -293,18 +294,12 @@ async fn send_batch(
     frame: &Map<String, Value>,
     reference: Option<&Value>,
 ) -> Value {
-    let items = match frame.get("items") {
-        Some(Value::Array(items)) if (1..=MAX_BATCH_SEND).contains(&items.len()) => items,
-        _ => return error_frame(&MailboxError::InvalidBody, reference),
+    let Some(Value::Array(items)) = frame.get("items") else {
+        return error_frame(&MailboxError::InvalidBody, reference);
     };
-    let mut results = Vec::with_capacity(items.len());
-    for item in items {
-        let outcome = if item.is_object() {
-            crate::tools::send_message(bus, &send_params(session, item)).await
-        } else {
-            Err(MailboxError::InvalidBody)
-        };
-        results.push(outcome.unwrap_or_else(|e| e.to_json()));
+    match crate::tools::send_batch(bus, items, |item| Cow::Owned(send_params(session, item))).await
+    {
+        Ok(results) => typed("batch", json!({ "results": results }), reference),
+        Err(e) => error_frame(&e, reference),
     }
-    typed("batch", json!({ "results": results }), reference)
 }

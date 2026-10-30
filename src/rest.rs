@@ -5,6 +5,7 @@
 //! mutate state and history pages hold message text, so both answer with
 //! `Cache-Control: no-store`.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -21,8 +22,7 @@ use crate::errors::MailboxError;
 
 type Ctx = Arc<Bus>;
 
-/// Most messages in one `POST /messages/batch`.
-pub const MAX_BATCH_SEND: usize = 256;
+pub use crate::tools::MAX_BATCH_SEND;
 /// Largest `POST /messages/batch` request body: 16 MiB, room for a full batch
 /// of bodies of a few tens of KiB (the 1 MiB limit of every other route would
 /// cap a batch of large messages at 16 of them).
@@ -146,19 +146,11 @@ async fn send_msg(State(bus): State<Ctx>, body: Result<Json<Value>, JsonRejectio
 /// array: one failing item does not stop or undo the others. A body that is
 /// not an array of 1 to [`MAX_BATCH_SEND`] items is `invalid_body`.
 async fn send_batch(State(bus): State<Ctx>, body: Result<Json<Value>, JsonRejection>) -> Reply {
-    let items = match json_body(body)? {
-        Value::Array(items) if (1..=MAX_BATCH_SEND).contains(&items.len()) => items,
-        _ => return Err(MailboxError::InvalidBody),
+    let body = json_body(body)?;
+    let Value::Array(items) = &body else {
+        return Err(MailboxError::InvalidBody);
     };
-    let mut results = Vec::with_capacity(items.len());
-    for item in &items {
-        let outcome = if item.is_object() {
-            crate::tools::send_message(&bus, item).await
-        } else {
-            Err(MailboxError::InvalidBody)
-        };
-        results.push(outcome.unwrap_or_else(|e| e.to_json()));
-    }
+    let results = crate::tools::send_batch(&bus, items, Cow::Borrowed).await?;
     Ok(Json(Value::Array(results)))
 }
 

@@ -9,6 +9,7 @@
 //! error JSON; Rust `Err` is reserved for malformed *requests* (upstream
 //! turns those into JSON-RPC `-32602`).
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use mcp::protocol::{
@@ -365,6 +366,34 @@ pub async fn send_message(bus: &Bus, params: &Value) -> Result<Value, MailboxErr
     }
     let to = required_name(params, "to")?;
     Ok(to_wire(bus.send(&from, &to, body(params)?).await?))
+}
+
+/// Most messages in one `POST /messages/batch` or WebSocket `batch` frame.
+pub const MAX_BATCH_SEND: usize = 256;
+
+/// Apply 1 to [`MAX_BATCH_SEND`] sends in order, each like [`send_message`]
+/// with the parameters `params` derives from the item (a WebSocket stream
+/// overrides `from`). An item that is not an object, or whose send fails,
+/// answers with its contract error object at its position: one failing item
+/// does not stop or undo the others. Any other item count is `invalid_body`.
+pub async fn send_batch<'a>(
+    bus: &Bus,
+    items: &'a [Value],
+    params: impl Fn(&'a Value) -> Cow<'a, Value>,
+) -> Result<Vec<Value>, MailboxError> {
+    if !(1..=MAX_BATCH_SEND).contains(&items.len()) {
+        return Err(MailboxError::InvalidBody);
+    }
+    let mut results = Vec::with_capacity(items.len());
+    for item in items {
+        let outcome = if item.is_object() {
+            send_message(bus, &params(item)).await
+        } else {
+            Err(MailboxError::InvalidBody)
+        };
+        results.push(outcome.unwrap_or_else(|e| e.to_json()));
+    }
+    Ok(results)
 }
 
 /// Create a room per the tool and `POST /rooms` contract: `agent` and `room`

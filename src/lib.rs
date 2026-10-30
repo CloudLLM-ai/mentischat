@@ -16,6 +16,8 @@
 //! this crate owns mailbox semantics: roster, held names, caps, read
 //! marking, history, expiry, and blocking pulls.
 
+#![warn(missing_docs)]
+
 // The data directory permissions (0700/0600) and SIGTERM handling use
 // Unix-only APIs, so say so at compile time instead of failing with a wall of
 // unresolved symbols.

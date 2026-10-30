@@ -26,7 +26,10 @@ pub enum TakenReason {
 #[derive(Debug, Clone, PartialEq)]
 pub enum MailboxError {
     /// Name fails the roster regex.
-    InvalidName { agent: String },
+    InvalidName {
+        /// The name as given.
+        agent: String,
+    },
     /// Missing / non-string / whitespace-only / oversized body, a body that
     /// is not JSON, a name field that is not a string, or a `reclaim` that is
     /// not a boolean.
@@ -36,8 +39,11 @@ pub enum MailboxError {
     /// The name is registered or held; `reclaim` takes it anyway. Carries
     /// free names to pick instead.
     NameTaken {
+        /// The name that was asked for.
         agent: String,
+        /// Whether it is registered now or held for a previous holder.
         reason: TakenReason,
+        /// Free names to pick instead.
         suggestions: Vec<String>,
     },
     /// `before` is not a positive integer.
@@ -50,35 +56,80 @@ pub enum MailboxError {
     InvalidDescription,
     /// The named agent is not on the roster. Carries the current roster so
     /// callers can self-correct.
-    Unregistered { agent: String, known: Vec<String> },
+    Unregistered {
+        /// The name that is not on the roster.
+        agent: String,
+        /// The roster now, sorted.
+        known: Vec<String>,
+    },
     /// That recipient already holds `MAX_PENDING_PER_AGENT` unread messages.
-    QueueFull { to: String, pending: i64 },
+    QueueFull {
+        /// The recipient whose queue is full.
+        to: String,
+        /// How many unread messages it holds.
+        pending: i64,
+    },
     /// Global row cap hit.
-    StorageFull { pending: i64 },
+    StorageFull {
+        /// How many unread messages the bus holds.
+        pending: i64,
+    },
     /// A storage failure unrelated to capacity (not a full queue). The
     /// in-memory engine cannot raise it; the code stays in the wire contract.
     StorageError,
     /// Roster already holds [`crate::bus::MAX_ROSTER`] agents.
-    RosterFull { agents: i64 },
+    RosterFull {
+        /// How many agents the roster holds.
+        agents: i64,
+    },
     /// `MAX_WAITERS_PER_AGENT` pulls are already parked for that name.
-    TooManyWaiters { agent: String, waiting: usize },
+    TooManyWaiters {
+        /// The agent whose pulls are parked.
+        agent: String,
+        /// How many are parked.
+        waiting: usize,
+    },
     /// Room name fails the same grammar as an agent name.
-    InvalidRoom { room: String },
+    InvalidRoom {
+        /// The room name as given.
+        room: String,
+    },
     /// No room has that name.
-    RoomNotFound { room: String },
+    RoomNotFound {
+        /// The room name asked for.
+        room: String,
+    },
     /// A room with that name exists already.
-    RoomExists { room: String },
+    RoomExists {
+        /// The room name that is taken.
+        room: String,
+    },
     /// The agent is not a member of the room it tried to use.
-    NotAMember { agent: String, room: String },
-    /// Reserved: a private room answers [`MailboxError::RoomNotFound`] to an
-    /// agent that is neither in it nor invited, so this is never raised.
-    PrivateRoom { room: String },
+    NotAMember {
+        /// The agent that is not in the room.
+        agent: String,
+        /// The room it tried to use.
+        room: String,
+    },
     /// The daemon already holds [`crate::bus::MAX_ROOMS`] rooms.
-    RoomsFull { rooms: i64 },
+    RoomsFull {
+        /// How many rooms the daemon holds.
+        rooms: i64,
+    },
     /// The agent is in [`crate::bus::MAX_ROOMS_PER_AGENT`] rooms already.
-    TooManyRooms { agent: String, rooms: i64 },
+    TooManyRooms {
+        /// The agent that cannot join another room.
+        agent: String,
+        /// How many rooms it is in.
+        rooms: i64,
+    },
     /// The room holds [`crate::bus::MAX_ROOM_MEMBERS`] members already.
-    RoomFull { room: String, members: i64 },
+    RoomFull {
+        /// The room that is full.
+        room: String,
+        /// How many members it holds.
+        members: i64,
+    },
     /// REST path that is not a known route.
     NotFound,
     /// Known REST path, HTTP method it does not serve.
@@ -108,7 +159,6 @@ impl MailboxError {
             Self::RoomNotFound { .. } => "room_not_found",
             Self::RoomExists { .. } => "room_exists",
             Self::NotAMember { .. } => "not_a_member",
-            Self::PrivateRoom { .. } => "private_room",
             Self::RoomsFull { .. } => "rooms_full",
             Self::TooManyRooms { .. } => "too_many_rooms",
             Self::RoomFull { .. } => "room_full",
@@ -132,7 +182,7 @@ impl MailboxError {
             Self::Unregistered { .. } | Self::RoomNotFound { .. } | Self::NotFound => {
                 StatusCode::NOT_FOUND
             }
-            Self::NotAMember { .. } | Self::PrivateRoom { .. } => StatusCode::FORBIDDEN,
+            Self::NotAMember { .. } => StatusCode::FORBIDDEN,
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             Self::QueueFull { .. }
             | Self::TooManyWaiters { .. }
@@ -190,8 +240,7 @@ impl MailboxError {
             }
             Self::InvalidRoom { room }
             | Self::RoomNotFound { room }
-            | Self::RoomExists { room }
-            | Self::PrivateRoom { room } => json!({ "error": self.code(), "room": room }),
+            | Self::RoomExists { room } => json!({ "error": self.code(), "room": room }),
             Self::NotAMember { agent, room } => {
                 json!({ "error": self.code(), "agent": agent, "room": room })
             }

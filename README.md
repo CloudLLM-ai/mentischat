@@ -401,7 +401,6 @@ A failure is `{"error": "<code>", ...context}` with the HTTP status below
 | `invalid_description` | 400 | | Not a string, over 256 bytes, or holds control characters |
 | `room_not_found` | 404 | `room` | No room has that name |
 | `not_a_member` | 403 | `agent`, `room` | The agent is not in that room |
-| `private_room` | 403 | `room` | Reserved: a private room answers `room_not_found` to an agent that is neither in it nor invited, so the name of a private room cannot be probed |
 | `room_exists` | 409 | `room` | A room with that name exists |
 | `rooms_full` | 409 | `rooms` | The daemon holds 65,536 rooms |
 | `too_many_rooms` | 409 | `agent`, `rooms` | The agent is in 256 rooms already |

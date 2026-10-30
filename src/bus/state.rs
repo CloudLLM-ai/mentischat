@@ -57,6 +57,7 @@ use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
 
+use super::convos::ConvoMap;
 use super::log::{Convo, Msg, Target};
 use super::park::Signal;
 use super::rooms::Room;
@@ -251,11 +252,6 @@ pub(super) fn convo_key(a: &Key, b: &Key) -> Key {
     key
 }
 
-/// True when `key` is a conversation `folded` takes part in.
-pub(super) fn convo_has(key: &str, folded: &str) -> bool {
-    key.split('\n').any(|side| side == folded)
-}
-
 /// How big a page of messages is: how many, and how many bytes of their JSON.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Page {
@@ -409,7 +405,7 @@ pub(super) struct State {
     /// them without visiting private rooms it cannot show.
     pub public_names: RwLock<BTreeSet<String>>,
     /// Conversations by [`convo_key`].
-    pub convos: Sharded<Arc<Convo>>,
+    pub convos: ConvoMap,
     /// Rooms by folded name.
     pub rooms: Sharded<Arc<Room>>,
     /// How many messages a room keeps.
@@ -444,7 +440,7 @@ impl State {
             names: RwLock::default(),
             readers: Sharded::new(),
             public_names: RwLock::default(),
-            convos: Sharded::new(),
+            convos: ConvoMap::new(),
             rooms: Sharded::new(),
             room_capacity: super::DEFAULT_ROOM_CAPACITY,
             no_agent: "".into(),
@@ -1005,7 +1001,7 @@ impl State {
     /// name `key`, and tidy what that leaves behind. Returns how many it
     /// killed.
     fn discard_mail_to(&self, key: &str, gen: u64) -> usize {
-        let convos = self.convos.entries_where(|k| convo_has(k, key));
+        let convos = self.convos.of_agent(key);
         let (mut discarded, mut freed) = (0, 0);
         for (convo_key, convo) in convos {
             let mut log = convo.log.lock();

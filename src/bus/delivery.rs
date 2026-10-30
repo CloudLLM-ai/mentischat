@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use super::log::Msg;
-use super::state::{convo_has, convo_key, page_from_newest, Agent, Key, State};
+use super::state::{convo_key, page_from_newest, Agent, Key, State};
 use super::{HistoryPage, MAX_BATCH};
 
 /// One history page's messages for `me` (see `Bus::history`) and the
@@ -41,7 +41,10 @@ pub(super) fn history_rows(
             .collect(),
         None => state
             .convos
-            .values_where(|key| convo_has(key, me_key.as_str())),
+            .of_agent(me_key.as_str())
+            .into_iter()
+            .map(|(_, convo)| convo)
+            .collect(),
     };
     // One row past a full page says whether older messages exist; each log
     // is locked just long enough to copy its newest candidates out.

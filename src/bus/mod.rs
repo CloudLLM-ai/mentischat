@@ -35,6 +35,7 @@ use crate::errors::TakenReason;
 use crate::names::{AgentName, RoomName};
 
 mod clock;
+mod convos;
 mod delivery;
 mod log;
 mod model;

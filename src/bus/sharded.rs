@@ -118,20 +118,6 @@ impl<V: Clone> Sharded<V> {
             .collect()
     }
 
-    /// Every entry whose key `keep` accepts.
-    pub(super) fn entries_where(&self, keep: impl Fn(&str) -> bool) -> Vec<(String, V)> {
-        self.shards
-            .iter()
-            .flat_map(|s| {
-                let map = s.0.read();
-                map.iter()
-                    .filter(|(k, _)| keep(k))
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect::<Vec<_>>()
-            })
-            .collect()
-    }
-
     /// Remove the entry under `key` if `is_it` accepts its value.
     pub(super) fn remove_if(&self, key: &str, is_it: impl Fn(&V) -> bool) {
         let mut map = self.shard(key).write();
@@ -182,11 +168,20 @@ impl<V: Clone> Sharded<V> {
         self.shards.iter().map(|s| s.0.read().len()).sum()
     }
 
-    /// Remove every entry `keep` rejects, shard by shard.
-    pub(super) fn retain(&self, mut keep: impl FnMut(&V) -> bool) {
+    /// Remove every entry `keep` rejects, shard by shard; returns the keys
+    /// removed.
+    pub(super) fn retain_keyed(&self, mut keep: impl FnMut(&V) -> bool) -> Vec<String> {
+        let mut removed = Vec::new();
         for shard in self.shards.iter() {
-            shard.0.write().retain(|_, v| keep(v));
+            shard.0.write().retain(|k, v| {
+                let kept = keep(v);
+                if !kept {
+                    removed.push(k.clone());
+                }
+                kept
+            });
         }
+        removed
     }
 
     /// Remove and return every value.

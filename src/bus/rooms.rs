@@ -530,6 +530,42 @@ impl State {
         }
     }
 
+    /// Make room in `st`, the locked log of one room, for a message of `len`
+    /// bytes: first the room's own capacity, then the byte budget, each by
+    /// pushing out this room's oldest message, and reserve the bytes. Fails
+    /// `storage_full` when the budget is held elsewhere or the room has
+    /// nothing left to push out.
+    fn make_room(&self, st: &mut RoomState, len: usize) -> Result<(), MailErr> {
+        while st.log.len() >= self.room_capacity {
+            let freed = st.evict_oldest().unwrap_or(0);
+            self.release_bytes(freed);
+        }
+        let mut checked = false;
+        while !self.try_reserve_bytes(len) {
+            // Pushing out this whole room cannot help when the rest of
+            // the budget is held elsewhere: fail before evicting anything.
+            if !checked {
+                checked = true;
+                let own: usize = st.log.iter().map(|m| m.cost()).sum();
+                let others = self.bytes.0.load(Relaxed).saturating_sub(own);
+                if others.saturating_add(len) > self.byte_budget {
+                    return Err(self.storage_full());
+                }
+            }
+            match st.evict_oldest() {
+                Some(n) => self.release_bytes(n),
+                None => return Err(self.storage_full()),
+            }
+        }
+        Ok(())
+    }
+
+    fn storage_full(&self) -> MailErr {
+        MailErr::StorageFull {
+            pending: self.unread.0.load(Relaxed) as i64,
+        }
+    }
+
     /// Append `body` from `sender` to `room`. The sender must be a member.
     /// Nothing is counted against the direct-mail caps: a room is bounded by
     /// its own capacity.
@@ -547,36 +583,7 @@ impl State {
             if st.retired || st.member(sender).is_none() {
                 return Err(not_in_room(&found, &st, sender, room));
             }
-            // Make room: first the room's own capacity, then the byte budget,
-            // each by pushing out this room's oldest message.
-            let len = body.len() + super::MESSAGE_OVERHEAD_BYTES;
-            while st.log.len() >= self.room_capacity {
-                let freed = st.evict_oldest().unwrap_or(0);
-                self.release_bytes(freed);
-            }
-            let mut checked = false;
-            while !self.try_reserve_bytes(len) {
-                // Pushing out this whole room cannot help when the rest of
-                // the budget is held elsewhere: fail before evicting anything.
-                if !checked {
-                    checked = true;
-                    let own: usize = st.log.iter().map(|m| m.cost()).sum();
-                    let others = self.bytes.0.load(Relaxed).saturating_sub(own);
-                    if others.saturating_add(len) > self.byte_budget {
-                        return Err(MailErr::StorageFull {
-                            pending: self.unread.0.load(Relaxed) as i64,
-                        });
-                    }
-                }
-                match st.evict_oldest() {
-                    Some(n) => self.release_bytes(n),
-                    None => {
-                        return Err(MailErr::StorageFull {
-                            pending: self.unread.0.load(Relaxed) as i64,
-                        });
-                    }
-                }
-            }
+            self.make_room(&mut st, body.len() + super::MESSAGE_OVERHEAD_BYTES)?;
             // Under the room's lock, so the log stays sorted by id.
             let id = self.next_id.0.fetch_add(1, Relaxed);
             let msg = Arc::new(Msg::new(
@@ -607,37 +614,13 @@ impl State {
         limit: usize,
     ) -> (Vec<RoomEntry>, bool) {
         let key = Key::fold(&agent.name);
-        // The rooms this agent can see besides the public ones: those it is
-        // in and those it was invited to, both short lists it keeps.
-        let own: BTreeSet<String> = {
-            let st = agent.inner.lock();
-            st.rooms
-                .iter()
-                .map(|r| Key::fold(&r.name).as_str().to_string())
-                .chain(st.invited_to.iter().cloned())
-                .collect()
-        };
+        let own = own_room_keys(agent);
         let mut entries = Vec::new();
         let mut cursor: Option<String> = after.map(str::to_string);
         // Walk the public index and the agent's own rooms together, in name
         // order, so a page costs O(page + the agent's rooms), not O(rooms).
         loop {
-            let chunk: Vec<String> = {
-                let bound = cursor.as_deref().map_or(Bound::Unbounded, Bound::Excluded);
-                let mut merged: BTreeSet<String> = self
-                    .public_names
-                    .read()
-                    .range::<str, _>((bound, Bound::Unbounded))
-                    .take(limit + 1)
-                    .cloned()
-                    .collect();
-                merged.extend(
-                    own.range::<str, _>((bound, Bound::Unbounded))
-                        .take(limit + 1)
-                        .cloned(),
-                );
-                merged.into_iter().take(limit + 1).collect()
-            };
+            let chunk = self.name_chunk(&own, cursor.as_deref(), limit + 1);
             let Some(last) = chunk.last().cloned() else {
                 return (entries, false);
             };
@@ -646,29 +629,38 @@ impl State {
                 let Some(room) = self.rooms.get(&folded) else {
                     continue;
                 };
-                let st = room.inner.lock();
-                let member = st.members.get(key.as_str());
-                let hidden = room.private && member.is_none() && !st.invited.contains(key.as_str());
-                if st.retired || hidden {
+                let Some(entry) = visible_entry(&room, key.as_str()) else {
                     continue;
-                }
+                };
                 if entries.len() == limit {
                     return (entries, true);
                 }
-                entries.push(RoomEntry {
-                    room: room.name.to_string(),
-                    description: room.description.clone(),
-                    private: room.private,
-                    members: st.members.len(),
-                    joined: member.is_some(),
-                    unread: member.map_or(0, |m| m.unread),
-                });
+                entries.push(entry);
             }
             if exhausted {
                 return (entries, false);
             }
             cursor = Some(last);
         }
+    }
+
+    /// The next `n` folded room names after `cursor`, in name order, from the
+    /// public index merged with `own` (the agent's private rooms).
+    fn name_chunk(&self, own: &BTreeSet<String>, cursor: Option<&str>, n: usize) -> Vec<String> {
+        let bound = cursor.map_or(Bound::Unbounded, Bound::Excluded);
+        let mut merged: BTreeSet<String> = self
+            .public_names
+            .read()
+            .range::<str, _>((bound, Bound::Unbounded))
+            .take(n)
+            .cloned()
+            .collect();
+        merged.extend(
+            own.range::<str, _>((bound, Bound::Unbounded))
+                .take(n)
+                .cloned(),
+        );
+        merged.into_iter().take(n).collect()
     }
 
     /// One page of the retained messages of `room`, for a member: the
@@ -706,4 +698,34 @@ impl State {
             .filter_map(|r| r.inner.lock().members.get(key.as_str()).map(|m| m.unread))
             .sum()
     }
+}
+
+/// The folded names of the rooms `agent` can see besides the public ones:
+/// those it is in and those it was invited to, both short lists it keeps.
+fn own_room_keys(agent: &Agent) -> BTreeSet<String> {
+    let st = agent.inner.lock();
+    st.rooms
+        .iter()
+        .map(|r| Key::fold(&r.name).as_str().to_string())
+        .chain(st.invited_to.iter().cloned())
+        .collect()
+}
+
+/// `room` as the agent folded to `key` sees it; `None` when the room is gone
+/// or private and the agent is neither in it nor invited.
+fn visible_entry(room: &Room, key: &str) -> Option<RoomEntry> {
+    let st = room.inner.lock();
+    let member = st.members.get(key);
+    let hidden = room.private && member.is_none() && !st.invited.contains(key);
+    if st.retired || hidden {
+        return None;
+    }
+    Some(RoomEntry {
+        room: room.name.to_string(),
+        description: room.description.clone(),
+        private: room.private,
+        members: st.members.len(),
+        joined: member.is_some(),
+        unread: member.map_or(0, |m| m.unread),
+    })
 }

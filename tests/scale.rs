@@ -234,3 +234,40 @@ async fn the_overview_reads_a_bounded_number_of_rows_but_counts_the_whole_roster
     assert_eq!(ov.agents.len(), mentischat::bus::MAX_OVERVIEW_AGENTS);
     assert_eq!(ov.agents_total, 1100);
 }
+
+/// Private rooms the viewer cannot see are never visited: a page costs the
+/// public rooms and the viewer's own, however many private rooms exist.
+#[tokio::test]
+async fn list_rooms_does_not_visit_private_rooms_it_cannot_show() {
+    let (_d, bus) = fresh_bus("private_walk");
+    register_many(&bus, 41).await;
+    let viewer = name("agent00040");
+    for i in 0..40 {
+        let creator = name(&format!("agent{i:05}"));
+        for j in 0..200 {
+            bus.create_room(&creator, &room(&format!("secret{i:02}-{j:03}")), true, None)
+                .await
+                .unwrap();
+        }
+    }
+    bus.create_room(&name("agent00000"), &room("open"), false, None)
+        .await
+        .unwrap();
+    bus.invite(&name("agent00001"), &room("secret01-000"), &viewer)
+        .await
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let listing = bus.list_rooms(&viewer).await.unwrap();
+    let elapsed = started.elapsed();
+    let names: Vec<&str> = listing.rooms.iter().map(|r| r.room.as_str()).collect();
+    assert_eq!(
+        names,
+        ["open", "secret01-000"],
+        "public plus the one invited to"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(50),
+        "8000 private rooms must not be walked: {elapsed:?}"
+    );
+}

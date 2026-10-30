@@ -285,6 +285,10 @@ pub(super) struct AgentState {
     pub sent: u64,
     /// The rooms this agent is in (a hint: each room's member list decides).
     pub rooms: Vec<Arc<Room>>,
+    /// Folded names of rooms this agent was invited to (a hint, bounded, so
+    /// `list_rooms` can show them without searching every room; the room's
+    /// own invitation list decides).
+    pub invited_to: std::collections::HashSet<String>,
     /// Set once the agent has left the roster. A send that looked the agent
     /// up before that sees it here and fails `unregistered`.
     pub removed: bool,
@@ -335,6 +339,7 @@ impl Agent {
                 read: VecDeque::new(),
                 sent: 0,
                 rooms: Vec::new(),
+                invited_to: Default::default(),
                 removed: false,
             }),
         }
@@ -504,8 +509,9 @@ pub(super) struct State {
     /// an expiry has to look at (at most [`MAX_TOTAL_MESSAGES`]). Entries
     /// are added, and removed, under the agent's lock.
     pub readers: Sharded<Arc<Agent>>,
-    /// Folded room names in order, for paging `list_rooms`.
-    pub room_names: RwLock<BTreeSet<String>>,
+    /// Folded names of the public rooms in order, so `list_rooms` pages through
+    /// them without visiting private rooms it cannot show.
+    pub public_names: RwLock<BTreeSet<String>>,
     /// Conversations by [`convo_key`].
     pub convos: Sharded<Arc<Convo>>,
     /// Rooms by folded name.
@@ -541,7 +547,7 @@ impl State {
             holds: Mutex::default(),
             names: RwLock::default(),
             readers: Sharded::new(),
-            room_names: RwLock::default(),
+            public_names: RwLock::default(),
             convos: Sharded::new(),
             rooms: Sharded::new(),
             room_capacity: super::DEFAULT_ROOM_CAPACITY,
@@ -1125,7 +1131,7 @@ impl State {
         let agents = self.roster.drain();
         self.names.write().clear();
         self.readers.drain();
-        self.room_names.write().clear();
+        self.public_names.write().clear();
         let counts = (self.total.0.load(Relaxed) as i64, agents.len() as i64);
         for agent in agents {
             let mut st = agent.inner.lock();

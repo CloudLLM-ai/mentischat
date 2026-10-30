@@ -21,7 +21,7 @@
 //! room is invite-only and unlisted for everyone else; any local process can
 //! still claim a member's name, so it is etiquette, not a security boundary.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
@@ -303,7 +303,9 @@ impl State {
                 },
             }
         }
-        self.room_names.write().insert(key);
+        if !private {
+            self.public_names.write().insert(key);
+        }
         self.remember_room(agent, &made);
         let info = made.inner.lock().info(&made);
         Ok(info)
@@ -380,6 +382,18 @@ impl State {
                 });
             }
             st.invited.insert(invitee_key.as_str().to_string());
+            let info = st.info(&found);
+            drop(st);
+            // Tell the invitee, so list_rooms finds the room without
+            // searching; the agent's lock is taken after the room's is
+            // released. A full list just means the room is not listed: the
+            // invitation itself still stands.
+            let mut inv = invitee.inner.lock();
+            if inv.invited_to.len() < MAX_ROOMS_PER_AGENT {
+                inv.invited_to
+                    .insert(Key::fold(&found.name).as_str().to_string());
+            }
+            return Ok(info);
         }
         Ok(st.info(&found))
     }
@@ -473,7 +487,7 @@ impl State {
         }
         let key = Key::fold(&room.name);
         self.rooms.remove_if(key.as_str(), |r| Arc::ptr_eq(r, room));
-        self.room_names.write().remove(key.as_str());
+        self.public_names.write().remove(key.as_str());
     }
 
     /// Note on the agent that it is in `room`, so a pull knows where to look.
@@ -484,6 +498,7 @@ impl State {
             if st.removed {
                 true
             } else {
+                st.invited_to.remove(Key::fold(&room.name).as_str());
                 if !st.rooms.iter().any(|r| Arc::ptr_eq(r, room)) {
                     st.rooms.push(room.clone());
                 }
@@ -578,20 +593,36 @@ impl State {
         limit: usize,
     ) -> (Vec<RoomEntry>, bool) {
         let key = Key::fold(&agent.name);
+        // The rooms this agent can see besides the public ones: those it is
+        // in and those it was invited to, both short lists it keeps.
+        let own: BTreeSet<String> = {
+            let st = agent.inner.lock();
+            st.rooms
+                .iter()
+                .map(|r| Key::fold(&r.name).as_str().to_string())
+                .chain(st.invited_to.iter().cloned())
+                .collect()
+        };
         let mut entries = Vec::new();
         let mut cursor: Option<String> = after.map(str::to_string);
-        // Walk the name index in chunks until a page of visible rooms is
-        // found; private rooms the agent cannot see are skipped.
+        // Walk the public index and the agent's own rooms together, in name
+        // order, so a page costs O(page + the agent's rooms), not O(rooms).
         loop {
             let chunk: Vec<String> = {
-                let names = self.room_names.read();
-                let from = cursor.as_deref();
-                let bound = from.map_or(Bound::Unbounded, Bound::Excluded);
-                names
+                let bound = cursor.as_deref().map_or(Bound::Unbounded, Bound::Excluded);
+                let mut merged: BTreeSet<String> = self
+                    .public_names
+                    .read()
                     .range::<str, _>((bound, Bound::Unbounded))
                     .take(limit + 1)
                     .cloned()
-                    .collect()
+                    .collect();
+                merged.extend(
+                    own.range::<str, _>((bound, Bound::Unbounded))
+                        .take(limit + 1)
+                        .cloned(),
+                );
+                merged.into_iter().take(limit + 1).collect()
             };
             let Some(last) = chunk.last().cloned() else {
                 return (entries, false);

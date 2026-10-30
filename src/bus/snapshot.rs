@@ -381,6 +381,7 @@ fn restore_message(
 /// where to look), its retained messages, and the unread counts those and
 /// the saved cursors imply.
 fn restore_room(state: &State, rec: RoomRec) {
+    let room_is_private = rec.private;
     let name: Arc<str> = rec.name.into();
     let mut st = RoomState {
         invited: rec.invited.into_iter().collect(),
@@ -443,9 +444,19 @@ fn restore_room(state: &State, rec: RoomRec) {
     for agent in joined {
         agent.inner.lock().rooms.push(room.clone());
     }
+    let invited: Vec<String> = room.inner.lock().invited.iter().cloned().collect();
+    for who in invited {
+        if let Some(agent) = state.roster.get(&who) {
+            agent
+                .inner
+                .lock()
+                .invited_to
+                .insert(Key::fold(&room.name).as_str().to_string());
+        }
+    }
     let key = name.to_ascii_lowercase();
     // A duplicate room name in a hand-edited snapshot keeps the first.
-    if state.rooms.try_insert(&key, room).is_ok() {
-        state.room_names.write().insert(key);
+    if state.rooms.try_insert(&key, room).is_ok() && !room_is_private {
+        state.public_names.write().insert(key);
     }
 }

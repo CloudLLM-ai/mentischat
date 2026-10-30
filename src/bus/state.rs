@@ -528,10 +528,19 @@ impl State {
 
     /// Messages accepted since the daemon started.
     pub(super) fn messages_sent(&self) -> u64 {
+        // An agent removed since the snapshot already folded its count into
+        // `sent_by_gone`, under the same lock.
         let live: u64 = self
             .agents_sorted()
             .iter()
-            .map(|a| a.inner.lock().sent)
+            .map(|a| {
+                let st = a.inner.lock();
+                if st.removed {
+                    0
+                } else {
+                    st.sent
+                }
+            })
             .sum();
         live + self.sent_by_gone.load(Relaxed)
     }
@@ -572,14 +581,14 @@ impl State {
         };
         // The roster is only read once the recipient's lock is released: the
         // roster comes first in the lock order.
-        let msg = match delivered {
+        let (msg, at_cap) = match delivered {
             Some(result) => result?,
             None => return Err(self.unregistered(to)),
         };
-        // The live count is raised once the message is filed; at the cap the
-        // oldest read message makes room. Unread mail is under the cap, so
-        // there is read mail to prune.
-        if self.total.0.fetch_add(1, Relaxed) >= MAX_TOTAL_MESSAGES as usize {
+        // The live count was raised with the message; at the cap the oldest
+        // read message makes room. Unread mail is under the cap, so there is
+        // read mail to prune.
+        if at_cap {
             self.prune_oldest_read();
         }
         // Sending is activity: an agent that only sends must not age off the
@@ -603,7 +612,7 @@ impl State {
         sender: &Agent,
         recipient: &Agent,
         out: Outgoing<'_>,
-    ) -> Result<Arc<Msg>, MailErr> {
+    ) -> Result<(Arc<Msg>, bool), MailErr> {
         let pending = to_state.unread.len();
         if pending >= MAX_PENDING_PER_AGENT as usize {
             return Err(MailErr::QueueFull {
@@ -611,18 +620,24 @@ impl State {
                 pending: pending as i64,
             });
         }
-        self.reserve()?;
+        let at_cap = self.reserve()?;
         let msg = self.file(out, sender, recipient);
         to_state.unread.push_back(msg.clone());
         if recipient.signal.parked() > 0 {
             recipient.signal.notify.notify_one();
         }
-        Ok(msg)
+        Ok((msg, at_cap))
     }
 
-    /// Count one more unread message, failing `storage_full` when every slot
-    /// is unread.
-    fn reserve(&self) -> Result<(), MailErr> {
+    /// Count one more unread and one more live message, failing
+    /// `storage_full` when every slot is unread. Returns true when the live
+    /// count was already at the cap, so the caller prunes the oldest read
+    /// message once it has released the recipient's lock.
+    ///
+    /// Both counts are raised under the recipient's lock, so `clear` and
+    /// `remove_agent` (which lock the agent first) never see a message that
+    /// is filed but not counted.
+    fn reserve(&self) -> Result<bool, MailErr> {
         let mut unread = self.unread.0.load(Relaxed);
         loop {
             if unread >= MAX_TOTAL_MESSAGES as usize {
@@ -639,7 +654,7 @@ impl State {
                 Err(now) => unread = now,
             }
         }
-        Ok(())
+        Ok(self.total.0.fetch_add(1, Relaxed) >= MAX_TOTAL_MESSAGES as usize)
     }
 
     /// Delete the message that has been read longest, comparing the read

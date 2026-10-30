@@ -27,7 +27,7 @@ use tokio::sync::futures::Notified;
 
 use super::clock::now_ms;
 use super::park::ParkGuard;
-use super::state::{Agent, AgentState, Key, Page, State};
+use super::state::{Agent, AgentState, Key, Page, State, Take};
 use super::{Bus, MailErr, Message, MAX_STREAM_BYTES, MAX_STREAM_IN_FLIGHT};
 use crate::names::AgentName;
 
@@ -143,7 +143,7 @@ impl State {
         let now = now_ms();
         st.last_seen_ms = now;
         let rooms = st.rooms.clone();
-        Ok(self.take_merged(agent, &mut st, &rooms, now, Page { items, bytes }, true))
+        Ok(self.take_merged(agent, &mut st, &rooms, Take::Lease, Page { items, bytes }))
     }
 
     /// Acknowledge everything leased to the stream `epoch` with an id up to

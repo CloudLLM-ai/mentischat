@@ -312,6 +312,52 @@ pub(super) fn page_from_newest(mut rows: Vec<Arc<Msg>>) -> (Vec<Arc<Msg>>, Optio
     (rows, next)
 }
 
+/// How [`State::take_merged`] hands out what it picked.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum Take {
+    /// A pull: direct mail is marked read at this time (milliseconds since
+    /// the Unix epoch).
+    Read(u64),
+    /// A stream push: out of the queue but unread, until acked.
+    Lease,
+}
+
+/// What one pull found.
+pub(super) enum Pulled {
+    /// The agent has left the roster.
+    Gone,
+    /// The agent is there and nothing is unread.
+    Nothing,
+    /// A batch of unread mail.
+    Batch(Batch),
+}
+
+/// Lease `chosen` (candidates in id order, tagged with the index of their
+/// room in `rooms`, or `None` for direct mail): the first `direct` unread
+/// direct messages move to the lease list, room messages are leased as they
+/// are.
+fn lease_chosen(
+    st: &mut AgentState,
+    chosen: &[(Arc<Msg>, Option<usize>)],
+    rooms: &[Arc<Room>],
+    direct: usize,
+) {
+    let moved: Vec<Arc<Msg>> = st.unread.drain(..direct).collect();
+    for msg in moved {
+        st.leased_bytes += msg.page_len();
+        st.leased.push(Leased { msg, room: None });
+    }
+    for (msg, room) in chosen {
+        if let Some(i) = room {
+            st.leased_bytes += msg.page_len();
+            st.leased.push(Leased {
+                msg: msg.clone(),
+                room: Some(rooms[*i].clone()),
+            });
+        }
+    }
+}
+
 /// A message on its way: what `send` hands down once both names resolve.
 struct Outgoing<'a> {
     /// The conversation it belongs to, see [`convo_key`].
@@ -744,27 +790,24 @@ impl State {
     /// the first always included. Taking and marking happen
     /// under the agent's lock in this one call, so a pull hands each message
     /// out exactly once.
-    pub(super) fn pull(
-        &self,
-        agent: &Arc<Agent>,
-        now_ms: u64,
-        page: Page,
-    ) -> Option<Option<Batch>> {
+    pub(super) fn pull(&self, agent: &Arc<Agent>, now_ms: u64, page: Page) -> Pulled {
         let mut st = agent.inner.lock();
         if st.removed {
-            return None;
+            return Pulled::Gone;
         }
         st.last_seen_ms = now_ms;
-        if st.rooms.is_empty() {
-            let direct = self.take_direct(agent, &mut st, now_ms, page);
-            return Some(direct.map(|messages| Batch {
-                remaining: st.unread.len(),
-                messages,
-                skipped: 0,
-            }));
-        }
-        let rooms = st.rooms.clone();
-        Some(self.take_merged(agent, &mut st, &rooms, now_ms, page, false))
+        let batch = if st.rooms.is_empty() {
+            self.take_direct(agent, &mut st, now_ms, page)
+                .map(|messages| Batch {
+                    remaining: st.unread.len(),
+                    messages,
+                    skipped: 0,
+                })
+        } else {
+            let rooms = st.rooms.clone();
+            self.take_merged(agent, &mut st, &rooms, Take::Read(now_ms), page)
+        };
+        batch.map_or(Pulled::Nothing, Pulled::Batch)
     }
 
     /// Mark the first `n` (at most) of the agent's unread direct mail read at
@@ -826,9 +869,8 @@ impl State {
         agent: &Arc<Agent>,
         st: &mut AgentState,
         rooms: &[Arc<Room>],
-        now_ms: u64,
+        how: Take,
         page: Page,
-        lease: bool,
     ) -> Option<Batch> {
         let waiting: Vec<_> = rooms
             .iter()
@@ -858,24 +900,11 @@ impl State {
         }
         let chosen = &candidates[..take];
         let direct = chosen.iter().filter(|(_, room)| room.is_none()).count();
-        if lease {
-            // Pushed, not read: out of the queue but unread, until acked.
-            let moved: Vec<Arc<Msg>> = st.unread.drain(..direct).collect();
-            for msg in moved {
-                st.leased_bytes += msg.page_len();
-                st.leased.push(Leased { msg, room: None });
+        match how {
+            Take::Read(now_ms) => {
+                self.read_first(agent, st, direct, now_ms);
             }
-            for (msg, room) in chosen {
-                if let Some(i) = room {
-                    st.leased_bytes += msg.page_len();
-                    st.leased.push(Leased {
-                        msg: msg.clone(),
-                        room: Some(rooms[*i].clone()),
-                    });
-                }
-            }
-        } else {
-            self.read_first(agent, st, direct, now_ms);
+            Take::Lease => lease_chosen(st, chosen, rooms, direct),
         }
         let (mut remaining, mut skipped) = (st.unread.len(), 0);
         for (i, w) in &waiting {

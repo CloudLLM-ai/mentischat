@@ -67,7 +67,7 @@ use clock::{now_ms, rfc3339_ms, unix_ms};
 use delivery::{history_page, history_rows};
 use log::{json_len, Msg};
 use park::{ParkGuard, Signal};
-use state::{Agent, Key, Page, State};
+use state::{Agent, Key, Page, Pulled, State};
 
 type MailErr = crate::errors::MailboxError;
 
@@ -447,8 +447,9 @@ impl Bus {
         page: Page,
     ) -> Result<Option<Taken>, MailErr> {
         match state.pull(agent, now_ms(), page) {
-            None => Err(state.unregistered(name.as_str())),
-            Some(batch) => Ok(batch.map(|batch| Taken {
+            Pulled::Gone => Err(state.unregistered(name.as_str())),
+            Pulled::Nothing => Ok(None),
+            Pulled::Batch(batch) => Ok(Some(Taken {
                 agent: agent.name.clone(),
                 messages: batch.messages,
                 remaining: batch.remaining,

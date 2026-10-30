@@ -11,14 +11,14 @@
 //! state of a busy daemon. One iteration is one message delivered, so the
 //! reported throughput is messages per second. `contention` runs the same
 //! loop for 1 to 32 independent pairs at once on a multi-thread runtime with a
-//! worker per core.
+//! worker per core. `room_fanout` sends to rooms of 2, 16 and 128 members.
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use mentischat::bus::{Bus, MAX_PENDING_PER_AGENT, MAX_TOTAL_MESSAGES};
-use mentischat::names::AgentName;
+use mentischat::names::{AgentName, RoomName};
 
 /// Messages sent between wipes in the `empty` case; small enough that the
 /// mailbox stays far from the row cap.
@@ -147,6 +147,77 @@ fn bench_contention(c: &mut Criterion) {
     group.finish();
 }
 
+/// A room named `bench` with `members` agents in it (`m0` is the sender).
+async fn room_with(bus: &Bus, members: usize) -> RoomName {
+    let room = RoomName::parse("bench").expect("valid room");
+    for i in 0..members {
+        let who = name(&format!("m{i}"));
+        bus.register(&who).await.expect("register member");
+        if i == 0 {
+            bus.create_room(&who, &room, false, None)
+                .await
+                .expect("create");
+        } else {
+            bus.join_room(&who, &room).await.expect("join");
+        }
+    }
+    room
+}
+
+/// `iters` messages from `m0` to the room, each followed by every other
+/// member pulling it (`pull`), or just the sends, and the time it took.
+async fn fan_out(
+    bus: &Bus,
+    room: &RoomName,
+    members: usize,
+    iters: u64,
+    pull: bool,
+    body: &str,
+) -> Duration {
+    let sender = name("m0");
+    let readers: Vec<AgentName> = (1..members).map(|i| name(&format!("m{i}"))).collect();
+    let started = Instant::now();
+    for _ in 0..iters {
+        bus.send_room(&sender, room, body.to_string())
+            .await
+            .expect("send");
+        if pull {
+            for reader in &readers {
+                black_box(bus.check_inbox(reader, 0).await.expect("pull"));
+            }
+        }
+    }
+    started.elapsed()
+}
+
+/// Room fan-out: one sender, rooms of 2, 16 and 128 members. `send` is the
+/// append and the wake of every member; `send_and_pull` adds every other
+/// member pulling the message, so its throughput counts deliveries.
+fn bench_room_fanout(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let body = "x".repeat(BODY_BYTES);
+    let mut group = c.benchmark_group("room_fanout");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(3));
+    for members in [2usize, 16, 128] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bus = Bus::new(dir.path()).expect("bus opens");
+        let room = rt.block_on(room_with(&bus, members));
+        group.throughput(Throughput::Elements(1));
+        group.bench_function(format!("send/{members}"), |b| {
+            b.iter_custom(|iters| rt.block_on(fan_out(&bus, &room, members, iters, false, &body)));
+        });
+        group.throughput(Throughput::Elements(members as u64 - 1));
+        group.bench_function(format!("send_and_pull/{members}"), |b| {
+            b.iter_custom(|iters| rt.block_on(fan_out(&bus, &room, members, iters, true, &body)));
+        });
+    }
+    group.finish();
+}
+
 fn bench_send_pull(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
@@ -180,5 +251,10 @@ fn bench_send_pull(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_send_pull, bench_contention);
+criterion_group!(
+    benches,
+    bench_send_pull,
+    bench_contention,
+    bench_room_fanout
+);
 criterion_main!(benches);

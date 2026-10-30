@@ -474,6 +474,33 @@ make ci             # what CI runs: fmt --check, check, clippy, test, doc
 `make release` still do. GitHub Actions runs `make ci`'s steps on Linux and
 macOS, plus an MSRV check against the `rust-version` in `Cargo.toml`.
 
+## Performance
+
+Measured on an Apple M4 Max (16 cores, macOS), release builds, with other work
+running on the machine, so read them as orders of magnitude.
+
+| What | How | Result |
+|---|---|---|
+| Engine, one pair | `cargo bench --bench bus`, send then pull through `Bus` | about 1.1M messages/s, empty or at the 8192 cap |
+| Engine, many pairs | same, 8 / 32 pairs on a worker per core | 1.3M / 1.7M messages/s |
+| Room fan-out | send to a room of 2 / 16 / 128 members | 2.4M / 2.1M / 1.5M sends/s |
+| REST handlers, no socket | `cargo bench --bench rest` | `POST /messages` about 0.5M req/s, batch of 64 about 0.9M messages/s |
+| Over loopback HTTP | `examples/http_load.rs`, 64 keep-alive clients | single sends about 66k req/s; batches of 64 about 3.8M messages/s (60k req/s); pulls with `limit=256` about 34k pulls/s returning 2.2M messages/s |
+
+The engine is not the limit: a request over HTTP costs about 15 microseconds
+of hyper, syscalls and (in the load generator) the client, against about 2
+for the handler. To move many messages, send them with `POST /messages/batch`
+(up to 256 per request) and drain with `check_inbox` / `GET /inboxes/{agent}`
+and a `limit` (up to 256 per page).
+
+To reproduce the HTTP numbers:
+
+```bash
+MENTISCHAT_PLAIN=1 MENTISCHAT_DIR=$(mktemp -d) target/release/mentischat &
+cargo run --release --example http_load -- --mode batch --clients 64 --seconds 5
+# --mode send | batch | pull; stop the daemon afterwards
+```
+
 ## Trust model & scope
 
 Localhost-only by design: any local process may send as any registered name,

@@ -24,6 +24,13 @@ pub const MAX_WAIT_MS: u32 = 30_000;
 pub const MAX_WAITERS_PER_AGENT: usize = 8;
 /// Cap on roster rows — bounds the number of parked pulls (8 per name).
 pub const MAX_ROSTER: i64 = 256;
+/// Default number of messages a room keeps. When a room is full a new message
+/// pushes out the oldest; a member that had not read it is told how many it
+/// missed (`skipped`).
+pub const DEFAULT_ROOM_CAPACITY: usize = 1024;
+/// Cap on rooms: bounds the memory rooms can hold, as [`MAX_ROSTER`] bounds
+/// the roster.
+pub const MAX_ROOMS: usize = 256;
 /// Default time a read message is kept after it was read.
 const DEFAULT_READ_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Default time an agent stays on the roster without a `register`,
@@ -60,8 +67,13 @@ pub struct Message {
     pub id: String,
     /// Sender roster name.
     pub from: String,
-    /// Recipient roster name.
+    /// Recipient roster name. Empty (and left out of the JSON) for a room
+    /// message, which carries `room` instead.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub to: String,
+    /// The room a room message was sent to; absent from direct mail.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub room: Option<String>,
     /// Body exactly as stored (never trimmed).
     pub body: String,
     /// UTC RFC 3339 creation timestamp.
@@ -78,8 +90,12 @@ pub struct SendReceipt {
     pub id: String,
     /// Echoed sender name.
     pub from: String,
-    /// Echoed recipient name.
+    /// Echoed recipient name; empty (and left out) for a room message.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub to: String,
+    /// The room it went to, for a room message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub room: Option<String>,
     /// UTC RFC 3339 creation timestamp.
     pub created_at: String,
 }
@@ -178,8 +194,17 @@ pub struct InboxPage {
     /// Delivered messages, now marked read. Each message is handed out by
     /// `check_inbox` once; `history` shows it again.
     pub messages: Vec<Message>,
-    /// Unread messages still queued after this page; drain while `> 0`.
+    /// Unread messages still queued after this page, direct and room mail
+    /// together; drain while `> 0`.
     pub remaining: i64,
+    /// Room messages this agent never saw because its rooms were full and
+    /// pushed them out first, since its last pull. Absent when none.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub skipped: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// One `history` result page: the newest messages older than the cursor,
@@ -188,11 +213,63 @@ pub struct InboxPage {
 pub struct HistoryPage {
     /// The agent whose history this is.
     pub agent: String,
-    /// Messages it sent (read or not) and messages it has read, oldest first.
+    /// Messages it sent (read or not) and messages it has read, oldest first;
+    /// for a room, the room's retained messages.
     pub messages: Vec<Message>,
     /// Pass as `before` to get the page of older messages; `None` when there
     /// are none.
     pub next: Option<i64>,
+}
+
+/// Wire shape of a room: what `create_room`, `join_room` and `invite` return.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RoomInfo {
+    /// The room's name, spelled as it was created.
+    pub room: String,
+    /// What the room is for, if its creator said.
+    pub description: Option<String>,
+    /// Invite-only and left out of other agents' `list_rooms`. This is
+    /// etiquette between cooperating local agents, not a security boundary:
+    /// any local process can claim any agent name.
+    pub private: bool,
+    /// Members, sorted by name.
+    pub members: Vec<String>,
+}
+
+/// One row of `list_rooms`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RoomEntry {
+    /// The room's name.
+    pub room: String,
+    /// What the room is for, if its creator said.
+    pub description: Option<String>,
+    /// Invite-only. A private room only appears to its members and invitees.
+    pub private: bool,
+    /// How many agents are in it.
+    pub members: usize,
+    /// True when the asking agent is a member.
+    pub joined: bool,
+    /// Unread room messages for the asking agent; 0 unless `joined`.
+    pub unread: usize,
+}
+
+/// Wire shape of `list_rooms`: public rooms plus the private ones the agent is
+/// in or was invited to, sorted by name.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RoomListing {
+    /// The rooms the asking agent can see.
+    pub rooms: Vec<RoomEntry>,
+}
+
+/// Wire shape of `leave_room`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LeaveOutcome {
+    /// The room that was left.
+    pub room: String,
+    /// True when the agent was its last member and the room is gone.
+    pub deleted: bool,
 }
 
 /// How long the mailbox keeps things, and how long a released name is held.

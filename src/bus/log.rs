@@ -22,6 +22,19 @@ const WIRE_FIXED_BYTES: usize =
     r#"{"id":"","from":"","to":"","body":,"createdAt":"2000-01-01T00:00:00.000Z","readAt":null}"#
         .len();
 
+/// Same for a room message: `room` in place of `to`.
+const ROOM_WIRE_FIXED_BYTES: usize =
+    r#"{"id":"","from":"","room":"","body":,"createdAt":"2000-01-01T00:00:00.000Z","readAt":null}"#
+        .len();
+
+/// Who a message is for: an agent (`to` and the registration it was sent to),
+/// or a room (then `to` is empty and `to_gen` 0, which no registration has).
+pub(super) struct Target {
+    pub to: Arc<str>,
+    pub to_gen: u64,
+    pub room: Option<Arc<str>>,
+}
+
 /// A mail message. Immutable once sent, apart from the two atomics.
 #[derive(Debug)]
 pub(super) struct Msg {
@@ -37,6 +50,9 @@ pub(super) struct Msg {
     /// discarding an agent's mail never touches mail for a later holder of
     /// the same name.
     pub to_gen: u64,
+    /// The room it was sent to, for a room message (then `to` is empty and
+    /// `to_gen` 0, which no registration has).
+    pub room: Option<Arc<str>>,
     /// Body exactly as sent (never trimmed).
     pub body: Box<str>,
     /// Milliseconds since the Unix epoch when the send was accepted.
@@ -58,20 +74,27 @@ impl Msg {
     pub(super) fn new(
         id: u64,
         from: Arc<str>,
-        to: Arc<str>,
-        to_gen: u64,
+        target: Target,
         body: Box<str>,
         body_json_len: usize,
         created_ms: u64,
     ) -> Self {
+        let Target { to, to_gen, room } = target;
         // Roster names are ASCII without characters JSON escapes, and an id
         // is decimal digits, so their wire size is their length.
-        let wire_len = WIRE_FIXED_BYTES + digits(id) + from.len() + to.len() + body_json_len;
+        let fixed = if room.is_some() {
+            ROOM_WIRE_FIXED_BYTES
+        } else {
+            WIRE_FIXED_BYTES
+        };
+        let target_len = room.as_ref().map_or(to.len(), |r| r.len());
+        let wire_len = fixed + digits(id) + from.len() + target_len + body_json_len;
         Self {
             id,
             from,
             to,
             to_gen,
+            room,
             body,
             created_ms,
             read_ms: AtomicU64::new(0),
@@ -109,6 +132,7 @@ impl Msg {
             id: self.id.to_string(),
             from: self.from.to_string(),
             to: self.to.to_string(),
+            room: self.room.as_ref().map(ToString::to_string),
             body: self.body.to_string(),
             created_at: rfc3339_ms(self.created_ms),
             read_at: self.read_at_ms().map(rfc3339_ms),

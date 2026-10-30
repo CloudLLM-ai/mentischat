@@ -16,7 +16,8 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use super::log::{json_len, Msg};
+use super::log::{json_len, Msg, Target};
+use super::rooms::{Member, Room, RoomState};
 use super::state::{convo_key, Agent, Hold, Key, State};
 
 /// File name of the snapshot inside the data directory.
@@ -89,6 +90,29 @@ pub(super) struct Snapshot {
     holds: Vec<HoldRec>,
     /// Live messages, oldest first.
     messages: Vec<MsgRec>,
+    /// Rooms with their retained messages and members' cursors. Absent in a
+    /// snapshot from before rooms.
+    #[serde(default)]
+    rooms: Vec<RoomRec>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RoomRec {
+    name: String,
+    private: bool,
+    description: Option<String>,
+    members: Vec<MemberRec>,
+    /// Folded names invited and not yet joined.
+    invited: Vec<String>,
+    /// Retained messages, oldest first; `to` and `read_ms` are unused.
+    messages: Vec<MsgRec>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct MemberRec {
+    name: String,
+    cursor: u64,
+    skipped: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -193,7 +217,33 @@ pub(super) fn capture(state: &State) -> Snapshot {
             })
             .collect(),
         messages,
+        rooms: state
+            .rooms
+            .values_where(|_| true)
+            .iter()
+            .filter_map(|room| room_rec(room))
+            .collect(),
     }
+}
+
+fn room_rec(room: &Room) -> Option<RoomRec> {
+    let st = room.inner.lock();
+    (!st.retired).then(|| RoomRec {
+        name: room.name.to_string(),
+        private: room.private,
+        description: room.description.clone(),
+        members: st
+            .members
+            .values()
+            .map(|m| MemberRec {
+                name: m.name.to_string(),
+                cursor: m.cursor,
+                skipped: m.skipped,
+            })
+            .collect(),
+        invited: st.invited.iter().cloned().collect(),
+        messages: st.log.iter().map(msg_rec).collect(),
+    })
 }
 
 fn msg_rec(m: &Arc<Msg>) -> MsgRec {
@@ -244,6 +294,16 @@ fn rebuild(snapshot: Snapshot) -> State {
     state.next_id.0.store(next_id, Relaxed);
     let mut names: HashMap<String, Arc<str>> = HashMap::new();
     let mut read = Vec::new();
+    let next_after_rooms = snapshot
+        .rooms
+        .iter()
+        .flat_map(|r| r.messages.iter().map(|m| m.id + 1))
+        .max()
+        .unwrap_or(1);
+    state.next_id.0.fetch_max(next_after_rooms, Relaxed);
+    for rec in snapshot.rooms {
+        restore_room(&state, rec);
+    }
     for rec in messages {
         restore_message(&state, &mut names, &mut read, rec);
     }
@@ -285,8 +345,11 @@ fn restore_message(
     let msg = Arc::new(Msg::new(
         rec.id,
         from,
-        recipient.name.clone(),
-        recipient.gen,
+        Target {
+            to: recipient.name.clone(),
+            to_gen: recipient.gen,
+            room: None,
+        },
         body,
         body_len,
         rec.created_ms,
@@ -308,4 +371,69 @@ fn restore_message(
     } else {
         read.push((to_key, msg));
     }
+}
+
+/// Rebuild one room: its members that are still on the roster (each told
+/// where to look), its retained messages, and the unread counts those and
+/// the saved cursors imply.
+fn restore_room(state: &State, rec: RoomRec) {
+    let name: Arc<str> = rec.name.into();
+    let mut st = RoomState {
+        invited: rec.invited.into_iter().collect(),
+        ..RoomState::default()
+    };
+    for m in rec.messages {
+        let body: Box<str> = m.body.into();
+        let body_len = json_len(&body);
+        let from: Arc<str> = m.from.into();
+        let target = Target {
+            to: state.no_agent.clone(),
+            to_gen: 0,
+            room: Some(name.clone()),
+        };
+        st.log.push_back(Arc::new(Msg::new(
+            m.id,
+            from,
+            target,
+            body,
+            body_len,
+            m.created_ms,
+        )));
+    }
+    let mut joined = Vec::new();
+    for m in rec.members {
+        let Some(agent) = state.roster.get(&m.name.to_ascii_lowercase()) else {
+            continue;
+        };
+        let unread = st
+            .log
+            .iter()
+            .filter(|msg| msg.id > m.cursor && !msg.from.eq_ignore_ascii_case(&agent.name))
+            .count();
+        let member = Member {
+            name: agent.name.clone(),
+            signal: agent.signal.clone(),
+            cursor: m.cursor,
+            unread,
+            skipped: m.skipped,
+        };
+        st.members
+            .insert(Key::fold(&agent.name).as_str().to_string(), member);
+        joined.push(agent);
+    }
+    if st.members.is_empty() {
+        return;
+    }
+    let room = Arc::new(Room {
+        name: name.clone(),
+        private: rec.private,
+        description: rec.description,
+        inner: parking_lot::Mutex::new(st),
+    });
+    for agent in joined {
+        agent.inner.lock().rooms.push(room.clone());
+    }
+    let key = name.to_ascii_lowercase();
+    // A duplicate room name in a hand-edited snapshot keeps the first.
+    let _ = state.rooms.try_insert(&key, room);
 }

@@ -52,6 +52,51 @@ impl AgentName {
     }
 }
 
+/// A room name: the same grammar as [`AgentName`] (1-63 characters, starting
+/// `[a-zA-Z0-9]`, then `[a-zA-Z0-9._-]`), compared without regard to case,
+/// in a namespace of its own: a room and an agent may share a name.
+///
+/// Construct through [`RoomName::parse`], which fails with
+/// [`MailboxError::InvalidRoom`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RoomName(String);
+
+impl RoomName {
+    /// Validate and wrap a raw room name.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mentischat::names::RoomName;
+    ///
+    /// assert!(RoomName::parse("release-war-room").is_ok());
+    /// assert!(RoomName::parse("-lobby").is_err());
+    /// assert!(RoomName::parse("").is_err());
+    /// ```
+    pub fn parse(raw: &str) -> Result<Self, MailboxError> {
+        match AgentName::parse(raw) {
+            Ok(name) => Ok(Self(name.0)),
+            Err(_) => Err(MailboxError::InvalidRoom { room: echo(raw) }),
+        }
+    }
+
+    /// The validated name.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The name lowercased: the form two spellings of one room share.
+    pub fn folded(&self) -> String {
+        self.0.to_ascii_lowercase()
+    }
+}
+
+impl fmt::Display for RoomName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// The harness or app an agent runs in (`claude_code`, `cursor`), lowercased.
 /// A label on the roster entry, shown in `list_agents` and the terminal view;
 /// it plays no part in the name.

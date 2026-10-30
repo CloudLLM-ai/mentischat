@@ -59,6 +59,18 @@ pub enum MailboxError {
     RosterFull { agents: i64 },
     /// `MAX_WAITERS_PER_AGENT` pulls are already parked for that name.
     TooManyWaiters { agent: String, waiting: usize },
+    /// Room name fails the same grammar as an agent name.
+    InvalidRoom { room: String },
+    /// No room has that name.
+    RoomNotFound { room: String },
+    /// A room with that name exists already.
+    RoomExists { room: String },
+    /// The agent is not a member of the room it tried to use.
+    NotAMember { agent: String, room: String },
+    /// The room is private and the agent was not invited.
+    PrivateRoom { room: String },
+    /// The daemon already holds [`crate::bus::MAX_ROOMS`] rooms.
+    RoomsFull { rooms: i64 },
     /// REST path that is not a known route.
     NotFound,
     /// Known REST path, HTTP method it does not serve.
@@ -83,6 +95,12 @@ impl MailboxError {
             Self::StorageError => "storage_error",
             Self::RosterFull { .. } => "roster_full",
             Self::TooManyWaiters { .. } => "too_many_waiters",
+            Self::InvalidRoom { .. } => "invalid_room",
+            Self::RoomNotFound { .. } => "room_not_found",
+            Self::RoomExists { .. } => "room_exists",
+            Self::NotAMember { .. } => "not_a_member",
+            Self::PrivateRoom { .. } => "private_room",
+            Self::RoomsFull { .. } => "rooms_full",
             Self::NotFound => "not_found",
             Self::MethodNotAllowed => "method_not_allowed",
             Self::ShuttingDown => "shutting_down",
@@ -94,15 +112,21 @@ impl MailboxError {
         use axum::http::StatusCode;
         match self {
             Self::InvalidName { .. }
+            | Self::InvalidRoom { .. }
             | Self::InvalidBody
             | Self::InvalidWait
             | Self::InvalidDescription
             | Self::InvalidCursor => StatusCode::BAD_REQUEST,
-            Self::Unregistered { .. } | Self::NotFound => StatusCode::NOT_FOUND,
+            Self::Unregistered { .. } | Self::RoomNotFound { .. } | Self::NotFound => {
+                StatusCode::NOT_FOUND
+            }
+            Self::NotAMember { .. } | Self::PrivateRoom { .. } => StatusCode::FORBIDDEN,
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             Self::QueueFull { .. }
             | Self::TooManyWaiters { .. }
             | Self::RosterFull { .. }
+            | Self::RoomExists { .. }
+            | Self::RoomsFull { .. }
             | Self::NameTaken { .. } => StatusCode::CONFLICT,
             Self::StorageFull { .. } => StatusCode::INSUFFICIENT_STORAGE,
             Self::StorageError => StatusCode::INTERNAL_SERVER_ERROR,
@@ -149,6 +173,14 @@ impl MailboxError {
             Self::TooManyWaiters { agent, waiting } => {
                 json!({ "error": self.code(), "agent": agent, "waiting": waiting })
             }
+            Self::InvalidRoom { room }
+            | Self::RoomNotFound { room }
+            | Self::RoomExists { room }
+            | Self::PrivateRoom { room } => json!({ "error": self.code(), "room": room }),
+            Self::NotAMember { agent, room } => {
+                json!({ "error": self.code(), "agent": agent, "room": room })
+            }
+            Self::RoomsFull { rooms } => json!({ "error": self.code(), "rooms": rooms }),
             Self::NotFound | Self::MethodNotAllowed => json!({ "error": self.code() }),
             Self::ShuttingDown => json!({ "error": self.code() }),
         }

@@ -32,13 +32,14 @@ use std::time::{Duration, SystemTime};
 use tokio::time::Instant;
 
 use crate::errors::TakenReason;
-use crate::names::AgentName;
+use crate::names::{AgentName, RoomName};
 
 mod clock;
 mod delivery;
 mod log;
 mod model;
 mod park;
+mod rooms;
 mod snapshot;
 mod state;
 
@@ -49,6 +50,7 @@ pub use model::{
     SweepOutcome, MAX_BATCH, MAX_BODY_BYTES, MAX_DESCRIPTION_BYTES, MAX_PENDING_PER_AGENT,
     MAX_RETURN_BYTES, MAX_ROSTER, MAX_TOTAL_MESSAGES, MAX_WAITERS_PER_AGENT, MAX_WAIT_MS,
 };
+pub use model::{LeaveOutcome, RoomEntry, RoomInfo, RoomListing, DEFAULT_ROOM_CAPACITY, MAX_ROOMS};
 pub use snapshot::{remove_snapshot, SnapshotError};
 
 use clock::{now_ms, rfc3339_ms, unix_ms};
@@ -76,14 +78,21 @@ struct Taken {
     agent: Arc<str>,
     messages: Vec<Arc<Msg>>,
     remaining: usize,
+    skipped: u64,
 }
 
 impl Taken {
+    /// True when the pull has something to report, mail or lost messages.
+    fn delivers(&self) -> bool {
+        !self.messages.is_empty() || self.skipped > 0
+    }
+
     fn into_page(self) -> InboxPage {
         InboxPage {
             agent: self.agent.to_string(),
             messages: self.messages.iter().map(|m| m.to_wire()).collect(),
             remaining: self.remaining as i64,
+            skipped: self.skipped,
         }
     }
 
@@ -92,6 +101,7 @@ impl Taken {
             agent,
             messages: Vec::new(),
             remaining: 0,
+            skipped: 0,
         }
     }
 }
@@ -137,6 +147,13 @@ impl Bus {
             retention,
             data_dir: data_dir.to_path_buf(),
         })
+    }
+
+    /// Keep the last `capacity` messages of each room instead of
+    /// [`DEFAULT_ROOM_CAPACITY`]; at least 1.
+    pub fn with_room_capacity(mut self, capacity: usize) -> Self {
+        self.state.room_capacity = capacity.max(1);
+        self
     }
 
     /// How long read mail and idle agents are kept, and released names held.
@@ -245,7 +262,7 @@ impl Bus {
         let rows: Vec<_> = state
             .agents_sorted()
             .iter()
-            .map(|a| roster_row(a))
+            .map(|a| roster_row(state, a))
             .collect();
         let suggestions = state.free_suggestions(&state.holds.lock(), now_ms());
         let agents = rows
@@ -282,7 +299,7 @@ impl Bus {
         let agents = state
             .agents_sorted()
             .iter()
-            .map(|a| roster_row(a))
+            .map(|a| roster_row(state, a))
             .map(|row| AgentOverview {
                 name: row.name,
                 provider: row.provider,
@@ -320,6 +337,7 @@ impl Bus {
             id: msg.id.to_string(),
             from: msg.from.to_string(),
             to: msg.to.to_string(),
+            room: msg.room.as_ref().map(ToString::to_string),
             created_at: rfc3339_ms(msg.created_ms),
         })
     }
@@ -338,7 +356,7 @@ impl Bus {
     /// [`MAX_WAITERS_PER_AGENT`] pulls are already parked for this name.
     pub async fn check_inbox(&self, name: &AgentName, wait_ms: u32) -> Result<InboxPage, MailErr> {
         let (taken, mut signal) = self.pull_now(name)?;
-        if wait_ms == 0 || !taken.messages.is_empty() {
+        if wait_ms == 0 || taken.delivers() {
             return Ok(taken.into_page());
         }
         // Park until mail arrives or the deadline passes. A wake can find
@@ -393,10 +411,11 @@ impl Bus {
     ) -> Result<Option<Taken>, MailErr> {
         match state.pull(agent, now_ms()) {
             None => Err(state.unregistered(name.as_str())),
-            Some(batch) => Ok(batch.map(|(messages, remaining)| Taken {
+            Some(batch) => Ok(batch.map(|batch| Taken {
                 agent: agent.name.clone(),
-                messages,
-                remaining,
+                messages: batch.messages,
+                remaining: batch.remaining,
+                skipped: batch.skipped,
             })),
         }
     }
@@ -471,6 +490,162 @@ impl Bus {
         let with = with.map(AgentName::folded);
         let (rows, next) = history_rows(state, &agent, with.as_deref(), before);
         Ok(history_page(&agent.name, &rows, next))
+    }
+
+    /// Create the room `room` with `agent` as its first member. A private
+    /// room is invite-only and left out of other agents' `list_rooms`; that
+    /// is etiquette between cooperating local agents, not a security
+    /// boundary, since any local process can claim any name.
+    ///
+    /// # Errors
+    ///
+    /// `unregistered`; `room_exists`; `rooms_full` at [`MAX_ROOMS`];
+    /// `invalid_description`; `shutting_down`.
+    pub async fn create_room(
+        &self,
+        agent: &AgentName,
+        room: &RoomName,
+        private: bool,
+        description: Option<String>,
+    ) -> Result<RoomInfo, MailErr> {
+        let description = description
+            .map(validate_description)
+            .transpose()?
+            .filter(|d| !d.is_empty());
+        let (state, agent) = self.active(agent)?;
+        state.create_room(&agent, room, private, description)
+    }
+
+    /// Join `room`: a public room takes anyone, a private one only an agent
+    /// that was invited. Joining a room you are in changes nothing. New
+    /// members start at the head of the room: `check_inbox` brings what is
+    /// sent from now on, and `history` with `room` shows what the room still
+    /// holds.
+    ///
+    /// # Errors
+    ///
+    /// `unregistered`; `room_not_found`; `private_room`; `shutting_down`.
+    pub async fn join_room(&self, agent: &AgentName, room: &RoomName) -> Result<RoomInfo, MailErr> {
+        let (state, agent) = self.active(agent)?;
+        state.join_room(&agent, room)
+    }
+
+    /// Let `invitee` join `room`, which only a member may do. The invitee
+    /// then joins with [`join_room`](Self::join_room); the invitation is the
+    /// only way into a private room.
+    ///
+    /// # Errors
+    ///
+    /// `unregistered` (for `agent` or `invitee`); `room_not_found`;
+    /// `not_a_member`; `shutting_down`.
+    pub async fn invite(
+        &self,
+        agent: &AgentName,
+        room: &RoomName,
+        invitee: &AgentName,
+    ) -> Result<RoomInfo, MailErr> {
+        let (state, agent) = self.active(agent)?;
+        let invitee = state.agent(invitee.as_str(), Key::fold(invitee.as_str()).as_str())?;
+        state.invite(&agent, room, &invitee)
+    }
+
+    /// Leave `room`; the room is deleted with its last member.
+    ///
+    /// # Errors
+    ///
+    /// `unregistered`; `room_not_found`; `not_a_member`; `shutting_down`.
+    pub async fn leave_room(
+        &self,
+        agent: &AgentName,
+        room: &RoomName,
+    ) -> Result<LeaveOutcome, MailErr> {
+        let (state, agent) = self.active(agent)?;
+        let deleted = state.leave_room(&agent, room)?;
+        Ok(LeaveOutcome {
+            room: room.to_string(),
+            deleted,
+        })
+    }
+
+    /// The rooms `agent` can see: every public room, and the private ones it
+    /// is in or was invited to, sorted by name.
+    pub async fn list_rooms(&self, agent: &AgentName) -> Result<RoomListing, MailErr> {
+        let (state, agent) = self.active(agent)?;
+        Ok(RoomListing {
+            rooms: state.list_rooms(&agent),
+        })
+    }
+
+    /// Send `body` to every other member of `room`, which `from` must be in.
+    /// Validates the body like [`send`](Self::send). A room keeps its last
+    /// messages ([`DEFAULT_ROOM_CAPACITY`]); a member that falls further
+    /// behind than that is told how many it missed (`skipped`).
+    ///
+    /// # Errors
+    ///
+    /// `invalid_body`; `unregistered`; `room_not_found`; `not_a_member`;
+    /// `shutting_down`.
+    pub async fn send_room(
+        &self,
+        from: &AgentName,
+        room: &RoomName,
+        body: String,
+    ) -> Result<SendReceipt, MailErr> {
+        if body.len() > MAX_BODY_BYTES || body.trim().is_empty() {
+            return Err(MailErr::InvalidBody);
+        }
+        let body_json_len = json_len(&body);
+        let (state, sender) = self.active(from)?;
+        let msg = state.send_room(
+            &sender,
+            room,
+            body.into_boxed_str(),
+            body_json_len,
+            now_ms(),
+        )?;
+        Ok(SendReceipt {
+            id: msg.id.to_string(),
+            from: msg.from.to_string(),
+            to: String::new(),
+            room: msg.room.as_ref().map(ToString::to_string),
+            created_at: rfc3339_ms(msg.created_ms),
+        })
+    }
+
+    /// One page of what `room` still holds, for a member: the newest
+    /// messages (older than `before`, a previous page's `next`), up to
+    /// [`MAX_BATCH`] within [`MAX_RETURN_BYTES`], oldest first. Reads
+    /// everything in the room, including what the agent has not taken with
+    /// `check_inbox`; changes nothing but `last_seen`.
+    ///
+    /// # Errors
+    ///
+    /// `unregistered`; `room_not_found`; `not_a_member`; `shutting_down`.
+    pub async fn room_history(
+        &self,
+        agent: &AgentName,
+        room: &RoomName,
+        before: Option<i64>,
+    ) -> Result<HistoryPage, MailErr> {
+        let (state, agent) = self.active(agent)?;
+        let (rows, next) = state.room_history(&agent, room, before)?;
+        Ok(history_page(&agent.name, &rows, next))
+    }
+
+    /// The open state and the agent `name`, refreshed as seen now:
+    /// `unregistered` when it is not on the roster.
+    fn active(&self, name: &AgentName) -> Result<(&State, Arc<Agent>), MailErr> {
+        let state = self.open()?;
+        let agent = state.agent(name.as_str(), Key::fold(name.as_str()).as_str())?;
+        {
+            let mut st = agent.inner.lock();
+            if st.removed {
+                drop(st);
+                return Err(state.unregistered(name.as_str()));
+            }
+            st.last_seen_ms = now_ms();
+        }
+        Ok((state, agent))
     }
 
     /// Delete mail read longer than [`Retention::read_ttl`] ago, and agents
@@ -619,13 +794,13 @@ struct RosterRow {
     queued: i64,
 }
 
-fn roster_row(agent: &Agent) -> RosterRow {
+fn roster_row(state: &State, agent: &Agent) -> RosterRow {
     let st = agent.inner.lock();
     RosterRow {
         name: agent.name.to_string(),
         provider: st.provider.clone(),
         description: st.description.clone(),
         last_seen_ms: st.last_seen_ms,
-        queued: st.unread.len() as i64,
+        queued: (st.unread.len() + state.room_unread(agent, &st.rooms)) as i64,
     }
 }

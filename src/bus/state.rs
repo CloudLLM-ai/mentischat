@@ -17,6 +17,9 @@
 //!   log of everything two agents exchanged, found by the pair's folded
 //!   names. History reads these, newest first. A room log (later) is the same
 //!   shape.
+//! - **Rooms** (a [`Sharded`] map of [`Room`], one `Mutex` each): see
+//!   `rooms.rs`. An agent keeps a list of the rooms it is in so a pull knows
+//!   where to look.
 //! - **Read queues** (inside each agent's lock): the mail an agent has read,
 //!   in the order it was read, with the read time and id of the front
 //!   published in atomics, so the oldest read mail anywhere (pruned at the
@@ -34,11 +37,11 @@
 //! 1. `holds`
 //! 2. a roster shard
 //! 3. an agent
-//! 4. a conversation-map shard
-//! 5. a conversation log
+//! 4. a room-map shard, or a conversation-map shard
+//! 5. a room, or a conversation log
 //!
 //! Two agents are never locked at once, nor two conversation logs, nor two
-//! shards of one map. A send locks its recipient, then the conversation, and
+//! rooms, nor two shards of one map. A send locks its recipient, then the conversation, and
 //! touches the sender (and prunes at the global cap, which locks whichever
 //! agent has read longest) only after releasing the recipient. A message's id
 //! is taken under its conversation's lock, so every log is sorted by id, and
@@ -54,8 +57,9 @@ use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
 
-use super::log::{Convo, Msg};
+use super::log::{Convo, Msg, Target};
 use super::park::Signal;
+use super::rooms::Room;
 use super::{MailErr, MAX_BATCH, MAX_PENDING_PER_AGENT, MAX_RETURN_BYTES, MAX_TOTAL_MESSAGES};
 use crate::errors::TakenReason;
 
@@ -136,6 +140,18 @@ impl<V: Clone> Sharded<V> {
             .entry(key.to_string())
             .or_insert_with(make)
             .clone()
+    }
+
+    /// Insert `value` unless `key` is taken; hands the value back if so.
+    pub(super) fn try_insert(&self, key: &str, value: V) -> Result<(), V> {
+        use std::collections::hash_map::Entry;
+        match self.shard(key).write().entry(key.to_string()) {
+            Entry::Occupied(_) => Err(value),
+            Entry::Vacant(slot) => {
+                slot.insert(value);
+                Ok(())
+            }
+        }
     }
 
     pub(super) fn insert(&self, key: String, value: V) {
@@ -232,6 +248,8 @@ pub(super) struct AgentState {
     pub read: VecDeque<Arc<Msg>>,
     /// Messages this agent has sent.
     pub sent: u64,
+    /// The rooms this agent is in (a hint: each room's member list decides).
+    pub rooms: Vec<Arc<Room>>,
     /// Set once the agent has left the roster. A send that looked the agent
     /// up before that sees it here and fails `unregistered`.
     pub removed: bool,
@@ -277,6 +295,7 @@ impl Agent {
                 unread: VecDeque::new(),
                 read: VecDeque::new(),
                 sent: 0,
+                rooms: Vec::new(),
                 removed: false,
             }),
         }
@@ -294,10 +313,10 @@ impl Agent {
     }
 }
 
-/// Roster entries sorted by folded name.
-pub(super) fn sorted(mut entries: Vec<(String, Arc<Agent>)>) -> Vec<Arc<Agent>> {
+/// The values of `entries` ordered by their (folded) keys.
+pub(super) fn sorted_by_key<T>(mut entries: Vec<(String, T)>) -> Vec<T> {
     entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    entries.into_iter().map(|(_, agent)| agent).collect()
+    entries.into_iter().map(|(_, value)| value).collect()
 }
 
 /// Longest folded name: [`crate::names::AgentName`] caps names at 63 bytes.
@@ -384,8 +403,15 @@ struct Outgoing<'a> {
     now_ms: u64,
 }
 
-/// Mail taken by a pull: the batch and how many unread messages remain.
-pub(super) type Batch = (Vec<Arc<Msg>>, usize);
+/// Mail taken by a pull.
+pub(super) struct Batch {
+    /// Direct and room messages together, oldest first.
+    pub messages: Vec<Arc<Msg>>,
+    /// Unread messages left, in direct mail and every room.
+    pub remaining: usize,
+    /// Room messages lost to rooms filling up since the last pull.
+    pub skipped: u64,
+}
 
 /// The whole mailbox. See the module docs for what each lock guards and the
 /// order to take them in.
@@ -397,6 +423,12 @@ pub(super) struct State {
     pub holds: Mutex<HashMap<String, Hold>>,
     /// Conversations by [`convo_key`].
     pub convos: Sharded<Arc<Convo>>,
+    /// Rooms by folded name.
+    pub rooms: Sharded<Arc<Room>>,
+    /// How many messages a room keeps.
+    pub room_capacity: usize,
+    /// The recipient of a room message, which has none.
+    pub no_agent: Arc<str>,
     /// Live messages, read and unread.
     pub total: Padded<AtomicUsize>,
     /// Live unread messages.
@@ -419,6 +451,9 @@ impl State {
             roster: Sharded::new(),
             holds: Mutex::default(),
             convos: Sharded::new(),
+            rooms: Sharded::new(),
+            room_capacity: super::DEFAULT_ROOM_CAPACITY,
+            no_agent: "".into(),
             total: Padded(AtomicUsize::new(0)),
             unread: Padded(AtomicUsize::new(0)),
             next_id: Padded(AtomicU64::new(1)),
@@ -430,7 +465,7 @@ impl State {
 
     /// Roster entries sorted by folded name.
     pub(super) fn agents_sorted(&self) -> Vec<Arc<Agent>> {
-        sorted(self.roster.entries())
+        sorted_by_key(self.roster.entries())
     }
 
     /// Roster names, sorted without regard to case.
@@ -647,8 +682,11 @@ impl State {
             let msg = Arc::new(Msg::new(
                 id,
                 sender.name.clone(),
-                recipient.name.clone(),
-                recipient.gen,
+                Target {
+                    to: recipient.name.clone(),
+                    to_gen: recipient.gen,
+                    room: None,
+                },
                 body,
                 body_json_len,
                 now_ms,
@@ -677,19 +715,112 @@ impl State {
             return None;
         }
         st.last_seen_ms = now_ms;
-        let take = fitting(st.unread.iter().map(|m| m.page_len()));
-        if take == 0 {
-            return Some(None);
+        if st.rooms.is_empty() {
+            let direct = self.take_direct(agent, &mut st, now_ms, MAX_BATCH as usize);
+            return Some(direct.map(|messages| Batch {
+                remaining: st.unread.len(),
+                messages,
+                skipped: 0,
+            }));
         }
+        let rooms = st.rooms.clone();
+        Some(self.take_merged(agent, &mut st, &rooms, now_ms))
+    }
+
+    /// Mark the first `n` (at most) of the agent's unread direct mail read at
+    /// `now_ms` and hand it out, oldest first, within the batch caps.
+    fn take_direct(
+        &self,
+        agent: &Agent,
+        st: &mut AgentState,
+        now_ms: u64,
+        n: usize,
+    ) -> Option<Vec<Arc<Msg>>> {
+        let take = fitting(st.unread.iter().map(|m| m.page_len())).min(n);
+        if take == 0 {
+            return None;
+        }
+        Some(self.read_first(agent, st, take, now_ms))
+    }
+
+    /// Move the first `take` unread messages to the read queue.
+    fn read_first(
+        &self,
+        agent: &Agent,
+        st: &mut AgentState,
+        take: usize,
+        now_ms: u64,
+    ) -> Vec<Arc<Msg>> {
         let batch: Vec<Arc<Msg>> = st.unread.drain(..take).collect();
-        let remaining = st.unread.len();
         for msg in &batch {
             msg.read_ms.store(now_ms, Relaxed);
         }
         st.read.extend(batch.iter().cloned());
-        agent.publish_oldest_read(&st);
+        agent.publish_oldest_read(st);
         self.unread.0.fetch_sub(take, Relaxed);
-        Some(Some((batch, remaining)))
+        batch
+    }
+
+    /// A pull for an agent that is in rooms: the oldest unread messages of
+    /// its direct mail and every room, merged by id, within the batch caps.
+    /// Direct mail is marked read; each room's cursor advances past what was
+    /// taken, and its skipped count is reported and reset.
+    fn take_merged(
+        &self,
+        agent: &Agent,
+        st: &mut AgentState,
+        rooms: &[Arc<Room>],
+        now_ms: u64,
+    ) -> Option<Batch> {
+        let waiting: Vec<_> = rooms
+            .iter()
+            .enumerate()
+            .filter_map(|(i, room)| room.waiting(agent).map(|w| (i, w)))
+            .collect();
+        if waiting.len() < rooms.len() {
+            let member_of: Vec<&Arc<Room>> = waiting.iter().map(|(i, _)| &rooms[*i]).collect();
+            st.rooms
+                .retain(|r| member_of.iter().any(|m| Arc::ptr_eq(m, r)));
+        }
+        let mut candidates: Vec<(Arc<Msg>, Option<usize>)> = st
+            .unread
+            .iter()
+            .take(MAX_BATCH as usize)
+            .map(|m| (m.clone(), None))
+            .chain(
+                waiting
+                    .iter()
+                    .flat_map(|(i, w)| w.messages.iter().map(move |m| (m.clone(), Some(*i)))),
+            )
+            .collect();
+        candidates.sort_unstable_by_key(|(m, _)| m.id);
+        let take = fitting(candidates.iter().map(|(m, _)| m.page_len()));
+        if take == 0 && waiting.iter().all(|(_, w)| w.skipped == 0) {
+            return None;
+        }
+        let chosen = &candidates[..take];
+        let direct = chosen.iter().filter(|(_, room)| room.is_none()).count();
+        self.read_first(agent, st, direct, now_ms);
+        let (mut remaining, mut skipped) = (st.unread.len(), 0);
+        for (i, w) in &waiting {
+            let ids: Vec<u64> = chosen
+                .iter()
+                .filter(|(_, room)| *room == Some(*i))
+                .map(|(m, _)| m.id)
+                .collect();
+            if ids.is_empty() && w.skipped == 0 {
+                remaining += w.unread;
+                continue;
+            }
+            let (unread, lost) = rooms[*i].commit(agent, &ids);
+            remaining += unread;
+            skipped += lost;
+        }
+        Some(Batch {
+            messages: chosen.iter().map(|(m, _)| m.clone()).collect(),
+            remaining,
+            skipped,
+        })
     }
 
     /// Delete read mail read before `cutoff_ms`. Returns how many.
@@ -722,11 +853,13 @@ impl State {
     pub(super) fn remove_agent(&self, key: &str, until_ms: u64) -> Option<(Arc<Agent>, i64)> {
         let mut holds = self.holds.lock();
         let agent = self.roster.remove(key)?;
+        let rooms;
         let queued = {
             let mut st = agent.inner.lock();
             st.removed = true;
             st.read.clear();
             agent.publish_oldest_read(&st);
+            rooms = std::mem::take(&mut st.rooms);
             self.sent_by_gone.fetch_add(st.sent, Relaxed);
             holds.insert(
                 key.to_string(),
@@ -738,6 +871,7 @@ impl State {
             std::mem::take(&mut st.unread).len()
         };
         drop(holds);
+        self.leave_all_rooms(&agent, rooms);
         self.unread.0.fetch_sub(queued, Relaxed);
         let discarded = self.discard_mail_to(key, agent.gen);
         self.total.0.fetch_sub(discarded, Relaxed);
@@ -808,6 +942,9 @@ impl State {
         holds.clear();
         for convo in self.convos.drain() {
             convo.log.lock().retired = true;
+        }
+        for room in self.rooms.drain() {
+            room.inner.lock().retired = true;
         }
         self.total.0.store(0, Relaxed);
         self.unread.0.store(0, Relaxed);

@@ -87,7 +87,7 @@ async fn notification_gets_202() {
 }
 
 #[tokio::test]
-async fn tools_list_shows_exactly_six_pattern_free_tools() {
+async fn tools_list_shows_the_mailbox_and_room_tools_pattern_free() {
     let (_d, app) = app();
     let (_, resp) = rpc(&app, "tools/list", json!({})).await;
     let tools = resp["result"]["tools"].as_array().unwrap();
@@ -100,7 +100,12 @@ async fn tools_list_shows_exactly_six_pattern_free_tools() {
             "send_message",
             "check_inbox",
             "history",
-            "list_agents"
+            "list_agents",
+            "create_room",
+            "join_room",
+            "invite",
+            "leave_room",
+            "list_rooms"
         ]
     );
     let raw = serde_json::to_string(tools).unwrap();
@@ -161,7 +166,7 @@ async fn register_tool_requires_a_name_and_takes_provider_description_and_reclai
     let props = history["inputSchema"]["properties"].as_object().unwrap();
     let mut names: Vec<&str> = props.keys().map(String::as_str).collect();
     names.sort_unstable();
-    assert_eq!(names, ["agent", "before", "with"]);
+    assert_eq!(names, ["agent", "before", "room", "with"]);
     assert_eq!(history["inputSchema"]["required"], json!(["agent"]));
 }
 
@@ -611,5 +616,208 @@ async fn a_non_string_name_is_invalid_body() {
         let err: Value =
             serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(err["error"], "invalid_body", "{tool} {args}");
+    }
+}
+
+/// Call a tool and return `(is_error, parsed JSON text)`.
+async fn call(app: &Router, tool: &str, args: Value) -> (bool, Value) {
+    let (_, resp) = rpc(
+        app,
+        "tools/call",
+        json!({ "name": tool, "arguments": args }),
+    )
+    .await;
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    (
+        resp["result"]["isError"].as_bool().unwrap_or(false),
+        serde_json::from_str(text).unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn room_tools_describe_themselves_with_primitive_schemas() {
+    let (_d, app) = app();
+    let (_, resp) = rpc(&app, "tools/list", json!({})).await;
+    let tools = resp["result"]["tools"].as_array().unwrap();
+    let tool = |name: &str| tools.iter().find(|t| t["name"] == name).unwrap();
+    let props = |name: &str| {
+        let mut keys: Vec<String> = tool(name)["inputSchema"]["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
+    };
+    assert_eq!(
+        props("create_room"),
+        ["agent", "description", "private", "room"]
+    );
+    assert_eq!(
+        tool("create_room")["inputSchema"]["required"],
+        json!(["agent", "room"])
+    );
+    assert_eq!(
+        tool("create_room")["inputSchema"]["properties"]["private"]["type"],
+        "boolean"
+    );
+    assert_eq!(props("join_room"), ["agent", "room"]);
+    assert_eq!(props("invite"), ["agent", "invitee", "room"]);
+    assert_eq!(props("leave_room"), ["agent", "room"]);
+    assert_eq!(props("list_rooms"), ["agent"]);
+    assert_eq!(props("send_message"), ["body", "from", "room", "to"]);
+    assert_eq!(
+        tool("send_message")["inputSchema"]["required"],
+        json!(["from", "body"])
+    );
+    for t in tools {
+        assert!(
+            !t["description"].as_str().unwrap().is_empty(),
+            "{}",
+            t["name"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn two_agents_talk_in_a_room_through_the_tools() {
+    let (_d, app) = app();
+    for agent in ["a", "b"] {
+        call(&app, "register", json!({ "agent": agent })).await;
+    }
+    let (err, room) = call(
+        &app,
+        "create_room",
+        json!({"agent": "a", "room": "Lobby", "description": "chat"}),
+    )
+    .await;
+    assert!(!err, "{room}");
+    assert_eq!(room["room"], "Lobby");
+    assert_eq!(room["private"], false);
+    assert_eq!(room["members"], json!(["a"]));
+    let (_, joined) = call(&app, "join_room", json!({"agent": "b", "room": "lobby"})).await;
+    assert_eq!(joined["members"], json!(["a", "b"]));
+
+    let (err, receipt) = call(
+        &app,
+        "send_message",
+        json!({"from": "a", "room": "lobby", "body": "Reply when you can: hi room"}),
+    )
+    .await;
+    assert!(!err, "{receipt}");
+    assert_eq!(receipt["room"], "Lobby");
+    assert!(receipt.get("to").is_none(), "{receipt}");
+
+    let (_, page) = call(&app, "check_inbox", json!({"agent": "b"})).await;
+    assert_eq!(page["messages"][0]["room"], "Lobby", "{page}");
+    assert_eq!(page["messages"][0]["from"], "a");
+    assert!(page["messages"][0].get("to").is_none());
+    assert_eq!(page["remaining"], 0);
+
+    let (_, history) = call(&app, "history", json!({"agent": "b", "room": "lobby"})).await;
+    assert_eq!(
+        history["messages"][0]["body"],
+        "Reply when you can: hi room"
+    );
+
+    let (_, listing) = call(&app, "list_rooms", json!({"agent": "b"})).await;
+    assert_eq!(listing["rooms"][0]["joined"], true);
+    assert_eq!(listing["rooms"][0]["members"], 2);
+
+    let (_, left) = call(&app, "leave_room", json!({"agent": "b", "room": "lobby"})).await;
+    assert_eq!(left, json!({"room": "lobby", "deleted": false}));
+}
+
+#[tokio::test]
+async fn room_tool_failures_are_contract_errors() {
+    let (_d, app) = app();
+    for agent in ["a", "b"] {
+        call(&app, "register", json!({ "agent": agent })).await;
+    }
+    call(
+        &app,
+        "create_room",
+        json!({"agent": "a", "room": "den", "private": true}),
+    )
+    .await;
+    let cases = [
+        (
+            "join_room",
+            json!({"agent": "b", "room": "den"}),
+            "private_room",
+        ),
+        (
+            "join_room",
+            json!({"agent": "b", "room": "nowhere"}),
+            "room_not_found",
+        ),
+        (
+            "join_room",
+            json!({"agent": "b", "room": "-bad"}),
+            "invalid_room",
+        ),
+        ("join_room", json!({"agent": "b"}), "invalid_room"),
+        (
+            "join_room",
+            json!({"agent": "b", "room": 7}),
+            "invalid_body",
+        ),
+        (
+            "create_room",
+            json!({"agent": "b", "room": "DEN"}),
+            "room_exists",
+        ),
+        (
+            "create_room",
+            json!({"agent": "b", "room": "x", "private": "maybe"}),
+            "invalid_body",
+        ),
+        (
+            "invite",
+            json!({"agent": "b", "room": "den", "invitee": "a"}),
+            "not_a_member",
+        ),
+        (
+            "invite",
+            json!({"agent": "a", "room": "den", "invitee": "ghost"}),
+            "unregistered",
+        ),
+        (
+            "leave_room",
+            json!({"agent": "b", "room": "den"}),
+            "not_a_member",
+        ),
+        (
+            "history",
+            json!({"agent": "b", "room": "den"}),
+            "not_a_member",
+        ),
+        (
+            "history",
+            json!({"agent": "a", "room": "den", "with": "b"}),
+            "invalid_body",
+        ),
+        (
+            "send_message",
+            json!({"from": "b", "room": "den", "body": "x"}),
+            "not_a_member",
+        ),
+        (
+            "send_message",
+            json!({"from": "a", "room": "den", "to": "b", "body": "x"}),
+            "invalid_body",
+        ),
+        (
+            "send_message",
+            json!({"from": "a", "body": "x"}),
+            "invalid_name",
+        ),
+        ("list_rooms", json!({"agent": "ghost"}), "unregistered"),
+    ];
+    for (tool, args, code) in cases {
+        let (is_error, body) = call(&app, tool, args.clone()).await;
+        assert!(is_error, "{tool} {args}");
+        assert_eq!(body["error"], code, "{tool} {args}: {body}");
     }
 }

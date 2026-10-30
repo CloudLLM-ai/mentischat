@@ -1,4 +1,6 @@
-//! The six mailbox tools exposed over MCP.
+//! The mailbox tools exposed over MCP: the six for direct mail (register,
+//! deregister, send_message, check_inbox, history, list_agents) and five for
+//! rooms (create_room, join_room, invite, leave_room, list_rooms).
 //!
 //! One [`ToolProtocol`] implementation dispatches by tool name; schemas stay
 //! primitive (no regex patterns) so local GGUF/OpenCode grammars keep
@@ -17,7 +19,7 @@ use serde_json::{json, Value};
 
 use crate::bus::{Bus, Registration};
 use crate::errors::MailboxError;
-use crate::names::{AgentName, Provider};
+use crate::names::{AgentName, Provider, RoomName};
 
 /// MCP tool surface over the shared [`Bus`].
 pub struct MailboxProtocol {
@@ -76,10 +78,19 @@ fn metadata_for(tool_name: &str) -> Option<ToolMetadata> {
         "send_message" => Some(
             ToolMetadata::new(
                 "send_message",
-                "Queue a message for a registered agent. Fails if from or to is not registered. Start the body with a reply marker: \"No reply needed\", \"Reply when you can\" or \"Waiting for your reply\". Nothing wakes the recipient: it reads the message when it next calls check_inbox. When you need the answer now, follow with check_inbox using wait_ms 30000.",
+                "Queue a message for a registered agent. Fails if from or to is not registered. Start the body with a reply marker: \"No reply needed\", \"Reply when you can\" or \"Waiting for your reply\". Nothing wakes the recipient: it reads the message when it next calls check_inbox. When you need the answer now, follow with check_inbox using wait_ms 30000. To message everyone in a room instead of one agent, pass room in place of to (exactly one of the two); you must be a member.",
             )
             .with_parameter(str_param("from", "Your registered name"))
-            .with_parameter(str_param("to", "Recipient's registered name (must be on the roster)"))
+            .with_parameter(
+                ToolParameter::new("to", ToolParameterType::String).with_description(
+                    "Recipient's registered name (must be on the roster); omit when sending to a room",
+                ),
+            )
+            .with_parameter(
+                ToolParameter::new("room", ToolParameterType::String).with_description(
+                    "A room you are in, to send to all its other members; omit when sending to one agent",
+                ),
+            )
             .with_parameter(str_param(
                 "body",
                 "Message text starting with a reply marker (max 64 KiB, non-empty)",
@@ -88,7 +99,7 @@ fn metadata_for(tool_name: &str) -> Option<ToolMetadata> {
         "check_inbox" => Some(
             ToolMetadata::new(
                 "check_inbox",
-                "Return the next batch of unread messages for this registered name and mark them read: check_inbox returns each message once (history shows it again). wait_ms 0 just checks. While waiting for a reply, use wait_ms 30000 and call again after an empty result, up to 10 times in a row. If remaining > 0, call again with wait_ms 0.",
+                "Return the next batch of unread messages for this registered name and mark them read: check_inbox returns each message once (history shows it again). Room messages arrive here too, mixed in oldest first with direct mail and marked with their room; skipped appears when a full room pushed messages out before you read them. wait_ms 0 just checks. While waiting for a reply, use wait_ms 30000 and call again after an empty result, up to 10 times in a row. If remaining > 0, call again with wait_ms 0.",
             )
             .with_parameter(str_param("agent", "Your registered name"))
             .with_parameter(
@@ -100,7 +111,7 @@ fn metadata_for(tool_name: &str) -> Option<ToolMetadata> {
         "history" => Some(
             ToolMetadata::new(
                 "history",
-                "Messages you sent (with readAt once read) and messages you have read, oldest first, up to 8 per page. Use it to look back at a conversation. Pass next from the reply as before to get older messages.",
+                "Messages you sent (with readAt once read) and messages you have read, oldest first, up to 8 per page. Use it to look back at a conversation. Pass next from the reply as before to get older messages. Pass room instead of with to read a room's retained messages (including ones you have not taken with check_inbox); you must be a member.",
             )
             .with_parameter(str_param("agent", "Your registered name"))
             .with_parameter(
@@ -108,10 +119,68 @@ fn metadata_for(tool_name: &str) -> Option<ToolMetadata> {
                     .with_description("Only messages exchanged with this agent; omit for all"),
             )
             .with_parameter(
+                ToolParameter::new("room", ToolParameterType::String).with_description(
+                    "A room you are in: its retained messages instead of your direct mail; omit for direct mail",
+                ),
+            )
+            .with_parameter(
                 ToolParameter::new("before", ToolParameterType::Integer).with_description(
                     "The next value from a previous history reply, for older messages; omit for the newest",
                 ),
             ),
+        ),
+        "create_room" => Some(
+            ToolMetadata::new(
+                "create_room",
+                "Create a room: a named conversation any number of agents can join, for work that involves more than two of you. You become its first member. Members read what is sent to the room with check_inbox (mixed in with direct mail, each message marked with its room) and send with send_message room. Fails room_exists when the name is taken. Set private: true for an invite-only room that list_rooms shows only to its members and invitees; that is etiquette between cooperating agents on this machine, not security.",
+            )
+            .with_parameter(str_param("agent", "Your registered name"))
+            .with_parameter(str_param(
+                "room",
+                "The room's name: 1-63 letters, digits, '.', '_' or '-', starting with a letter or digit; case does not matter",
+            ))
+            .with_parameter(
+                ToolParameter::new("private", ToolParameterType::Boolean)
+                    .with_description("true for an invite-only room that others cannot see in list_rooms")
+                    .with_default(json!(false)),
+            )
+            .with_parameter(
+                ToolParameter::new("description", ToolParameterType::String).with_description(
+                    "What the room is for (max 256 bytes); shown in list_rooms",
+                ),
+            ),
+        ),
+        "join_room" => Some(
+            ToolMetadata::new(
+                "join_room",
+                "Join a room so you receive what is sent to it from now on; earlier messages are in history with room. A private room needs an invitation from one of its members, otherwise it fails private_room. Call list_rooms to see what exists. Joining a room you are in changes nothing.",
+            )
+            .with_parameter(str_param("agent", "Your registered name"))
+            .with_parameter(str_param("room", "The room to join")),
+        ),
+        "invite" => Some(
+            ToolMetadata::new(
+                "invite",
+                "Invite a registered agent to a room you are in. A private room can only be joined by invitation; the invitee then calls join_room. Fails not_a_member if you are not in the room.",
+            )
+            .with_parameter(str_param("agent", "Your registered name"))
+            .with_parameter(str_param("room", "A room you are in"))
+            .with_parameter(str_param("invitee", "The registered name to invite")),
+        ),
+        "leave_room" => Some(
+            ToolMetadata::new(
+                "leave_room",
+                "Leave a room. You stop receiving its messages; a room with no members is deleted. Leaving the roster with deregister leaves every room too.",
+            )
+            .with_parameter(str_param("agent", "Your registered name"))
+            .with_parameter(str_param("room", "The room to leave")),
+        ),
+        "list_rooms" => Some(
+            ToolMetadata::new(
+                "list_rooms",
+                "Rooms you can see: every public room, and the private ones you are in or were invited to. Each has its description, how many members it has, whether you have joined, and how many of its messages you have not read yet.",
+            )
+            .with_parameter(str_param("agent", "Your registered name")),
         ),
         "list_agents" => Some(ToolMetadata::new(
             "list_agents",
@@ -121,13 +190,18 @@ fn metadata_for(tool_name: &str) -> Option<ToolMetadata> {
     }
 }
 
-const TOOL_NAMES: [&str; 6] = [
+const TOOL_NAMES: [&str; 11] = [
     "register",
     "deregister",
     "send_message",
     "check_inbox",
     "history",
     "list_agents",
+    "create_room",
+    "join_room",
+    "invite",
+    "leave_room",
+    "list_rooms",
 ];
 
 #[async_trait::async_trait]
@@ -145,6 +219,11 @@ impl ToolProtocol for MailboxProtocol {
             "check_inbox" => check_inbox(bus, &parameters).await,
             "history" => history(bus, &parameters).await,
             "list_agents" => bus.list_agents().await.map(to_wire),
+            "create_room" => create_room(bus, &parameters).await,
+            "join_room" => join_room(bus, &parameters).await,
+            "invite" => invite(bus, &parameters).await,
+            "leave_room" => leave_room(bus, &parameters).await,
+            "list_rooms" => list_rooms(bus, &parameters).await,
             other => return Err(unknown_tool(other)),
         };
         // Logged after the match, so only known tool names reach the log.
@@ -223,26 +302,107 @@ pub async fn register_agent(bus: &Bus, params: &Value) -> Result<Value, MailboxE
     Ok(to_wire(bus.register_with(&name, opts).await?))
 }
 
-/// One history page per the tool contract: `agent` is required, `with` and
-/// `before` optional.
+/// One history page per the tool contract: `agent` is required, `with`,
+/// `room` (instead of `with`) and `before` optional.
 pub async fn history(bus: &Bus, params: &Value) -> Result<Value, MailboxError> {
     let agent = required_name(params, "agent")?;
     let with = optional_name(params.get("with"))?;
+    let room = optional_room(params.get("room"))?;
     let before = parse_cursor(params.get("before"))?;
-    Ok(to_wire(bus.history(&agent, with.as_ref(), before).await?))
+    match room {
+        Some(_) if with.is_some() => Err(MailboxError::InvalidBody),
+        Some(room) => Ok(to_wire(bus.room_history(&agent, &room, before).await?)),
+        None => Ok(to_wire(bus.history(&agent, with.as_ref(), before).await?)),
+    }
 }
 
-/// Queue a message per the tool and `POST /messages` contract. `from` is
-/// validated before `to`, so when both are bad the error names `from`.
+/// Queue a message per the tool and `POST /messages` contract: to the agent
+/// `to`, or to the room `room`, exactly one of the two (both is
+/// `invalid_body`). `from` is validated before the target, so when both are
+/// bad the error names `from`.
 pub async fn send_message(bus: &Bus, params: &Value) -> Result<Value, MailboxError> {
     let from = required_name(params, "from")?;
+    let room = optional_room(params.get("room"))?;
+    let body = |params: &Value| {
+        params
+            .get("body")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or(MailboxError::InvalidBody)
+    };
+    if let Some(room) = room {
+        if optional_name(params.get("to"))?.is_some() {
+            return Err(MailboxError::InvalidBody);
+        }
+        return Ok(to_wire(bus.send_room(&from, &room, body(params)?).await?));
+    }
     let to = required_name(params, "to")?;
-    let body = params
-        .get("body")
-        .and_then(Value::as_str)
-        .ok_or(MailboxError::InvalidBody)?
-        .to_string();
-    Ok(to_wire(bus.send(&from, &to, body).await?))
+    Ok(to_wire(bus.send(&from, &to, body(params)?).await?))
+}
+
+/// Create a room per the tool and `POST /rooms` contract: `agent` and `room`
+/// are required; `private` (like `reclaim`, a boolean or `"true"`/`"false"`)
+/// and `description` are optional.
+pub async fn create_room(bus: &Bus, params: &Value) -> Result<Value, MailboxError> {
+    let agent = required_name(params, "agent")?;
+    let room = required_room(params)?;
+    let private = parse_reclaim(params.get("private"))?;
+    let description = parse_description(params.get("description"))?;
+    Ok(to_wire(
+        bus.create_room(&agent, &room, private, description).await?,
+    ))
+}
+
+/// Join a room per the tool and `POST /rooms/{room}/members` contract.
+pub async fn join_room(bus: &Bus, params: &Value) -> Result<Value, MailboxError> {
+    let agent = required_name(params, "agent")?;
+    let room = required_room(params)?;
+    Ok(to_wire(bus.join_room(&agent, &room).await?))
+}
+
+/// Invite an agent per the tool and `POST /rooms/{room}/invitations`
+/// contract. `agent` is validated before `room`, and `room` before
+/// `invitee`.
+pub async fn invite(bus: &Bus, params: &Value) -> Result<Value, MailboxError> {
+    let agent = required_name(params, "agent")?;
+    let room = required_room(params)?;
+    let invitee = required_name(params, "invitee")?;
+    Ok(to_wire(bus.invite(&agent, &room, &invitee).await?))
+}
+
+/// Leave a room per the tool and `DELETE /rooms/{room}/members/{agent}`
+/// contract.
+pub async fn leave_room(bus: &Bus, params: &Value) -> Result<Value, MailboxError> {
+    let agent = required_name(params, "agent")?;
+    let room = required_room(params)?;
+    Ok(to_wire(bus.leave_room(&agent, &room).await?))
+}
+
+/// List rooms per the tool and `GET /rooms?agent=` contract.
+pub async fn list_rooms(bus: &Bus, params: &Value) -> Result<Value, MailboxError> {
+    let agent = required_name(params, "agent")?;
+    Ok(to_wire(bus.list_rooms(&agent).await?))
+}
+
+/// The required `room` field: missing or empty is `invalid_room`, a
+/// non-string value is `invalid_body`.
+fn required_room(params: &Value) -> Result<RoomName, MailboxError> {
+    match params.get("room") {
+        None | Some(Value::Null) => RoomName::parse(""),
+        Some(Value::String(raw)) => RoomName::parse(raw),
+        Some(_) => Err(MailboxError::InvalidBody),
+    }
+}
+
+/// An optional `room` field: absent, null or `""` -> `None`; a string -> a
+/// validated room name; any other JSON type -> `invalid_body`.
+pub fn optional_room(v: Option<&Value>) -> Result<Option<RoomName>, MailboxError> {
+    match v {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if s.is_empty() => Ok(None),
+        Some(Value::String(s)) => RoomName::parse(s).map(Some),
+        Some(_) => Err(MailboxError::InvalidBody),
+    }
 }
 
 /// A bus result as its JSON wire shape.

@@ -1,0 +1,1 @@
+{"version":1,"next_id":4,"messages_sent":3,"agents":[{"name":"a","vider":null,"description":null,"registered_ms":1,"last_seen_ms":2}],"holds":[{"key":"gone","until_ms":9,"registered_ms":1}],"messages":[{"id":1,"from":"a","to":nulg,"registered_ms":0,"last_seen_ms":2}],"hold"to":"","body":"room","created_ms":1,"read_ms":0}]}]}

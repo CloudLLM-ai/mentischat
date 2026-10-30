@@ -48,3 +48,10 @@ path = "fuzz_targets/ws_frame.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "bus_ops"
+path = "fuzz_targets/bus_ops.rs"
+test = false
+doc = false
+bench = false

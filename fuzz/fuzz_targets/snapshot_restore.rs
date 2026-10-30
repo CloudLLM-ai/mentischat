@@ -170,7 +170,9 @@ fn canonical(v: Value) -> Value {
             items.sort_by_key(Value::to_string);
             Value::Array(items)
         }
-        Value::Object(map) => Value::Object(map.into_iter().map(|(k, v)| (k, canonical(v))).collect()),
+        Value::Object(map) => {
+            Value::Object(map.into_iter().map(|(k, v)| (k, canonical(v))).collect())
+        }
         other => other,
     }
 }
@@ -193,10 +195,14 @@ fn check_snapshot(snap: &Value) {
     let mut unread: BTreeMap<String, usize> = BTreeMap::new();
     for m in snap["messages"].as_array().unwrap() {
         if m["read_ms"] == 0 {
-            *unread.entry(m["to"].as_str().unwrap().to_ascii_lowercase()).or_default() += 1;
+            *unread
+                .entry(m["to"].as_str().unwrap().to_ascii_lowercase())
+                .or_default() += 1;
         }
     }
-    assert!(unread.values().all(|n| *n <= MAX_PENDING_PER_AGENT as usize));
+    assert!(unread
+        .values()
+        .all(|n| *n <= MAX_PENDING_PER_AGENT as usize));
 
     let mut seen: HashSet<u64> = direct.iter().copied().collect();
     assert_eq!(seen.len(), direct.len(), "direct ids unique");
@@ -207,7 +213,10 @@ fn check_snapshot(snap: &Value) {
     for room in rooms {
         let log = ids(&room["messages"]);
         assert!(log.len() <= DEFAULT_ROOM_CAPACITY);
-        assert!(log.windows(2).all(|w| w[0] < w[1]), "room log sorted by id: {log:?}");
+        assert!(
+            log.windows(2).all(|w| w[0] < w[1]),
+            "room log sorted by id: {log:?}"
+        );
         for id in log {
             assert!(seen.insert(id), "id {id} is in two places");
             top = top.max(id);
@@ -215,7 +224,9 @@ fn check_snapshot(snap: &Value) {
         let members = room["members"].as_array().unwrap();
         assert!(!members.is_empty() && members.len() <= MAX_ROOM_MEMBERS);
         for m in members {
-            *per_agent.entry(m["name"].as_str().unwrap().to_ascii_lowercase()).or_default() += 1;
+            *per_agent
+                .entry(m["name"].as_str().unwrap().to_ascii_lowercase())
+                .or_default() += 1;
         }
         let invited = room["invited"].as_array().unwrap();
         assert!(invited.len() + members.len() <= MAX_ROOM_MEMBERS);
@@ -226,7 +237,10 @@ fn check_snapshot(snap: &Value) {
     }
     assert!(per_agent.values().all(|n| *n <= MAX_ROOMS_PER_AGENT));
     let next = snap["next_id"].as_u64().unwrap();
-    assert!(next > top || (next == 0 && seen.is_empty()), "next_id {next} <= top {top}");
+    assert!(
+        next > top || (next == 0 && seen.is_empty()),
+        "next_id {next} <= top {top}"
+    );
 }
 
 /// A fresh send, direct and to a room, is numbered above everything restored.
@@ -242,17 +256,26 @@ fn check_next_ids(bus: &Bus, snap: &Value) {
         )
         .max();
     runtime().block_on(async {
-        let (x, y) = (AgentName::parse("zx1").unwrap(), AgentName::parse("zy1").unwrap());
+        let (x, y) = (
+            AgentName::parse("zx1").unwrap(),
+            AgentName::parse("zy1").unwrap(),
+        );
         // A full roster or an existing name just skips the probe.
         if bus.register(&x).await.is_err() || bus.register(&y).await.is_err() {
             return;
         }
         let direct = bus.send(&x, &y, "probe".into()).await.expect("send");
         let id: u64 = direct.id.parse().expect("numeric id");
-        assert!(top.is_none_or(|t| id > t), "fresh id {id} <= restored {top:?}");
+        assert!(
+            top.is_none_or(|t| id > t),
+            "fresh id {id} <= restored {top:?}"
+        );
         let room = RoomName::parse("zroom1").unwrap();
         if bus.create_room(&x, &room, false, None).await.is_ok() {
-            let r = bus.send_room(&x, &room, "probe".into()).await.expect("send_room");
+            let r = bus
+                .send_room(&x, &room, "probe".into())
+                .await
+                .expect("send_room");
             assert!(r.id.parse::<u64>().unwrap() > id);
         }
     });
@@ -279,7 +302,11 @@ fuzz_target!(|data: &[u8]| {
     // Fixed point: what a restored bus writes restores to the same thing.
     let again = Bus::from_snapshot_bytes(&first).expect("our own snapshot restores");
     let second: Value = serde_json::from_slice(&again.snapshot_bytes()).unwrap();
-    assert_eq!(canonical(snap.clone()), canonical(second), "restore is a fixed point");
+    assert_eq!(
+        canonical(snap.clone()),
+        canonical(second),
+        "restore is a fixed point"
+    );
 
     check_next_ids(&bus, &snap);
 });

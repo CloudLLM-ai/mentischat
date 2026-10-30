@@ -1,0 +1,1 @@
+{"version":1,"next_id":4,"messages_sent":3,"agents":[{"name":"a","provider":"claude_code","description":"x","registered_ms":1,"last_seen_ms":2},{"name":"b","provider":null,"description":null,"registered_ms":1,"last_seen_ms":2}],"holds":[{"key":"gone","Until_ms":9,"registto":"a","body":"yo","created_ms":4,"read_ms":5}],"rooms":[{"name":"r","private":false,"dzescriptead_ms":0}]}]}

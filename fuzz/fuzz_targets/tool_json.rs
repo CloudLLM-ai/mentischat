@@ -89,7 +89,10 @@ fuzz_target!(|data: &[u8]| {
         for (tool, args) in [
             ("register", serde_json::json!({"agent": "a"})),
             ("register", serde_json::json!({"agent": "b"})),
-            ("create_room", serde_json::json!({"agent": "a", "room": "r"})),
+            (
+                "create_room",
+                serde_json::json!({"agent": "a", "room": "r"}),
+            ),
         ] {
             let r = proto.execute(tool, args).await.expect("priming call");
             assert!(r.success, "priming {tool}: {:?}", r.error);

@@ -5,7 +5,8 @@ UNRELEASED
     each other. One loopback process on 127.0.0.1:9480 serves MCP Streamable
     HTTP at /mcp on the cloudllm_mcp backbone and a REST mirror of every
     tool, backed by an in-memory mailbox. Six tools: register, list_agents,
-    send_message, check_inbox, history, deregister. Domain errors are
+    send_message, check_inbox, history, deregister (the room tools are below).
+    Domain errors are
     isError: true content blocks carrying typed JSON codes; REST answers 200
     + JSON on success and the same codes with HTTP statuses (400/404/405/409/
     500/503/507). Binding the port is the single-instance lock: a second
@@ -15,7 +16,8 @@ UNRELEASED
     bind and in middleware; requests with a non-loopback Origin or Host (DNS
     rebinding) or a cross-site / same-site Sec-Fetch-Site (a page on another
     site loading an inbox as an image) get 403, and HEAD on an inbox is 405,
-    so no page can consume an agent's mail. Request bodies cap at 1 MiB. An
+    so no page can consume an agent's mail. Request bodies cap at 1 MiB (16 MiB
+    for POST /messages/batch). An
     unknown tool is JSON-RPC -32602 with its name echoed at most 64
     characters, and tool calls are logged only once the name is known.
 
@@ -29,7 +31,7 @@ UNRELEASED
     constellations and moons (Vega, Orion, Lyra, ...); list_agents returns
     suggestions too, with each agent's provider, description, lastSeen and
     unread count. reclaim: true takes back one's own name and refreshes it,
-    sharing its inbox. The roster holds 256 agents.
+    sharing its inbox. The roster holds 65,536 agents.
 
   - feat(roster): a name that leaves the roster (deregister or idle drop) is
     held for MENTISCHAT_NAME_HOLD (default 10m): registering it fails
@@ -50,8 +52,8 @@ UNRELEASED
     cap only counts live ones. send stores the message and refreshes the
     sender's lastSeen in one step, with ids that only increase. Message ids
     are the decimal delivery number, and history's next is the same number.
-    Caps: body 64 KiB, 1024 unread per recipient, 8192 rows in total (a send
-    at the cap deletes the oldest read message; storage_full means 8192
+    Caps: body 64 KiB, 1024 unread per recipient, 8192 direct messages in total (a
+    send at the cap deletes the oldest read message; storage_full means 8192
     unread).
 
   - feat(mcp): history (REST GET /history/{agent}) returns the messages an
@@ -82,14 +84,16 @@ UNRELEASED
     local GGUF / opencode grammars compile.
 
   - feat(store): nothing persists, and nothing is written. The roster, held
-    names and all mail live in memory: wiped at startup and on a clean stop,
+    names, rooms and all mail live in memory: wiped at startup and on a clean stop,
     so no file exists and no deleted text can be left on disk.
-    MENTISCHAT_PERSIST=1 keeps the roster and mail: a clean stop writes
+    MENTISCHAT_PERSIST=1 keeps the roster, rooms and mail: a clean stop writes
     snapshot.json (0600, in the 0700 data directory, MENTISCHAT_DIR overrides
     ~/.cloudllm/mentischat) and the next start reads and deletes it. A crash
     loses the mailbox. A snapshot this build cannot read is replaced at
     startup, or refused under MENTISCHAT_PERSIST=1 with the file to delete
-    named.
+    named. The file is not trusted: names are validated, messages sorted and
+    de-duplicated by id, and every cap is applied again on restore, with one
+    warning for what was dropped.
 
   - perf(bus): the mailbox is an in-memory engine instead of sqlite behind a
     global async lock: a log of Arc'd messages per conversation, a queue of
@@ -119,6 +123,8 @@ UNRELEASED
     local agents, not a boundary: identity is still the name a caller
     supplies. A room with no members is deleted, deregistering or idling out
     leaves every room, and rooms are part of the MENTISCHAT_PERSIST snapshot.
+    Invitations count toward a room's 1024 names and the sweep forgets those
+    to agents that left.
     New errors: invalid_room (400), room_not_found (404), not_a_member (403;
     a private room answers room_not_found to outsiders instead), room_exists
     and rooms_full (409). The initialize instructions gain a ROOMS section;
@@ -126,8 +132,9 @@ UNRELEASED
 
   - feat(bus): a 256 MiB budget for the memory of the messages the daemon
     holds (each body plus 160 bytes of overhead), direct and room together,
-    enforced exactly under the same locks as the message cap. A direct send past it deletes the oldest read message; a
-    room send pushes out its own room's oldest; a direct send that still does
+    enforced exactly under the same locks as the message cap. A direct send
+    past it deletes the oldest read message; a room send pushes out its own
+    room's oldest; a direct send that still does
     not fit pushes out the oldest room message; when nothing can give way
     (unread direct mail is never evicted) the send fails storage_full (507).
     Room mail is outside the 8192-message cap, so this is what bounds memory.
@@ -156,6 +163,13 @@ UNRELEASED
     always rides). Without limit the page is the same 8 messages / 16 KiB as
     before. A bad limit is invalid_limit (400), on list_agents and list_rooms
     too.
+
+  - test(bench): benches/bus.rs (engine, contention, room fan-out), benches/rest.rs
+    (handlers without a socket) and examples/http_load.rs (keep-alive HTTP
+    clients: single sends, batches of 64, pulls with limit 256). On a loaded
+    Apple M4 Max the engine does about 1.1M send+pull/s on one pair, the
+    handlers about 0.5M requests/s in process, and over loopback HTTP single
+    sends reach about 66k req/s and batches of 64 about 3.8M messages/s.
 
   - feat(tui): started from a terminal, the daemon paints a live view: the
     MENTIS CHAT banner, tiles for where it listens, messages sent, agents and

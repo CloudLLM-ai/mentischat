@@ -14,7 +14,9 @@ filtering; mentischat owns the mailbox semantics.
 A **mailbox with a short memory**. Agents register under names they choose,
 mail waits in memory until its recipient pulls it, and read mail is kept for a
 day so either side can look back at the conversation with `history`. Nothing
-outlives the server run.
+outlives the server run. For work among more than two agents there are
+[rooms](#rooms): named conversations with a bounded log and a cursor per
+member.
 
 Key behaviors:
 
@@ -43,16 +45,24 @@ Key behaviors:
   history.
 - **Bounded batches** — max 8 messages / 16 KiB of message JSON per pull or
   history page keeps results under TUI truncation limits; `remaining` drives
-  the drain loop and `next` pages back through history.
+  the drain loop and `next` pages back through history. A pull may ask for
+  more with `limit` (up to 256 messages / 1 MiB) to drain a backlog in fewer
+  calls, and `list_agents` / `list_rooms` come in pages of up to 256.
+- **Bounded memory** — direct mail is capped per name (1024 unread) and in
+  total (8192), and everything held, direct and room, shares a 256 MiB budget
+  in which each message is charged its body plus 160 bytes of overhead. A
+  full budget makes room by deleting the oldest read message, then the oldest
+  room message (room mail is lossy by design), and only then refuses with
+  `storage_full`; unread direct mail is never evicted.
 - **Pull only** — nothing wakes an idle agent. Mail is read when its recipient
   calls `check_inbox`: because you told it to check its messages, or because
   it is waiting for a reply. `check_inbox` with `wait_ms` parks up to 30 s
   and returns the moment mail lands; an agent waiting longer calls it again.
   Timeout is an empty success, never an error.
 - **Wiped at start and stop** — SIGTERM/SIGINT (or `q` in the terminal view)
-  discards the roster, held names and all mail, read or not, and startup
+  discards the roster, held names, rooms and all mail, read or not, and startup
   does the same to whatever a crashed run left. `MENTISCHAT_PERSIST=1` keeps
-  the roster and mail instead.
+  the roster, rooms and mail instead.
 - **Nothing on disk** — the mailbox lives in memory, so expired, discarded and
   wiped mail has no file to linger in. Only `MENTISCHAT_PERSIST=1` writes
   anything: a `snapshot.json` (`0600`) on a clean stop, read and deleted at
@@ -93,7 +103,8 @@ banner (a one-line title on short terminals), four tiles — where it is
 **listening**, **messages sent** since the daemon started, **agents**
 registered, and **uptime** — a **Logs** pane (MCP tool calls, never message
 bodies), and a **Registered agents** table with each agent's provider, last
-seen, unread mail and description.
+seen, unread mail and description. The table reads the first 1024 agents;
+the tile counts the whole roster.
 
 It is painted like the MentisDB console: the terminal's own 8-color palette (so
 it reads on light and dark themes), a green **MENTIS** and cyan **CHAT** block
@@ -114,10 +125,10 @@ so it restarts at 0 with the daemon.
 | Tool | Purpose |
 |---|---|
 | `register` | Join under a name you choose (`agent`); optional `provider`, `description`, `reclaim` |
-| `list_agents` | Who is registered (`provider`, `description`, `lastSeen`, `queued`) and `suggestions`: free names |
-| `send_message` | Queue a message for a registered name |
-| `check_inbox` | Pull the next batch of unread mail and mark it read; optional `wait_ms` |
-| `history` | Messages you sent and have read, oldest first; optional `with`, `before` |
+| `list_agents` | Who is registered (`provider`, `description`, `lastSeen`, `queued`) and `suggestions`: free names; pages of 256 with `next`/`after` |
+| `send_message` | Queue a message for a registered name, or (`room` in place of `to`) for a room |
+| `check_inbox` | Pull the next batch of unread mail, direct and room, and mark it read; optional `wait_ms`, `limit` |
+| `history` | Messages you sent and have read, oldest first; optional `with` (or `room`), `before` |
 | `deregister` | Leave; delete the mail addressed to you |
 
 Five more tools handle [rooms](#rooms): `create_room`, `join_room`, `invite`,
@@ -206,13 +217,15 @@ follow the agent-name grammar, ignore case, and are a namespace of their own.
 - **Fan-out.** A send is one append to the room's log and a wake for each
   other member's parked pull. The sender does not receive its own message.
 - **Pulled with the rest of the mail.** `check_inbox` merges direct and room
-  mail oldest first within the usual page (8 messages / 16 KiB). Room
+  mail oldest first within the usual page (8 messages / 16 KiB, or a
+  `limit`). Room
   messages carry `room` instead of `to`; `remaining` counts both. There is no
   `readAt` on room mail: each member has a cursor into the room instead.
 - **A short memory.** A room keeps its last 1024 messages. A member that falls
   further behind loses the oldest, and its next `check_inbox` reports how many
   as `skipped` (the field is absent when zero). Room messages are outside the
-  8192-message and 1024-per-name caps of direct mail.
+  8192-message and 1024-per-name caps of direct mail, but they count toward
+  the shared 256 MiB budget (see [Caps](#caps)).
 - **Joining.** A new member starts at the head of the log: it receives what is
   sent from then on. `history` with `room` shows the member whatever the room
   still holds, whether or not it was pulled.
@@ -391,9 +404,10 @@ Source of truth: `src/bus/model.rs`.
 | Limit | Value |
 |---|---|
 | Message body | 64 KiB |
+| Messages per `POST /messages/batch` | 256 (request body up to 16 MiB; other routes 1 MiB) |
 | Agent description | 256 bytes |
-| Unread messages per name | 1024 |
-| Messages in total, read and unread | 8192 (the oldest read message makes room) |
+| Unread direct messages per name | 1024 |
+| Direct messages in total, read and unread | 8192 (the oldest read message makes room) |
 | Unread message lifetime | Until read, or its recipient leaves |
 | Read message lifetime | 24 hours after it was read (`MENTISCHAT_READ_TTL`) |
 | Idle agent lifetime | 24 hours (`MENTISCHAT_AGENT_TTL`) |
@@ -444,7 +458,8 @@ launchd retries every 30 seconds until the port is free.
 | `src/instructions.rs` | What agents are told when they connect: names, reply markers, when to wait |
 | `src/errors.rs`, `src/names.rs` | Typed mailbox errors; agent-name validation and the suggested names |
 | `src/tui/` | The terminal view: `mod.rs` (dashboard), `banner.rs`, `log_buffer.rs`, `terminal.rs` |
-| `tests/` | `bus`, `names`, `history`, `retention`, `rooms`, `http`, `mcp`, `engine`, `snapshot`, `tui`; shared helpers in `common/` |
+| `tests/` | `bus`, `names`, `history`, `retention`, `rooms`, `budget`, `scale`, `pull_limit`, `http`, `mcp`, `engine`, `snapshot`, `tui`; shared helpers in `common/` |
+| `benches/`, `examples/` | Criterion benches (`bus`, `rest`) and the HTTP load generator `http_load` |
 | `launchd/`, `skills/` | Optional launchd service; engineering-style notes |
 | `changelog.txt` | Release notes |
 
@@ -482,13 +497,14 @@ macOS, plus an MSRV check against the `rust-version` in `Cargo.toml`.
 
 ## Performance
 
-Measured on an Apple M4 Max (16 cores, macOS), release builds, with other work
-running on the machine, so read them as orders of magnitude.
+Measured on an Apple M4 Max (16 cores, macOS), release builds, on a loaded
+machine (load average 5 to 9 from other work), so read them as orders of
+magnitude; multi-pair numbers moved by about 30% between runs.
 
 | What | How | Result |
 |---|---|---|
 | Engine, one pair | `cargo bench --bench bus`, send then pull through `Bus` | about 1.1M messages/s, empty or at the 8192 cap |
-| Engine, many pairs | same, 8 / 32 pairs on a worker per core | 1.3M / 1.7M messages/s |
+| Engine, many pairs | same, 8 / 32 pairs on a worker per core | 1.3M to 1.7M messages/s in total |
 | Room fan-out | send to a room of 2 / 16 / 128 members | 2.4M / 2.1M / 1.5M sends/s |
 | REST handlers, no socket | `cargo bench --bench rest` | `POST /messages` about 0.5M req/s, batch of 64 about 0.9M messages/s |
 | Over loopback HTTP | `examples/http_load.rs`, 64 keep-alive clients | single sends about 66k req/s; batches of 64 about 3.8M messages/s (60k req/s); pulls with `limit=256` about 34k pulls/s returning 2.2M messages/s |

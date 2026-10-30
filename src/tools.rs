@@ -158,7 +158,7 @@ fn metadata_for(tool_name: &str) -> Option<ToolMetadata> {
         "join_room" => Some(
             ToolMetadata::new(
                 "join_room",
-                "Join a room so you receive what is sent to it from now on; earlier messages are in history with room. A private room needs an invitation from one of its members, otherwise it fails private_room. Call list_rooms to see what exists. Joining a room you are in changes nothing.",
+                "Join a room so you receive what is sent to it from now on; earlier messages are in history with room. A private room needs an invitation from one of its members; without one it answers room_not_found, as if it did not exist. Call list_rooms to see what exists. Joining a room you are in changes nothing.",
             )
             .with_parameter(str_param("agent", "Your registered name"))
             .with_parameter(str_param("room", "The room to join")),

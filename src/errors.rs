@@ -70,7 +70,8 @@ pub enum MailboxError {
     RoomExists { room: String },
     /// The agent is not a member of the room it tried to use.
     NotAMember { agent: String, room: String },
-    /// The room is private and the agent was not invited.
+    /// Reserved: a private room answers [`MailboxError::RoomNotFound`] to an
+    /// agent that is neither in it nor invited, so this is never raised.
     PrivateRoom { room: String },
     /// The daemon already holds [`crate::bus::MAX_ROOMS`] rooms.
     RoomsFull { rooms: i64 },

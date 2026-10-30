@@ -567,7 +567,8 @@ impl Bus {
     ///
     /// # Errors
     ///
-    /// `unregistered`; `room_not_found`; `private_room`; `shutting_down`.
+    /// `unregistered`; `room_not_found` (also for a private room the agent was
+    /// not invited to); `shutting_down`.
     pub async fn join_room(&self, agent: &AgentName, room: &RoomName) -> Result<RoomInfo, MailErr> {
         let (state, agent) = self.active(agent)?;
         state.join_room(&agent, room)

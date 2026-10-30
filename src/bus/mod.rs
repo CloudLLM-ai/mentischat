@@ -40,6 +40,7 @@ mod log;
 mod model;
 mod park;
 mod rooms;
+mod sharded;
 mod snapshot;
 mod state;
 mod stream;

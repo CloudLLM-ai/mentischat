@@ -181,7 +181,8 @@ async fn a_snapshot_with_huge_or_repeated_ids_loads_without_overflow() {
 async fn a_snapshot_is_held_to_the_caps_of_a_running_daemon() {
     use mentischat::bus::{MAX_PENDING_PER_AGENT, MAX_ROOM_MEMBERS};
     let too_many = MAX_PENDING_PER_AGENT as u64 + 100;
-    let room_msgs: Vec<_> = (1..=1100u64)
+    // Ids are unique across direct mail and rooms, as one counter issues them.
+    let room_msgs: Vec<_> = (too_many + 1..=too_many + 1100)
         .rev()
         .map(|id| {
             serde_json::json!({"id": id, "from": "a", "to": "", "body": format!("r{id}"),
@@ -217,7 +218,8 @@ async fn a_snapshot_is_held_to_the_caps_of_a_running_daemon() {
     let page = bus.room_history(&name("m0"), &room, None).await.unwrap();
     let newest = &page.messages.last().unwrap().body;
     assert_eq!(
-        newest, "r1100",
+        newest,
+        &format!("r{}", too_many + 1100),
         "the log is sorted and keeps the newest 1024"
     );
     let mut count = page.messages.len();

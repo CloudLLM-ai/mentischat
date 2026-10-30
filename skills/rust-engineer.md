@@ -7,7 +7,8 @@ description: >
   fixing bugs, adding APIs or MCP tools, or reviewing Rust changes in this
   repository. For micro-optimization and hot-path audits, also load
   rust-performance-reviewer; for shared state and locks,
-  rust-concurrency-patterns; for benches, rust-criterion-benchmarking.
+  rust-concurrency-patterns; for benches, rust-criterion-benchmarking;
+  for parsers and untrusted input, rust-fuzzing.
   Triggers: rust code, bug fix, implement, refactor, clippy, add test,
   public API, review rust, MCP tool, enum design.
 triggers:
@@ -36,8 +37,9 @@ It merges the MentisDB `rust-engineer` house style with the DiarioBitcoin
 | [`rust-performance-reviewer.md`](rust-performance-reviewer.md) | Hot-path audits, allocation/cache footprint review, flat profiles |
 | [`rust-concurrency-patterns.md`](rust-concurrency-patterns.md) | The store, the bus, blocking pulls, retention: lock order, guards vs `.await`, `Notify` wakeups, cursors |
 | [`rust-criterion-benchmarking.md`](rust-criterion-benchmarking.md) | Writing or reading `cargo bench` runs under `benches/`, baselines, throughput vs latency |
+| [`rust-fuzzing.md`](rust-fuzzing.md) | Names, request bodies, WS frames, snapshot restore, Bus op sequences: cargo-fuzz targets, invariants, findings into `tests/` |
 
-Do not re-derive performance, concurrency, or bench conventions from memory —
+Do not re-derive performance, concurrency, bench, or fuzzing conventions from memory —
 open the companion skill and follow it.
 
 ## Non-negotiables
@@ -208,6 +210,21 @@ Summary only — open `rust-criterion-benchmarking.md` for setup and gotchas.
 5. End-to-end HTTP load is a harness-free bench or a script against a
    running daemon, not a Criterion micro-bench.
 
+## Fuzzing quick rules (full skill: companion)
+
+Summary only — open `rust-fuzzing.md` for layout, harness rules and CI.
+
+1. Every trust boundary has a target under `fuzz/fuzz_targets/`: name
+   validation, request and frame decoding, snapshot restore, and the Bus as
+   a sequence of operations checked against a reference model.
+2. Each target asserts an invariant (round-trip, bounds, model agreement,
+   typed rejection), not just "no panic".
+3. Every crash is minimized into a named stable regression test under
+   `tests/`, and the input goes into `fuzz/corpus/<target>/`.
+4. `fuzz/` is its own nightly-only package with its own `[workspace]`;
+   `make ci`, clippy and the MSRV job never build it. `make fuzz-build`
+   and `make fuzz-replay` run in a separate CI job.
+
 ## Dependency direction
 
 - mentischat is a downstream consumer of `cloudllm_mcp`: pin it exactly
@@ -253,6 +270,7 @@ pub struct Example {
 | 6 | Add or update tests under `tests/` for the behavior change |
 | 7 | Run `make clippy` and relevant `cargo test` filters |
 | 8 | If hot-path performance changed, consult `rust-performance-reviewer` and add or update a bench under `benches/` |
+| 8b | If the change parses external input or adds an operation callers can drive, add or extend a fuzz target (`rust-fuzzing`) |
 | 9 | Update rustdoc if the public contract changed |
 | 10 | Update `changelog.txt` under the **top** section; re-sort by impact |
 | 11 | Granular commits: one logical change per commit, per file when practical |
@@ -390,6 +408,8 @@ override generic best practices when they conflict.
 - Drive-by refactors unrelated to the task
 - `#[allow(dead_code)]` / `#[allow(clippy::…)]` without a written reason
 - Claiming a performance win without a bench or load number
+- A new parser or decoder of untrusted input with no fuzz target, or a
+  fuzz finding fixed without a regression test in `tests/`
 - Shipping a fix/feature/test without a `changelog.txt` entry under the top
   section, appended in random order instead of sorted by impact
 - Writing changelog lines that only restate the commit subject
@@ -411,3 +431,5 @@ override generic best practices when they conflict.
   for the in-memory store (lock order, `parking_lot` guards, `Notify`
   wakeups, cursors); lessons 13–22 from the DiarioBitcoin and MentisDB
   post-mortems.
+- **2026-10-30** — Fuzzing: companion `rust-fuzzing`, quick rules,
+  checklist step 8b and an anti-pattern.

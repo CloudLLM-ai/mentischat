@@ -7,10 +7,21 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use mentischat::bus::{Bus, Registration, Retention, Stats};
-use mentischat::names::AgentName;
+use mentischat::names::{AgentName, RoomName};
 
 pub fn name(s: &str) -> AgentName {
     AgentName::parse(s).expect("valid test name")
+}
+
+pub fn room(s: &str) -> RoomName {
+    RoomName::parse(s).expect("valid test room")
+}
+
+/// Register every name in `names` on `bus`.
+pub async fn register(bus: &Bus, names: &[&str]) {
+    for n in names {
+        bus.register(&name(n)).await.unwrap();
+    }
 }
 
 /// A bus with the default retention in a fresh temp directory.

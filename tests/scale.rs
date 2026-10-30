@@ -4,16 +4,11 @@
 
 mod common;
 
-use common::{fresh_bus, name};
+use common::{fresh_bus, name, room};
 use mentischat::bus::{
     Bus, MAX_PAGE, MAX_ROOMS, MAX_ROOMS_PER_AGENT, MAX_ROOM_MEMBERS, MAX_ROSTER,
 };
 use mentischat::errors::MailboxError;
-use mentischat::names::RoomName;
-
-fn room(s: &str) -> RoomName {
-    RoomName::parse(s).unwrap()
-}
 
 async fn register_many(bus: &Bus, n: usize) {
     for i in 0..n {

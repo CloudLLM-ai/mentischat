@@ -9,13 +9,13 @@ use mentischat::bus::{Bus, MAX_RETAINED_BYTES, MESSAGE_OVERHEAD_BYTES};
 use mentischat::errors::MailboxError;
 use mentischat::names::RoomName;
 
-fn bus(budget: usize) -> Bus {
+/// A bus with `budget` bytes; the returned dir must outlive it.
+fn bus(budget: usize) -> (tempfile::TempDir, Bus) {
     let dir = tempfile::tempdir().unwrap();
     let bus = Bus::new(&dir.path().join("budget"))
         .unwrap()
         .with_byte_budget(budget);
-    std::mem::forget(dir);
-    bus
+    (dir, bus)
 }
 
 /// What a message with a body of `n` bytes is charged.
@@ -34,7 +34,7 @@ fn the_default_budget_is_256_mib() {
 
 #[tokio::test]
 async fn unread_direct_mail_is_never_evicted_so_a_full_budget_fails_storage_full() {
-    let bus = bus(3 * cost(300) + cost(100));
+    let (_dir, bus) = bus(3 * cost(300) + cost(100));
     bus.register(&name("a")).await.unwrap();
     bus.register(&name("b")).await.unwrap();
     for _ in 0..3 {
@@ -56,7 +56,7 @@ async fn unread_direct_mail_is_never_evicted_so_a_full_budget_fails_storage_full
 
 #[tokio::test]
 async fn a_full_budget_makes_room_by_deleting_the_oldest_read_mail() {
-    let bus = bus(3 * cost(300));
+    let (_dir, bus) = bus(3 * cost(300));
     bus.register(&name("a")).await.unwrap();
     bus.register(&name("b")).await.unwrap();
     for i in 0..3 {
@@ -81,7 +81,7 @@ async fn a_full_budget_makes_room_by_deleting_the_oldest_read_mail() {
 
 #[tokio::test]
 async fn leaving_and_clearing_give_the_bytes_back() {
-    let bus = bus(cost(600) + 100);
+    let (_dir, bus) = bus(cost(600) + 100);
     bus.register(&name("a")).await.unwrap();
     bus.register(&name("b")).await.unwrap();
     bus.send(&name("a"), &name("b"), body(600)).await.unwrap();
@@ -101,7 +101,7 @@ async fn leaving_and_clearing_give_the_bytes_back() {
 
 #[tokio::test]
 async fn every_message_is_charged_its_overhead_so_tiny_messages_are_bounded() {
-    let bus = bus(10 * cost(1));
+    let (_dir, bus) = bus(10 * cost(1));
     bus.register(&name("a")).await.unwrap();
     bus.register(&name("b")).await.unwrap();
     for _ in 0..10 {
@@ -113,7 +113,7 @@ async fn every_message_is_charged_its_overhead_so_tiny_messages_are_bounded() {
         "{err:?}"
     );
 
-    let rooms = self::bus(10 * cost(1));
+    let (_rooms_dir, rooms) = self::bus(10 * cost(1));
     rooms.register(&name("a")).await.unwrap();
     let room = RoomName::parse("tiny").unwrap();
     rooms
@@ -132,7 +132,7 @@ async fn every_message_is_charged_its_overhead_so_tiny_messages_are_bounded() {
 
 #[tokio::test]
 async fn room_mail_shares_the_budget_and_a_room_pushes_out_its_own_oldest() {
-    let bus = bus(3 * cost(300) + 100);
+    let (_dir, bus) = bus(3 * cost(300) + 100);
     bus.register(&name("a")).await.unwrap();
     bus.register(&name("b")).await.unwrap();
     let room = RoomName::parse("lobby").unwrap();
@@ -172,7 +172,7 @@ async fn room_mail_shares_the_budget_and_a_room_pushes_out_its_own_oldest() {
 
 #[tokio::test]
 async fn a_direct_send_pushes_out_the_oldest_room_message_before_failing() {
-    let bus = bus(3 * cost(300) + 100);
+    let (_dir, bus) = bus(3 * cost(300) + 100);
     bus.register(&name("a")).await.unwrap();
     bus.register(&name("b")).await.unwrap();
     let room = RoomName::parse("lobby").unwrap();
@@ -200,7 +200,7 @@ async fn a_direct_send_pushes_out_the_oldest_room_message_before_failing() {
 
     // With nothing left to push out, a full budget of unread direct mail
     // still refuses.
-    let tight = self::bus(cost(300));
+    let (_tight_dir, tight) = self::bus(cost(300));
     tight.register(&name("a")).await.unwrap();
     tight.register(&name("b")).await.unwrap();
     tight.send(&name("a"), &name("b"), body(300)).await.unwrap();

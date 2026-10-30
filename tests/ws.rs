@@ -142,7 +142,9 @@ async fn an_ack_marks_it_read_and_it_is_not_delivered_again() {
     let sent = s.bus.history(&name("a"), None, None).await.unwrap();
     assert!(sent.messages[0].read_at.is_some(), "readAt is the ack time");
     ws.close(None).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The server drops the session (returning leases) before its close
+    // reply, so the stream ending is the signal that nothing more returns.
+    assert!(next(&mut ws).await.is_none(), "the stream ends");
     let page = s.bus.check_inbox(&name("b"), 0).await.unwrap();
     assert!(page.messages.is_empty(), "never redelivered");
 }
@@ -163,14 +165,15 @@ async fn unacknowledged_mail_comes_back_by_pull_and_by_a_new_stream() {
         got.extend(bodies(&frame).into_iter().map(String::from));
     }
     drop(ws); // no ack, no close handshake
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
+    // The new stream is pushed the mail as soon as the dead one's leases
+    // return; no wait for the server to notice the drop is needed.
     let mut again = connect(&s, "b").await;
     let frame = next(&mut again).await.unwrap();
     assert_eq!(bodies(&frame), ["m1", "m2", "m3"], "order preserved");
     drop(again);
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let page = s.bus.check_inbox(&name("b"), 0).await.unwrap();
+    // A pull parks until the leases return, so it needs no sleep either.
+    let page = s.bus.check_inbox(&name("b"), 3_000).await.unwrap();
     let pulled: Vec<&str> = page.messages.iter().map(|m| m.body.as_str()).collect();
     assert_eq!(pulled, ["m1", "m2", "m3"]);
 }
@@ -298,9 +301,12 @@ async fn room_mail_fans_out_over_streams_and_a_full_room_reports_skipped() {
         assert_eq!(frame["messages"][0]["room"], "lobby");
         assert!(frame["messages"][0].get("to").is_none());
     }
-    drop(b);
-    drop(c);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // A close handshake ends the stream (and returns its leases) before the
+    // server replies, so both are settled once these return.
+    for ws in [&mut b, &mut c] {
+        ws.close(None).await.unwrap();
+        assert!(next(ws).await.is_none(), "the stream ends");
+    }
     // Four messages into a room of two: a member that connects late lost two.
     for i in 0..4 {
         s.bus

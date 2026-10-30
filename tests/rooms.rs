@@ -7,20 +7,10 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{bus_with, fresh_bus, idle_after, later, name};
+use common::{bus_with, fresh_bus, idle_after, later, name, register, room};
 use mentischat::bus::{Bus, InboxPage};
 use mentischat::errors::MailboxError;
 use mentischat::names::RoomName;
-
-fn room(s: &str) -> RoomName {
-    RoomName::parse(s).expect("valid test room")
-}
-
-async fn register(bus: &Bus, names: &[&str]) {
-    for n in names {
-        bus.register(&name(n)).await.unwrap();
-    }
-}
 
 async fn say(bus: &Bus, from: &str, in_room: &str, body: &str) {
     bus.send_room(&name(from), &room(in_room), body.into())
@@ -36,15 +26,15 @@ fn bodies(page: &InboxPage) -> Vec<&str> {
     page.messages.iter().map(|m| m.body.as_str()).collect()
 }
 
-/// A room with capacity `n` and `members` already in it (the first creates it).
-async fn room_of(n: usize, members: &[&str]) -> Arc<Bus> {
+/// A room with capacity `n` and `members` already in it (the first creates
+/// it); the returned dir must outlive the bus.
+async fn room_of(n: usize, members: &[&str]) -> (tempfile::TempDir, Arc<Bus>) {
     let dir = tempfile::tempdir().unwrap();
     let bus = Arc::new(
         Bus::new(&dir.path().join("rooms"))
             .unwrap()
             .with_room_capacity(n),
     );
-    std::mem::forget(dir);
     register(&bus, members).await;
     bus.create_room(&name(members[0]), &room("lobby"), false, None)
         .await
@@ -52,7 +42,7 @@ async fn room_of(n: usize, members: &[&str]) -> Arc<Bus> {
     for m in &members[1..] {
         bus.join_room(&name(m), &room("lobby")).await.unwrap();
     }
-    bus
+    (dir, bus)
 }
 
 #[test]
@@ -150,7 +140,7 @@ async fn a_private_room_is_invite_only_and_unlisted() {
 
 #[tokio::test]
 async fn a_room_message_reaches_every_member_but_its_sender() {
-    let bus = room_of(1024, &["a", "b", "c"]).await;
+    let (_dir, bus) = room_of(1024, &["a", "b", "c"]).await;
     bus.register(&name("outsider")).await.unwrap();
     say(&bus, "a", "lobby", "hello all").await;
 
@@ -176,7 +166,7 @@ async fn a_room_message_reaches_every_member_but_its_sender() {
 
 #[tokio::test]
 async fn room_messages_carry_room_and_direct_mail_keeps_to() {
-    let bus = room_of(1024, &["a", "b"]).await;
+    let (_dir, bus) = room_of(1024, &["a", "b"]).await;
     say(&bus, "a", "lobby", "to the room").await;
     bus.send(&name("a"), &name("b"), "to b".into())
         .await
@@ -193,7 +183,7 @@ async fn room_messages_carry_room_and_direct_mail_keeps_to() {
 
 #[tokio::test]
 async fn check_inbox_merges_direct_and_room_mail_oldest_first_with_exact_remaining() {
-    let bus = room_of(1024, &["a", "b"]).await;
+    let (_dir, bus) = room_of(1024, &["a", "b"]).await;
     bus.register(&name("c")).await.unwrap();
     bus.create_room(&name("c"), &room("side"), false, None)
         .await
@@ -221,7 +211,7 @@ async fn check_inbox_merges_direct_and_room_mail_oldest_first_with_exact_remaini
 
 #[tokio::test]
 async fn new_members_start_at_the_head_and_history_shows_the_past() {
-    let bus = room_of(1024, &["a", "b"]).await;
+    let (_dir, bus) = room_of(1024, &["a", "b"]).await;
     say(&bus, "a", "lobby", "before late joined").await;
     pull(&bus, "b").await;
     bus.register(&name("late")).await.unwrap();
@@ -252,7 +242,7 @@ async fn new_members_start_at_the_head_and_history_shows_the_past() {
 
 #[tokio::test]
 async fn room_history_pages_back_by_cursor() {
-    let bus = room_of(1024, &["a", "b"]).await;
+    let (_dir, bus) = room_of(1024, &["a", "b"]).await;
     for i in 0..20 {
         say(&bus, "a", "lobby", &format!("m{i}")).await;
     }
@@ -275,7 +265,7 @@ async fn room_history_pages_back_by_cursor() {
 
 #[tokio::test]
 async fn a_full_room_pushes_out_the_oldest_and_tells_the_laggard_what_it_missed() {
-    let bus = room_of(3, &["a", "slow", "quick"]).await;
+    let (_dir, bus) = room_of(3, &["a", "slow", "quick"]).await;
     for i in 0..5 {
         say(&bus, "a", "lobby", &format!("m{i}")).await;
     }
@@ -296,7 +286,7 @@ async fn a_full_room_pushes_out_the_oldest_and_tells_the_laggard_what_it_missed(
 #[tokio::test]
 async fn a_pull_that_lost_everything_still_reports_it_and_does_not_park() {
     // Capacity 1: b's own message pushes out the one a sent before b read it.
-    let bus = room_of(1, &["a", "b"]).await;
+    let (_dir, bus) = room_of(1, &["a", "b"]).await;
     say(&bus, "a", "lobby", "x").await;
     say(&bus, "b", "lobby", "y").await;
     let started = std::time::Instant::now();
@@ -311,10 +301,13 @@ async fn a_pull_that_lost_everything_still_reports_it_and_does_not_park() {
 
 #[tokio::test]
 async fn a_parked_pull_wakes_on_a_room_message() {
-    let bus = room_of(1024, &["a", "b"]).await;
+    let (_dir, bus) = room_of(1024, &["a", "b"]).await;
     let puller = bus.clone();
     let parked = tokio::spawn(async move { puller.check_inbox(&name("b"), 10_000).await });
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    // The runtime is single-threaded: yielding lets the pull run until it parks.
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
     say(&bus, "a", "lobby", "wake up").await;
     let page = tokio::time::timeout(Duration::from_secs(2), parked)
         .await
@@ -353,7 +346,7 @@ async fn the_last_member_leaving_deletes_the_room() {
 
 #[tokio::test]
 async fn leaving_stops_room_mail_and_deregistering_leaves_every_room() {
-    let bus = room_of(1024, &["a", "b", "c"]).await;
+    let (_dir, bus) = room_of(1024, &["a", "b", "c"]).await;
     say(&bus, "a", "lobby", "one").await;
     bus.leave_room(&name("b"), &room("lobby")).await.unwrap();
     assert!(
@@ -389,7 +382,7 @@ async fn an_idle_agent_dropped_by_the_sweep_leaves_its_rooms() {
 
 #[tokio::test]
 async fn list_rooms_reports_membership_and_unread_counts() {
-    let bus = room_of(1024, &["a", "b"]).await;
+    let (_dir, bus) = room_of(1024, &["a", "b"]).await;
     say(&bus, "a", "lobby", "1").await;
     say(&bus, "a", "lobby", "2").await;
     let for_b = bus.list_rooms(&name("b")).await.unwrap().rooms;
@@ -440,7 +433,7 @@ async fn rooms_survive_a_persisted_restart_with_cursors_and_members() {
 
 #[tokio::test]
 async fn room_mail_does_not_count_against_the_direct_mail_caps() {
-    let bus = room_of(1024, &["a", "b"]).await;
+    let (_dir, bus) = room_of(1024, &["a", "b"]).await;
     for i in 0..1100 {
         say(&bus, "a", "lobby", &format!("m{i}")).await;
     }

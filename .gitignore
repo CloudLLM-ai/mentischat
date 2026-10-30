@@ -1,3 +1,6 @@
 /target
 Cargo.lock.bak
 .DS_Store
+fuzz/target
+fuzz/artifacts
+fuzz/coverage

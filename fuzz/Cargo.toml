@@ -1,0 +1,27 @@
+[package]
+name = "mentischat-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "time"] }
+mentischat = { path = ".." }
+
+# Its own workspace: keeps the fuzz crate out of the parent package's builds,
+# clippy runs, MSRV check and published tarball.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "names"
+path = "fuzz_targets/names.rs"
+test = false
+doc = false
+bench = false

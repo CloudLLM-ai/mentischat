@@ -13,7 +13,7 @@ categories = ["command-line-utilities", "development-tools", "network-programmin
 # Unix only: data directory permissions and SIGTERM handling. See the
 # compile_error! in src/lib.rs.
 rust-version = "1.88"
-exclude = ["/target", "/.github", "/launchd"]
+exclude = ["/target", "/.github", "/launchd", "/fuzz"]
 
 [dependencies]
 async-trait = "0.1.92"

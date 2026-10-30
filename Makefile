@@ -1,5 +1,5 @@
 # Makefile
-.PHONY: build release clean fmt fmt-check check test doc help tasks clippy publish publish-dry-run install uninstall run run-plain stop ci msrv
+.PHONY: build release clean fmt fmt-check check test doc help tasks clippy publish publish-dry-run install uninstall run run-plain stop ci msrv fuzz-build fuzz-replay fuzz
 
 default: help
 CARGO_CMD=/usr/bin/env cargo
@@ -8,6 +8,9 @@ CARGO_CMD=/usr/bin/env cargo
 SWEEP := $(shell command -v cargo-sweep >/dev/null 2>&1 && echo cargo sweep)
 MENTISCHAT_PORT?=9480
 MSRV?=1.88
+FUZZ_SECONDS?=60
+# The crate has no `unsafe`, so AddressSanitizer would only slow the fuzzers down (about 2x); skip it.
+FUZZ_FLAGS=-s none
 
 # ----------------------------------------------------------------------------------------------------------------------
 # Targets
@@ -28,6 +31,17 @@ ci: fmt-check check clippy test doc ## Verification-only pipeline (no source rew
 # Check the rust-version claim in Cargo.toml (needs rustup and the toolchain)
 msrv: ## Type-check on the minimum supported Rust version (MSRV, default 1.88)
 	${CARGO_CMD} +$(MSRV) check --release --all-targets --all-features --locked
+
+# Fuzzing needs nightly and cargo-fuzz (cargo install cargo-fuzz); it is not part of `make ci`.
+fuzz-build: ## Build every fuzz target (needs nightly and cargo-fuzz)
+	${CARGO_CMD} +nightly fuzz build $(FUZZ_FLAGS)
+
+fuzz-replay: ## Replay each committed fuzz corpus once (fast regression pass)
+	for t in $$(${CARGO_CMD} +nightly fuzz list); do ${CARGO_CMD} +nightly fuzz run $(FUZZ_FLAGS) $$t fuzz/corpus/$$t -- -runs=0 || exit 1; done
+
+fuzz: ## Fuzz one target: make fuzz TARGET=names FUZZ_SECONDS=60
+	@test -n "$(TARGET)" || { echo "usage: make fuzz TARGET=<name> [FUZZ_SECONDS=60]"; exit 1; }
+	${CARGO_CMD} +nightly fuzz run $(FUZZ_FLAGS) $(TARGET) -- -max_total_time=$(FUZZ_SECONDS)
 
 # Format the code
 fmt: ## Format the code using cargo fmt

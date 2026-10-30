@@ -237,3 +237,15 @@ UNRELEASED
     agents wait, harness wiring, launchd and use as a library.
     skills/rust-engineer.md and skills/rust-performance-reviewer.md hold the
     house style for changes.
+
+  - fix(snapshot): a snapshot whose room messages were numbered above the
+    recorded next_id, or shared an id with a direct message, restored with
+    room logs out of id order and a counter that handed out ids already in
+    use. Restore now claims each id once across direct mail and rooms,
+    drops ids at the limit and sets next_id past everything kept. Restore
+    also runs the live validators (body, provider, description), folds
+    invitations and seats a member once. Found by the snapshot_restore fuzz
+    target. New: Bus::from_snapshot_bytes and Bus::snapshot_bytes.
+
+  - test(fuzz): cargo-fuzz targets in fuzz/ (names, tool_json,
+    snapshot_restore), with make fuzz-build, fuzz-replay and fuzz.

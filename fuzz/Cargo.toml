@@ -34,3 +34,10 @@ path = "fuzz_targets/tool_json.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "snapshot_restore"
+path = "fuzz_targets/snapshot_restore.rs"
+test = false
+doc = false
+bench = false

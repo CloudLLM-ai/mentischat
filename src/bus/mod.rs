@@ -820,10 +820,9 @@ impl Bus {
     }
 }
 
-/// Trims a register description and enforces [`MAX_DESCRIPTION_BYTES`] and
-/// no control characters; `""` stays `""` (it clears the stored one).
 /// Check a message body and return its JSON-escaped length: at most
-/// [`MAX_BODY_BYTES`] and not blank. Shared by direct and room sends.
+/// [`MAX_BODY_BYTES`] and not blank. Shared by direct and room sends and by
+/// snapshot restore, so a restored message obeys what a sent one does.
 fn validate_body(body: &str) -> Result<usize, MailErr> {
     if body.len() > MAX_BODY_BYTES || body.trim().is_empty() {
         return Err(MailErr::InvalidBody);
@@ -831,6 +830,8 @@ fn validate_body(body: &str) -> Result<usize, MailErr> {
     Ok(json_len(body))
 }
 
+/// Trims a register description and enforces [`MAX_DESCRIPTION_BYTES`] and
+/// no control characters; `""` stays `""` (it clears the stored one).
 fn validate_description(raw: String) -> Result<String, MailErr> {
     let trimmed = raw.trim();
     if trimmed.len() > MAX_DESCRIPTION_BYTES || trimmed.chars().any(char::is_control) {

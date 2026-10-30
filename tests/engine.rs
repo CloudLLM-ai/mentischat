@@ -128,3 +128,56 @@ async fn a_log_survives_being_pruned_and_compacted_around_an_unread_message() {
     assert_eq!(ids.last(), Some(&1), "the oldest message is still there");
     assert!(ids.len() < 9_001, "pruned mail is gone from history");
 }
+
+/// Senders race a recipient that keeps leaving and coming back, and pullers
+/// race the senders. Whatever interleaving happens, the global counts must
+/// agree with the per-agent queues at the end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn counts_stay_consistent_while_agents_come_and_go() {
+    let (_d, bus) = fresh_bus("churn");
+    for who in ["flaky", "s0", "s1", "s2", "s3"] {
+        bus.register(&name(who)).await.unwrap();
+    }
+    let senders: Vec<_> = (0..4)
+        .map(|i| {
+            let bus = bus.clone();
+            tokio::spawn(async move {
+                let from = name(&format!("s{i}"));
+                for _ in 0..2_000 {
+                    // Fails `unregistered` while flaky is away; that is fine.
+                    let _ = bus.send(&from, &name("flaky"), "x".into()).await;
+                    let _ = bus.send(&from, &name("s0"), "y".into()).await;
+                }
+            })
+        })
+        .collect();
+    let churn = {
+        let bus = bus.clone();
+        tokio::spawn(async move {
+            for _ in 0..300 {
+                let _ = bus.deregister(&name("flaky")).await;
+                let _ = bus.register_with(&name("flaky"), common::reclaim()).await;
+                let _ = bus.check_inbox(&name("flaky"), 0).await;
+            }
+        })
+    };
+    for task in senders {
+        task.await.unwrap();
+    }
+    churn.await.unwrap();
+    bus.register_with(&name("flaky"), common::reclaim())
+        .await
+        .unwrap();
+
+    let stats = bus.stats().await.unwrap();
+    let queued: i64 = bus
+        .list_agents()
+        .await
+        .unwrap()
+        .agents
+        .iter()
+        .map(|a| a.queued)
+        .sum();
+    assert_eq!(stats.unread, queued, "unread counter matches the queues");
+    assert!(stats.unread + stats.read <= 8192, "the cap held: {stats:?}");
+}

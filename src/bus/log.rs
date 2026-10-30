@@ -11,6 +11,8 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 
+use parking_lot::Mutex;
+
 use super::clock::rfc3339_ms;
 use super::Message;
 
@@ -31,6 +33,10 @@ pub(super) struct Msg {
     pub from: Arc<str>,
     /// Recipient, spelled as the roster stored it when the message was sent.
     pub to: Arc<str>,
+    /// Which registration of the recipient it was addressed to, so that
+    /// discarding an agent's mail never touches mail for a later holder of
+    /// the same name.
+    pub to_gen: u64,
     /// Body exactly as sent (never trimmed).
     pub body: Box<str>,
     /// Milliseconds since the Unix epoch when the send was accepted.
@@ -53,6 +59,7 @@ impl Msg {
         id: u64,
         from: Arc<str>,
         to: Arc<str>,
+        to_gen: u64,
         body: Box<str>,
         body_json_len: usize,
         created_ms: u64,
@@ -64,6 +71,7 @@ impl Msg {
             id,
             from,
             to,
+            to_gen,
             body,
             created_ms,
             read_ms: AtomicU64::new(0),
@@ -134,26 +142,36 @@ pub(super) fn json_len(body: &str) -> usize {
 /// Dead entries a log tolerates before its first compaction.
 const MIN_COMPACT_LEN: usize = 64;
 
-/// Every message exchanged between two agents, in both directions, oldest
-/// first. Ids are strictly increasing along the log, so a position is found
-/// by binary search however many dead entries lie between.
-#[derive(Debug)]
+/// Every message exchanged between two agents, in both directions, behind
+/// its own lock so unrelated conversations never wait on each other.
+#[derive(Debug, Default)]
 pub(super) struct Convo {
+    pub log: Mutex<ConvoLog>,
+}
+
+/// The log itself: sorted by id, so a position is found by binary search
+/// however many dead entries lie between.
+#[derive(Debug)]
+pub(super) struct ConvoLog {
     log: VecDeque<Arc<Msg>>,
     /// Length at which the next append sweeps dead entries out of the middle.
     compact_at: usize,
+    /// Set when the log was removed from the conversation map: an append that
+    /// finds it must look the conversation up again.
+    pub retired: bool,
 }
 
-impl Default for Convo {
+impl Default for ConvoLog {
     fn default() -> Self {
         Self {
             log: VecDeque::new(),
             compact_at: MIN_COMPACT_LEN,
+            retired: false,
         }
     }
 }
 
-impl Convo {
+impl ConvoLog {
     /// Append `msg`, whose id exceeds every id in the log. Dead entries at
     /// the front are dropped now; the ones between live messages when the
     /// log doubles past its last compaction, so appends stay O(1) amortized

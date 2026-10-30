@@ -10,7 +10,8 @@
 //! loop has to make room by dropping the oldest read message: the steady
 //! state of a busy daemon. One iteration is one message delivered, so the
 //! reported throughput is messages per second. `contention` runs the same
-//! loop for 1, 2, 4 and 8 independent pairs at once on a multi-thread runtime.
+//! loop for 1 to 32 independent pairs at once on a multi-thread runtime with a
+//! worker per core.
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
@@ -117,9 +118,14 @@ async fn contended(bus: std::sync::Arc<Bus>, tasks: u64, iters: u64, body: &str)
     started.elapsed()
 }
 
+/// Worker threads for the contention runtime: one per core.
+fn cores() -> usize {
+    std::thread::available_parallelism().map_or(8, usize::from)
+}
+
 fn bench_contention(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(8)
+        .worker_threads(cores())
         .build()
         .expect("runtime");
     let body = "x".repeat(BODY_BYTES);
@@ -129,7 +135,7 @@ fn bench_contention(c: &mut Criterion) {
     group.throughput(Throughput::Elements(1));
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(3));
-    for tasks in [1u64, 2, 4, 8] {
+    for tasks in [1u64, 2, 4, 8, 16, 32] {
         group.bench_function(format!("{tasks}_pairs"), |b| {
             b.iter_custom(|iters| {
                 rt.block_on(contended(bus.clone(), tasks, iters.max(tasks), &body))

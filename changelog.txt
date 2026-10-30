@@ -93,11 +93,15 @@ UNRELEASED
 
   - perf(bus): the mailbox is an in-memory engine instead of sqlite behind a
     global async lock: a log of Arc'd messages per conversation, a queue of
-    unread mail per recipient, and a parking_lot lock that is never held
-    across an await, so send and pull no longer scan or rewrite anything.
-    Send plus pull through the Bus API went from about 8.2k messages/s on an
-    empty mailbox and 434/s at the 8192-message cap to about 1.1M/s at both.
-    The tools, routes, caps and error codes are unchanged.
+    unread mail per recipient, and short parking_lot sections that are never
+    held across an await, so send and pull no longer scan or rewrite
+    anything. The roster and the conversations are sharded and each agent
+    and conversation has its own lock, so agents that talk to different
+    peers do not wait on each other. Send plus pull through the Bus API went
+    from about 8.2k messages/s on an empty mailbox and 434/s at the
+    8192-message cap to about 1.1M/s at both on one pair, and 8 to 32
+    concurrent pairs went from about 0.5M/s total to 1.3-1.6M/s. The tools,
+    routes, caps and error codes are unchanged.
 
   - feat(tui): started from a terminal, the daemon paints a live view: the
     MENTIS CHAT banner, tiles for where it listens, messages sent, agents and

@@ -1,18 +1,18 @@
 //! The mailbox: roster, caps, read marking, blocking pulls, history, held
 //! names, and expiry of read mail and idle agents.
 //!
-//! Everything lives in memory in one `State` behind a single
-//! [`parking_lot::Mutex`]. Each operation is one short synchronous call on the
-//! state (no I/O, no `.await`, nothing slower than a few hash lookups and
-//! queue moves) and the lock is released before any response is built, so
-//! the lock is never held across an `.await` and cannot be the reason a task
-//! stalls. There is one lock, so there is no lock order to follow; a future
-//! room log joins the state under it.
+//! Everything lives in memory in one `State`, split so that independent
+//! conversations never wait on each other: a roster `RwLock` (read-locked on
+//! the hot path), one `Mutex` per agent for its unread queue, one per
+//! conversation log, a small one for the order mail was read in, and atomics
+//! for the global counts. Each operation is a few short synchronous critical
+//! sections (no I/O, no `.await`), taken in the order `state.rs` documents,
+//! and responses are built after every lock is released.
 //!
 //! Mail between two agents is a conversation log of `Arc`'d messages; each
 //! recipient keeps a queue of its unread ones, so pulling, and the caps
 //! on unread mail, never scan anything. A blocking pull waits on its agent's
-//! [`tokio::sync::Notify`] rather than on the lock: it enables the wake
+//! [`tokio::sync::Notify`] rather than on a lock: it enables the wake
 //! first, checks the inbox, then waits, so a send that lands in between
 //! cannot be missed.
 //!
@@ -25,10 +25,10 @@
 //! mailbox and the next [`Bus::new`] reads it back and deletes it.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use parking_lot::{Mutex, MutexGuard};
 use tokio::time::Instant;
 
 use crate::errors::TakenReason;
@@ -55,7 +55,7 @@ use clock::{now_ms, rfc3339_ms, unix_ms};
 use delivery::{history_page, history_rows};
 use log::{json_len, Msg};
 use park::{ParkGuard, Signal};
-use state::{Agent, State};
+use state::{Agent, Key, State};
 
 type MailErr = crate::errors::MailboxError;
 
@@ -98,7 +98,7 @@ impl Taken {
 
 /// Shared mailbox handle; wrap in [`std::sync::Arc`] to share across HTTP/MCP layers.
 pub struct Bus {
-    state: Mutex<State>,
+    state: State,
     retention: Retention,
     /// Where [`close`](Self::close) writes its snapshot and [`new`](Self::new)
     /// looks for one.
@@ -133,7 +133,7 @@ impl Bus {
     pub fn with_retention(data_dir: &Path, retention: Retention) -> Result<Self, SnapshotError> {
         let state = snapshot::restore(data_dir)?.unwrap_or_else(State::new);
         Ok(Self {
-            state: Mutex::new(state),
+            state,
             retention,
             data_dir: data_dir.to_path_buf(),
         })
@@ -144,13 +144,12 @@ impl Bus {
         self.retention
     }
 
-    /// Locks the bus, failing `shutting_down` once it has been closed.
-    fn lock_open(&self) -> Result<MutexGuard<'_, State>, MailErr> {
-        let g = self.state.lock();
-        if g.closed {
+    /// The state, failing `shutting_down` once the bus has been closed.
+    fn open(&self) -> Result<&State, MailErr> {
+        if self.state.closed.load(Ordering::Relaxed) {
             Err(MailErr::ShuttingDown)
         } else {
-            Ok(g)
+            Ok(&self.state)
         }
     }
 
@@ -180,42 +179,45 @@ impl Bus {
     ) -> Result<RegisterOutcome, MailErr> {
         let description = opts.description.map(validate_description).transpose()?;
         let provider = opts.provider.map(|p| p.as_str().to_string());
-        let mut g = self.lock_open()?;
-        // Stamped under the lock so concurrent registers cannot write last_seen
-        // out of order.
+        let state = self.open()?;
         let now = now_ms();
         let key = name.folded();
-        if let Some(agent) = g.agents.get_mut(&key) {
+        // Membership changes are serialized by `holds`.
+        let mut holds = state.holds.lock();
+        if let Some(agent) = state.roster.get(&key) {
             if opts.reclaim {
-                return Ok(refresh_agent(agent, now, provider, description));
+                return Ok(refresh_agent(&agent, now, provider, description));
             }
             let stored = agent.name.to_string();
-            return Err(g.name_taken(stored, TakenReason::Registered, now));
+            return Err(state.name_taken(&holds, stored, TakenReason::Registered, now));
         }
-        let hold = g.holds.get(&key).filter(|h| h.until_ms > now).cloned();
+        let hold = holds.get(&key).filter(|h| h.until_ms > now).cloned();
         if let (Some(h), false) = (&hold, opts.reclaim) {
             let reason = TakenReason::Held {
                 until: rfc3339_ms(h.until_ms),
             };
-            return Err(g.name_taken(name.to_string(), reason, now));
+            return Err(state.name_taken(&holds, name.to_string(), reason, now));
         }
-        if g.agents.len() >= MAX_ROSTER as usize {
+        let agents = state.roster.len();
+        if agents >= MAX_ROSTER as usize {
             return Err(MailErr::RosterFull {
-                agents: g.agents.len() as i64,
+                agents: agents as i64,
             });
         }
         let registered_ms = hold.map_or(now, |h| h.registered_ms);
         let description = description.filter(|d| !d.is_empty());
+        let gen = state.next_gen.fetch_add(1, Ordering::Relaxed);
         let agent = Agent::new(
             name.as_str().into(),
+            gen,
             provider,
             description,
             registered_ms,
             now,
         );
         let outcome = register_outcome(&agent, true);
-        g.agents.insert(key.clone(), agent);
-        g.holds.remove(&key);
+        state.roster.insert(key.clone(), Arc::new(agent));
+        holds.remove(&key);
         Ok(outcome)
     }
 
@@ -224,14 +226,14 @@ impl Bus {
     /// it sent stay with their recipients. The name is then held for
     /// [`Retention::name_hold`].
     pub async fn deregister(&self, name: &AgentName) -> Result<DiscardOutcome, MailErr> {
-        let mut g = self.lock_open()?;
+        let state = self.open()?;
         let until_ms = now_ms() + self.retention.name_hold.as_millis() as u64;
-        match g.remove_agent(&name.folded(), until_ms) {
+        match state.remove_agent(&name.folded(), until_ms) {
             Some((agent, discarded)) => Ok(DiscardOutcome {
                 agent: agent.name.to_string(),
                 discarded,
             }),
-            None => Err(g.unregistered(name.as_str())),
+            None => Err(state.unregistered(name.as_str())),
         }
     }
 
@@ -239,11 +241,13 @@ impl Bus {
     /// description and unread count, plus free names to suggest. Read-only:
     /// does not touch `last_seen`.
     pub async fn list_agents(&self) -> Result<RosterListing, MailErr> {
-        let (rows, suggestions) = {
-            let g = self.lock_open()?;
-            let rows: Vec<_> = g.agents_sorted().map(roster_row).collect();
-            (rows, g.free_suggestions(now_ms()))
-        };
+        let state = self.open()?;
+        let rows: Vec<_> = state
+            .agents_sorted()
+            .iter()
+            .map(|a| roster_row(a))
+            .collect();
+        let suggestions = state.free_suggestions(&state.holds.lock(), now_ms());
         let agents = rows
             .into_iter()
             .map(|row| RosterEntry {
@@ -274,10 +278,11 @@ impl Bus {
     /// `shutting_down` once the bus is closed.
     pub async fn overview(&self) -> Result<Overview, MailErr> {
         let now = now_ms();
-        let g = self.lock_open()?;
-        let agents = g
+        let state = self.open()?;
+        let agents = state
             .agents_sorted()
-            .map(roster_row)
+            .iter()
+            .map(|a| roster_row(a))
             .map(|row| AgentOverview {
                 name: row.name,
                 provider: row.provider,
@@ -288,7 +293,7 @@ impl Bus {
             .collect();
         Ok(Overview {
             agents,
-            messages_sent: g.messages_sent,
+            messages_sent: state.messages_sent(),
         })
     }
 
@@ -308,11 +313,9 @@ impl Bus {
         }
         let body_json_len = json_len(&body);
         let body = body.into_boxed_str();
-        let msg = {
-            let mut g = self.lock_open()?;
-            // Stamped under the lock so createdAt order matches id order.
-            g.send(from.as_str(), to.as_str(), body, body_json_len, now_ms())?
-        };
+        let msg = self
+            .open()?
+            .send(from.as_str(), to.as_str(), body, body_json_len, now_ms())?;
         Ok(SendReceipt {
             id: msg.id.to_string(),
             from: msg.from.to_string(),
@@ -371,25 +374,31 @@ impl Bus {
     /// is none), and hand back the agent's signal for a pull that goes on to
     /// wait.
     fn pull_now(&self, name: &AgentName) -> Result<(Taken, Arc<Signal>), MailErr> {
-        let mut g = self.lock_open()?;
-        let key = name.folded();
-        let now = now_ms();
-        if !g.touch(&key, now) {
-            return Err(g.unregistered(name.as_str()));
-        }
-        let taken = g.take(&key, now);
-        let Some(agent) = g.agents.get(&key) else {
-            return Err(g.unregistered(name.as_str()));
-        };
-        let taken = taken.map_or_else(
-            || Taken::empty(agent.name.clone()),
-            |(messages, remaining)| Taken {
+        let state = self.open()?;
+        let agent = state.agent(name.as_str(), Key::fold(name.as_str()).as_str())?;
+        let taken = self.take(state, &agent, name)?;
+        Ok((
+            taken.unwrap_or_else(|| Taken::empty(agent.name.clone())),
+            agent.signal.clone(),
+        ))
+    }
+
+    /// Stamp `agent` as seen and take its next batch, if any;
+    /// `unregistered` when it left in the meantime.
+    fn take(
+        &self,
+        state: &State,
+        agent: &Arc<Agent>,
+        name: &AgentName,
+    ) -> Result<Option<Taken>, MailErr> {
+        match state.pull(agent, now_ms()) {
+            None => Err(state.unregistered(name.as_str())),
+            Some(batch) => Ok(batch.map(|(messages, remaining)| Taken {
                 agent: agent.name.clone(),
                 messages,
                 remaining,
-            },
-        );
-        Ok((taken, agent.signal.clone()))
+            })),
+        }
     }
 
     /// One pass of a waiting pull: take mail if there is any, else say the
@@ -404,39 +413,28 @@ impl Bus {
         signal: &Arc<Signal>,
         deadline: Instant,
     ) -> Result<Pull, MailErr> {
-        let mut g = self.lock_open()?;
-        let key = name.folded();
-        let now = now_ms();
-        // The agent was waiting all along; record when the pull ended.
-        if !g.touch(&key, now) {
-            return Err(g.unregistered(name.as_str()));
-        }
-        let taken = g.take(&key, now);
-        let Some(agent) = g.agents.get(&key) else {
-            return Err(g.unregistered(name.as_str()));
-        };
+        let state = self.open()?;
+        // The agent was waiting all along; taking also records when the pull
+        // ended.
+        let agent = state.agent(name.as_str(), Key::fold(name.as_str()).as_str())?;
         if !Arc::ptr_eq(&agent.signal, signal) {
             return Ok(Pull::Retarget(agent.signal.clone()));
         }
-        let stored = agent.name.clone();
-        if let Some((messages, remaining)) = taken {
-            return Ok(Pull::Ready(Taken {
-                agent: stored,
-                messages,
-                remaining,
-            }));
+        if let Some(taken) = self.take(state, &agent, name)? {
+            return Ok(Pull::Ready(taken));
         }
         if Instant::now() >= deadline {
-            return Ok(Pull::Ready(Taken::empty(stored)));
+            return Ok(Pull::Ready(Taken::empty(agent.name.clone())));
         }
+        // Raised only here, so a burst of pulls can overshoot the cap by the
+        // number racing; the guard counts every one that parks.
         let waiting = signal.parked();
         if waiting >= MAX_WAITERS_PER_AGENT {
             return Err(MailErr::TooManyWaiters {
-                agent: stored.to_string(),
+                agent: agent.name.to_string(),
                 waiting,
             });
         }
-        // Counted while the lock is still held, so the cap cannot be beaten.
         Ok(Pull::Park(ParkGuard::new(signal.clone())))
     }
 
@@ -460,20 +458,19 @@ impl Bus {
         with: Option<&AgentName>,
         before: Option<i64>,
     ) -> Result<HistoryPage, MailErr> {
-        let (stored, rows, next) = {
-            let mut g = self.lock_open()?;
-            let key = name.folded();
-            if !g.touch(&key, now_ms()) {
-                return Err(g.unregistered(name.as_str()));
+        let state = self.open()?;
+        let agent = state.agent(name.as_str(), Key::fold(name.as_str()).as_str())?;
+        {
+            let mut st = agent.inner.lock();
+            if st.removed {
+                drop(st);
+                return Err(state.unregistered(name.as_str()));
             }
-            let Some(me) = g.agents.get(&key) else {
-                return Err(g.unregistered(name.as_str()));
-            };
-            let with = with.map(AgentName::folded);
-            let (rows, next) = history_rows(&g, me, with.as_deref(), before);
-            (me.name.clone(), rows, next)
-        };
-        Ok(history_page(&stored, &rows, next))
+            st.last_seen_ms = now_ms();
+        }
+        let with = with.map(AgentName::folded);
+        let (rows, next) = history_rows(state, &agent, with.as_deref(), before);
+        Ok(history_page(&agent.name, &rows, next))
     }
 
     /// Delete mail read longer than [`Retention::read_ttl`] ago, and agents
@@ -491,32 +488,33 @@ impl Bus {
     /// [`Retention::name_hold`] from `now`, and holds that ended by `now`
     /// are forgotten.
     pub async fn sweep_at(&self, now: SystemTime) -> Result<SweepOutcome, MailErr> {
-        let mut g = self.lock_open()?;
+        let state = self.open()?;
         let now_ms = unix_ms(now);
         let cutoff = |ttl: Duration| now_ms.saturating_sub(ttl.as_millis() as u64);
-        let expired_read = g.expire_read(cutoff(self.retention.read_ttl));
+        let expired_read = state.expire_read(cutoff(self.retention.read_ttl));
         let idle_since = cutoff(self.retention.agent_ttl);
-        let mut stale: Vec<String> = g
-            .agents
-            .iter()
-            .filter(|(_, a)| a.last_seen_ms < idle_since && a.signal.parked() == 0)
-            .map(|(key, _)| key.clone())
+        let mut stale: Vec<String> = state
+            .roster
+            .entries()
+            .into_iter()
+            .filter(|(_, a)| a.signal.parked() == 0 && a.inner.lock().last_seen_ms < idle_since)
+            .map(|(key, _)| key)
             .collect();
         stale.sort_unstable();
-        g.holds.retain(|_, h| h.until_ms > now_ms);
+        state.holds.lock().retain(|_, h| h.until_ms > now_ms);
         let until_ms = now_ms + self.retention.name_hold.as_millis() as u64;
         let mut out = SweepOutcome {
             expired_read,
             ..SweepOutcome::default()
         };
         for key in stale {
-            if let Some((agent, discarded)) = g.remove_agent(&key, until_ms) {
+            if let Some((agent, discarded)) = state.remove_agent(&key, until_ms) {
                 out.discarded += discarded;
                 out.dropped_agents.push(agent.name.to_string());
             }
         }
         if !out.is_empty() {
-            g.compact_convos();
+            state.compact_convos();
         }
         Ok(out)
     }
@@ -524,11 +522,12 @@ impl Bus {
     /// Roster size and unread and read message counts, for `/health`. Does
     /// not deliver anything or touch `last_seen`.
     pub async fn stats(&self) -> Result<Stats, MailErr> {
-        let g = self.lock_open()?;
+        let state = self.open()?;
+        let unread = state.unread.0.load(Ordering::Relaxed);
         Ok(Stats {
-            agents: g.agents.len() as i64,
-            unread: g.unread as i64,
-            read: (g.total - g.unread) as i64,
+            agents: state.roster.len() as i64,
+            unread: unread as i64,
+            read: state.total.0.load(Ordering::Relaxed).saturating_sub(unread) as i64,
         })
     }
 
@@ -536,8 +535,7 @@ impl Bus {
     /// startup, which also clears whatever a persisted run left. Parked pulls
     /// fail `unregistered`. Returns `(messages, agents)` removed.
     pub async fn clear(&self) -> Result<(i64, i64), MailErr> {
-        let mut g = self.lock_open()?;
-        Ok(g.clear())
+        Ok(self.open()?.clear())
     }
 
     /// Mark the bus closed: every parked waiter fails `shutting_down` and no
@@ -548,9 +546,8 @@ impl Bus {
     /// Never fails; it returns a `Result` to keep the signature of the
     /// engine it replaced.
     pub async fn shutdown(&self) -> Result<(), MailErr> {
-        let mut g = self.state.lock();
-        g.closed = true;
-        g.clear();
+        self.state.closed.store(true, Ordering::Relaxed);
+        self.state.clear();
         Ok(())
     }
 
@@ -560,14 +557,9 @@ impl Bus {
     /// failure to write is logged and loses the mailbox, which is all a
     /// crash would have done.
     pub async fn close(&self) {
-        let snapshot = {
-            let mut g = self.state.lock();
-            g.closed = true;
-            for agent in g.agents.values() {
-                agent.signal.notify.notify_waiters();
-            }
-            snapshot::capture(&g)
-        };
+        self.state.closed.store(true, Ordering::Relaxed);
+        self.state.wake_all();
+        let snapshot = snapshot::capture(&self.state);
         if let Err(e) = snapshot::save(&self.data_dir, &snapshot) {
             tracing::error!(error = %e, "could not write the mailbox snapshot");
         }
@@ -586,12 +578,13 @@ fn validate_description(raw: String) -> Result<String, MailErr> {
 
 /// The outcome of registering `agent`, as stored.
 fn register_outcome(agent: &Agent, created: bool) -> RegisterOutcome {
+    let st = agent.inner.lock();
     RegisterOutcome {
         agent: agent.name.to_string(),
         created,
-        last_seen: rfc3339_ms(agent.last_seen_ms),
-        provider: agent.provider.clone(),
-        description: agent.description.clone(),
+        last_seen: rfc3339_ms(st.last_seen_ms),
+        provider: st.provider.clone(),
+        description: st.description.clone(),
     }
 }
 
@@ -599,17 +592,20 @@ fn register_outcome(agent: &Agent, created: bool) -> RegisterOutcome {
 /// description when given (`None` keeps the stored value; an empty
 /// description clears it).
 fn refresh_agent(
-    agent: &mut Agent,
+    agent: &Agent,
     now: u64,
     provider: Option<String>,
     description: Option<String>,
 ) -> RegisterOutcome {
-    agent.last_seen_ms = now;
-    if provider.is_some() {
-        agent.provider = provider;
-    }
-    if let Some(description) = description {
-        agent.description = Some(description).filter(|d| !d.is_empty());
+    {
+        let mut st = agent.inner.lock();
+        st.last_seen_ms = now;
+        if provider.is_some() {
+            st.provider = provider;
+        }
+        if let Some(description) = description {
+            st.description = Some(description).filter(|d| !d.is_empty());
+        }
     }
     register_outcome(agent, false)
 }
@@ -624,11 +620,12 @@ struct RosterRow {
 }
 
 fn roster_row(agent: &Agent) -> RosterRow {
+    let st = agent.inner.lock();
     RosterRow {
         name: agent.name.to_string(),
-        provider: agent.provider.clone(),
-        description: agent.description.clone(),
-        last_seen_ms: agent.last_seen_ms,
-        queued: agent.unread.len() as i64,
+        provider: st.provider.clone(),
+        description: st.description.clone(),
+        last_seen_ms: st.last_seen_ms,
+        queued: st.unread.len() as i64,
     }
 }

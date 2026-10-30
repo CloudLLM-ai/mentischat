@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use super::log::Msg;
-use super::state::{convo_key, fitting, Agent, State};
+use super::state::{convo_has, convo_key, fitting, Agent, Key, State};
 use super::{HistoryPage, MAX_BATCH};
 
 /// One history page's messages for `me` (see `Bus::history`) and the
@@ -25,32 +25,49 @@ pub(super) fn history_rows(
     with: Option<&str>,
     before: Option<i64>,
 ) -> (Vec<Arc<Msg>>, Option<i64>) {
-    let me_key = me.name.to_ascii_lowercase();
+    let me_key = Key::fold(&me.name);
+    let registered_ms = me.inner.lock().registered_ms;
     let before = before.map(|b| u64::try_from(b).unwrap_or(0));
     let visible = |m: &&Arc<Msg>| {
-        m.created_ms >= me.registered_ms
+        m.created_ms >= registered_ms
             && (m.from.eq_ignore_ascii_case(&me.name)
                 || (m.to.eq_ignore_ascii_case(&me.name) && m.read_at_ms().is_some()))
     };
-    let mut streams: Vec<_> = state
-        .convos
+    let convos: Vec<_> = match with {
+        Some(peer) => state
+            .convos
+            .get(convo_key(&me_key, &Key::fold(peer)).as_str())
+            .into_iter()
+            .collect(),
+        None => state
+            .convos
+            .values_where(|key| convo_has(key, me_key.as_str())),
+    };
+    // One row past a full page says whether older messages exist; each log
+    // is locked just long enough to copy its newest candidates out.
+    let want = MAX_BATCH as usize + 1;
+    let mut streams: Vec<_> = convos
         .iter()
-        .filter(|(key, _)| match with {
-            Some(peer) => **key == convo_key(&me_key, peer),
-            None => key.split('\n').any(|side| side == me_key),
+        .map(|convo| {
+            let log = convo.log.lock();
+            let newest: Vec<_> = log
+                .newest_first(before)
+                .filter(visible)
+                .take(want)
+                .cloned()
+                .collect();
+            newest.into_iter().peekable()
         })
-        .map(|(_, convo)| convo.newest_first(before).filter(visible).peekable())
         .collect();
-    // One row past a full page says whether older messages exist.
-    let mut rows = Vec::with_capacity(MAX_BATCH as usize + 1);
-    while rows.len() <= MAX_BATCH as usize {
+    let mut rows = Vec::with_capacity(want);
+    while rows.len() < want {
         let newest = streams
             .iter_mut()
             .enumerate()
             .filter_map(|(i, s)| s.peek().map(|m| (m.id, i)))
             .max();
         let Some((_, i)) = newest else { break };
-        rows.extend(streams[i].next().cloned());
+        rows.extend(streams[i].next());
     }
     let take = fitting(rows.iter().map(|m| m.page_len()));
     let next = (rows.len() > take).then(|| rows[take - 1].id as i64);

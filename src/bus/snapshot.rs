@@ -11,12 +11,13 @@ use std::fmt;
 use std::fs;
 use std::io::{self, BufWriter};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use super::log::{json_len, Msg};
-use super::state::{convo_key, Agent, Hold, State};
+use super::state::{convo_key, Agent, Hold, Key, State};
 
 /// File name of the snapshot inside the data directory.
 const SNAPSHOT_FILE: &str = "snapshot.json";
@@ -155,36 +156,35 @@ pub(super) fn restore(data_dir: &Path) -> Result<Option<State>, SnapshotError> {
 
 /// Everything in `state` worth keeping.
 pub(super) fn capture(state: &State) -> Snapshot {
-    let mut messages: Vec<MsgRec> = state
-        .convos
-        .values()
-        .flat_map(|convo| convo.live())
-        .map(|m| MsgRec {
-            id: m.id,
-            from: m.from.to_string(),
-            to: m.to.to_string(),
-            body: m.body.to_string(),
-            created_ms: m.created_ms,
-            read_ms: m.read_at_ms().unwrap_or(0),
+    let convos = state.convos.values_where(|_| true);
+    let mut messages: Vec<MsgRec> = convos
+        .iter()
+        .flat_map(|convo| {
+            let log = convo.log.lock();
+            log.live().map(msg_rec).collect::<Vec<_>>()
         })
         .collect();
     messages.sort_unstable_by_key(|m| m.id);
+    let holds = state.holds.lock();
     Snapshot {
         version: VERSION,
-        next_id: state.next_id,
-        messages_sent: state.messages_sent,
+        next_id: state.next_id.0.load(Relaxed),
+        messages_sent: state.messages_sent(),
         agents: state
             .agents_sorted()
-            .map(|a| AgentRec {
-                name: a.name.to_string(),
-                provider: a.provider.clone(),
-                description: a.description.clone(),
-                registered_ms: a.registered_ms,
-                last_seen_ms: a.last_seen_ms,
+            .iter()
+            .map(|a| {
+                let st = a.inner.lock();
+                AgentRec {
+                    name: a.name.to_string(),
+                    provider: st.provider.clone(),
+                    description: st.description.clone(),
+                    registered_ms: st.registered_ms,
+                    last_seen_ms: st.last_seen_ms,
+                }
             })
             .collect(),
-        holds: state
-            .holds
+        holds: holds
             .iter()
             .map(|(key, h)| HoldRec {
                 key: key.clone(),
@@ -196,70 +196,116 @@ pub(super) fn capture(state: &State) -> Snapshot {
     }
 }
 
+fn msg_rec(m: &Arc<Msg>) -> MsgRec {
+    MsgRec {
+        id: m.id,
+        from: m.from.to_string(),
+        to: m.to.to_string(),
+        body: m.body.to_string(),
+        created_ms: m.created_ms,
+        read_ms: m.read_at_ms().unwrap_or(0),
+    }
+}
+
 /// A [`State`] holding what `snapshot` described. Mail addressed to an agent
 /// that is not on the roster is dropped: it would have been discarded with
 /// the agent.
 fn rebuild(snapshot: Snapshot) -> State {
-    let mut state = State::new();
-    state.messages_sent = snapshot.messages_sent;
+    let state = State::new();
+    state.sent_by_gone.store(snapshot.messages_sent, Relaxed);
     for rec in snapshot.agents {
         let key = rec.name.to_ascii_lowercase();
-        let name: Arc<str> = rec.name.into();
-        let mut agent = Agent::new(name, rec.provider, rec.description, rec.registered_ms, 0);
-        agent.last_seen_ms = rec.last_seen_ms;
-        state.agents.insert(key, agent);
+        let gen = state.next_gen.fetch_add(1, Relaxed);
+        let agent = Agent::new(
+            rec.name.into(),
+            gen,
+            rec.provider,
+            rec.description,
+            rec.registered_ms,
+            rec.last_seen_ms,
+        );
+        state.roster.insert(key, Arc::new(agent));
     }
-    for rec in snapshot.holds {
-        let hold = Hold {
-            until_ms: rec.until_ms,
-            registered_ms: rec.registered_ms,
-        };
-        state.holds.insert(rec.key, hold);
+    {
+        let mut holds = state.holds.lock();
+        for rec in snapshot.holds {
+            let hold = Hold {
+                until_ms: rec.until_ms,
+                registered_ms: rec.registered_ms,
+            };
+            holds.insert(rec.key, hold);
+        }
     }
     let mut messages = snapshot.messages;
     messages.sort_unstable_by_key(|m| m.id);
-    state.next_id = snapshot
+    let next_id = snapshot
         .next_id
         .max(messages.last().map_or(1, |m| m.id + 1));
+    state.next_id.0.store(next_id, Relaxed);
     let mut names: HashMap<String, Arc<str>> = HashMap::new();
+    let mut read = Vec::new();
     for rec in messages {
-        restore_message(&mut state, &mut names, rec);
+        restore_message(&state, &mut names, &mut read, rec);
     }
-    let mut read: Vec<_> = state.read_q.drain(..).collect();
-    read.sort_by_key(|m| m.read_at_ms());
-    state.read_q = read.into();
+    read.sort_by_key(|(_, m): &(String, Arc<Msg>)| m.read_at_ms());
+    for (key, msg) in read {
+        if let Some(agent) = state.roster.get(&key) {
+            let mut st = agent.inner.lock();
+            st.read.push_back(msg);
+            agent.publish_oldest_read(&st);
+        }
+    }
     state
 }
 
-/// File one snapshot message where `State::append` would have, as read or
-/// unread as it was.
-fn restore_message(state: &mut State, names: &mut HashMap<String, Arc<str>>, rec: MsgRec) {
+/// File one snapshot message where `State::send` would have, as read or
+/// unread as it was. Read ones are collected into `read`, with their recipient's key, for
+/// the caller to queue in read order.
+fn restore_message(
+    state: &State,
+    names: &mut HashMap<String, Arc<str>>,
+    read: &mut Vec<(String, Arc<Msg>)>,
+    rec: MsgRec,
+) {
     let (from_key, to_key) = (rec.from.to_ascii_lowercase(), rec.to.to_ascii_lowercase());
-    if !state.agents.contains_key(&to_key) {
+    let Some(recipient) = state.roster.get(&to_key) else {
         return;
-    }
-    let mut spelled = |key: &str, name: String| {
-        let roster = state.agents.get(key).map(|a| a.name.clone());
-        roster.unwrap_or_else(|| names.entry(key.to_string()).or_insert(name.into()).clone())
     };
-    let (from, to) = (spelled(&from_key, rec.from), spelled(&to_key, rec.to));
+    let from: Arc<str> = state.roster.get(&from_key).map_or_else(
+        || {
+            names
+                .entry(from_key.clone())
+                .or_insert(rec.from.into())
+                .clone()
+        },
+        |a| a.name.clone(),
+    );
     let body: Box<str> = rec.body.into();
     let body_len = json_len(&body);
-    let msg = Arc::new(Msg::new(rec.id, from, to, body, body_len, rec.created_ms));
-    msg.read_ms
-        .store(rec.read_ms, std::sync::atomic::Ordering::Relaxed);
+    let msg = Arc::new(Msg::new(
+        rec.id,
+        from,
+        recipient.name.clone(),
+        recipient.gen,
+        body,
+        body_len,
+        rec.created_ms,
+    ));
+    msg.read_ms.store(rec.read_ms, Relaxed);
     state
         .convos
-        .entry(convo_key(&from_key, &to_key))
-        .or_default()
+        .get_or_insert_with(
+            convo_key(&Key::fold(&from_key), &Key::fold(&to_key)).as_str(),
+            Arc::default,
+        )
+        .log
+        .lock()
         .push(msg.clone());
-    state.total += 1;
+    state.total.0.fetch_add(1, Relaxed);
     if rec.read_ms == 0 {
-        state.unread += 1;
-        if let Some(agent) = state.agents.get_mut(&to_key) {
-            agent.unread.push_back(msg);
-        }
+        state.unread.0.fetch_add(1, Relaxed);
+        recipient.inner.lock().unread.push_back(msg);
     } else {
-        state.read_q.push_back(msg);
+        read.push((to_key, msg));
     }
 }

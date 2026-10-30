@@ -53,7 +53,8 @@ pub struct Info {
     pub version: String,
     /// Listen URL, for example `http://127.0.0.1:9480`.
     pub url: String,
-    /// Data directory holding `pending.sqlite`, shown bottom right.
+    /// Data directory (where `snapshot.json` goes under `MENTISCHAT_PERSIST=1`),
+    /// shown bottom right.
     pub data_path: String,
 }
 

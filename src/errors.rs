@@ -52,7 +52,8 @@ pub enum MailboxError {
     QueueFull { to: String, pending: i64 },
     /// Global row cap hit.
     StorageFull { pending: i64 },
-    /// Sqlite open/write failure unrelated to capacity (not a full queue).
+    /// A storage failure unrelated to capacity (not a full queue). The
+    /// in-memory engine cannot raise it; the code stays in the wire contract.
     StorageError,
     /// Roster already holds [`crate::bus::MAX_ROSTER`] agents.
     RosterFull { agents: i64 },

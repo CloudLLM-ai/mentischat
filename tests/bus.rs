@@ -1,8 +1,7 @@
 //! Bus behavior tests: roster semantics, caps, read-marking delivery, waiter
-//! races, crash recovery, and mutex stress — all in-process against tempdirs.
+//! races, restarts, and lock stress, all in-process.
 //! Chosen names and holds are in `tests/names.rs`, history in
-//! `tests/history.rs`, and lifetimes and on-disk scrubbing in
-//! `tests/retention.rs`.
+//! `tests/history.rs`, and lifetimes in `tests/retention.rs`.
 
 mod common;
 
@@ -341,27 +340,22 @@ async fn deregister_discards_inbox_but_keeps_sent_rows() {
 }
 
 #[tokio::test]
-async fn crash_reopen_preserves_roster_and_rows() {
+async fn a_crash_leaves_nothing_behind() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("crash");
 
     let bus = Bus::new(&data).unwrap();
     bus.register(&name("a")).await.unwrap();
     bus.register(&name("b")).await.unwrap();
-    bus.send(&name("a"), &name("b"), "survives".into())
+    bus.send(&name("a"), &name("b"), "gone with the process".into())
         .await
         .unwrap();
     drop(bus);
 
+    assert!(!data.exists(), "the mailbox only lives in memory");
     let bus = Bus::new(&data).unwrap();
-    let roster = bus.list_agents().await.unwrap().agents;
-    assert_eq!(roster.len(), 2, "roster survives a crash (no shutdown)");
-    let page = bus.check_inbox(&name("b"), 0).await.unwrap();
-    assert_eq!(
-        page.messages.len(),
-        1,
-        "unread mail survives a crash when nothing clears it"
-    );
+    assert!(bus.list_agents().await.unwrap().agents.is_empty());
+    assert_eq!(bus.stats().await.unwrap(), stats(0, 0, 0));
 }
 
 #[tokio::test]
@@ -667,29 +661,27 @@ async fn a_bad_description_registers_nothing() {
 
 #[tokio::test]
 async fn a_send_that_fails_stores_nothing() {
-    let dir = tempfile::tempdir().unwrap();
-    let data = dir.path().join("atomic_send");
-    let bus = Bus::new(&data).unwrap();
+    let (_d, bus) = fresh_bus("atomic_send");
     bus.register(&name("a")).await.unwrap();
     bus.register(&name("b")).await.unwrap();
-    // Fail the sender's last_seen update, which runs after the insert.
-    rusqlite::Connection::open(data.join("pending.sqlite"))
-        .unwrap()
-        .execute_batch(
-            "CREATE TRIGGER fail_touch BEFORE UPDATE ON roster
-             BEGIN SELECT RAISE(ABORT, 'injected'); END;",
-        )
-        .unwrap();
+    let before = bus.list_agents().await.unwrap().agents[0].last_seen.clone();
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
 
     assert!(matches!(
-        bus.send(&name("a"), &name("b"), "lost?".into()).await,
-        Err(MailboxError::StorageError)
+        bus.send(&name("a"), &name("nobody"), "lost?".into()).await,
+        Err(MailboxError::Unregistered { .. })
     ));
     assert_eq!(
         bus.stats().await.unwrap(),
         stats(2, 0, 0),
         "the failed send left no message behind"
     );
+    assert_eq!(
+        bus.list_agents().await.unwrap().agents[0].last_seen,
+        before,
+        "nor did it count as activity"
+    );
+    assert_eq!(bus.overview().await.unwrap().messages_sent, 0);
 }
 
 #[tokio::test]
@@ -821,7 +813,7 @@ async fn batch_size_counts_escaped_json_not_raw_body_bytes() {
 }
 
 #[tokio::test]
-async fn delivery_order_survives_a_crash() {
+async fn delivery_order_survives_a_persisted_restart() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("seq");
     let bus = Bus::new(&data).unwrap();
@@ -830,7 +822,7 @@ async fn delivery_order_survives_a_crash() {
     bus.send(&name("a"), &name("b"), "first".into())
         .await
         .unwrap();
-    drop(bus); // crash: no shutdown wipe
+    bus.close().await; // MENTISCHAT_PERSIST=1: the snapshot keeps the mailbox
 
     let bus = Bus::new(&data).unwrap();
     bus.send(&name("a"), &name("b"), "second".into())

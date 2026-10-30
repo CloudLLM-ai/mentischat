@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use mentischat::bus::{Bus, Retention, StoreError};
+use mentischat::bus::{Bus, Retention, SnapshotError};
 use mentischat::tui::{self, LogBuffer};
 use mentischat::BIND_ADDR;
 use tokio::sync::Notify;
@@ -99,7 +99,7 @@ async fn run_daemon() -> ExitCode {
     };
 
     // Bind first: the port is the single-instance lock, so a second instance
-    // exits here before it opens the live instance's database.
+    // exits here before it reads the live instance's snapshot.
     let listener = match tokio::net::TcpListener::bind(BIND_ADDR).await {
         Ok(l) => l,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
@@ -116,12 +116,12 @@ async fn run_daemon() -> ExitCode {
     };
 
     let opened = match Bus::with_retention(&data_dir, retention) {
-        // An older database would be wiped at startup anyway, so replace it.
-        // Under MENTISCHAT_PERSIST=1 it is kept and the daemon refuses to
-        // start, naming the files to delete.
-        Err(e @ StoreError::Schema { .. }) if !persist => {
-            tracing::warn!(error = %e, "replacing a database with an older table shape");
-            mentischat::store::reset(&data_dir)
+        // A snapshot this build cannot read would be wiped at startup
+        // anyway, so replace it. Under MENTISCHAT_PERSIST=1 it is kept and
+        // the daemon refuses to start, naming the file to delete.
+        Err(e @ (SnapshotError::Corrupt(_) | SnapshotError::Version(_))) if !persist => {
+            tracing::warn!(error = %e, "discarding a snapshot this build cannot read");
+            mentischat::bus::remove_snapshot(&data_dir)
                 .and_then(|()| Bus::with_retention(&data_dir, retention))
         }
         other => other,

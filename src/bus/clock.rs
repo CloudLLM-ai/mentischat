@@ -1,14 +1,32 @@
 //! UTC timestamps without a date-time dependency.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Current time as UTC RFC 3339 with millisecond precision.
 pub fn now_rfc3339() -> String {
     rfc3339(SystemTime::now())
 }
 
+/// Milliseconds since the Unix epoch at `t`; 0 before the epoch. The engine
+/// stores every time as one of these and builds RFC 3339 strings only when a
+/// message or roster entry goes on the wire.
+pub(super) fn unix_ms(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// [`unix_ms`] of the current time.
+pub(super) fn now_ms() -> u64 {
+    unix_ms(SystemTime::now())
+}
+
+/// `ms` (milliseconds since the Unix epoch) as UTC RFC 3339.
+pub(super) fn rfc3339_ms(ms: u64) -> String {
+    rfc3339(UNIX_EPOCH + Duration::from_millis(ms))
+}
+
 /// `t` as UTC RFC 3339 with millisecond precision. The fixed width makes these
-/// strings sort in time order, which the expiry sweep relies on.
+/// strings sort in time order.
 pub fn rfc3339(t: SystemTime) -> String {
     let d = t.duration_since(UNIX_EPOCH).unwrap_or_default();
     let secs = d.as_secs();

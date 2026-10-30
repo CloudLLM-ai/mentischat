@@ -4,7 +4,7 @@ UNRELEASED
     (Claude Code, Codex, Grok Build, opencode, Cursor, or a script) message
     each other. One loopback process on 127.0.0.1:9480 serves MCP Streamable
     HTTP at /mcp on the cloudllm_mcp backbone and a REST mirror of every
-    tool, backed by sqlite (WAL). Six tools: register, list_agents,
+    tool, backed by an in-memory mailbox. Six tools: register, list_agents,
     send_message, check_inbox, history, deregister. Domain errors are
     isError: true content blocks carrying typed JSON codes; REST answers 200
     + JSON on success and the same codes with HTTP statuses (400/404/405/409/
@@ -39,16 +39,17 @@ UNRELEASED
     hold a new holder starts fresh.
 
   - feat(bus): delivery. check_inbox returns the oldest unread mail and marks
-    it read in the same transaction, so each message arrives through
+    it read in one step, so each message arrives through
     check_inbox exactly once; messages carry readAt. A page holds up to 8
     messages within 16 KiB of serialized message JSON (the first always
     rides), and remaining drives the drain loop. wait_ms (0-30000) parks the
-    pull under the bus lock until mail lands; timeout is an empty success.
-    send wakes the oldest live parked pull; a pull cancelled after its wake
-    hands it on, a woken pull that finds nothing parks again for the time
-    left, and abandoned pulls are pruned, so the 8-pulls-per-name cap only
-    counts live ones. send stores the message and refreshes the sender's
-    lastSeen in one transaction, in an order seeded past every row on disk.
+    pull on its agent's wake signal until mail lands; timeout is an empty
+    success. send wakes the oldest parked pull; a pull cancelled after its
+    wake hands it on, a woken pull that finds nothing parks again for the
+    time left, and abandoned pulls free their slot, so the 8-pulls-per-name
+    cap only counts live ones. send stores the message and refreshes the
+    sender's lastSeen in one step, with ids that only increase. Message ids
+    are the decimal delivery number, and history's next is the same number.
     Caps: body 64 KiB, 1024 unread per recipient, 8192 rows in total (a send
     at the cap deletes the oldest read message; storage_full means 8192
     unread).
@@ -80,15 +81,23 @@ UNRELEASED
     and the instructions say so. Tool schemas carry no regex patterns, so
     local GGUF / opencode grammars compile.
 
-  - feat(store): nothing persists. The roster, held names and all mail are
-    wiped at startup (clearing whatever a crashed run left) and on a clean
-    stop; MENTISCHAT_PERSIST=1 keeps the roster and mail. Deleted text is
-    overwritten (secure_delete), the WAL is truncated on a side connection
-    off the bus lock after every deregister, sweep, prune and wipe, and a
-    wipe compacts the file (VACUUM). The data directory is 0700 and the
-    database 0600 (MENTISCHAT_DIR overrides ~/.cloudllm/mentischat). A
-    database whose tables have a different shape is replaced at startup, or
-    refused under MENTISCHAT_PERSIST=1 with the files to delete named.
+  - feat(store): nothing persists, and nothing is written. The roster, held
+    names and all mail live in memory: wiped at startup and on a clean stop,
+    so no file exists and no deleted text can be left on disk.
+    MENTISCHAT_PERSIST=1 keeps the roster and mail: a clean stop writes
+    snapshot.json (0600, in the 0700 data directory, MENTISCHAT_DIR overrides
+    ~/.cloudllm/mentischat) and the next start reads and deletes it. A crash
+    loses the mailbox. A snapshot this build cannot read is replaced at
+    startup, or refused under MENTISCHAT_PERSIST=1 with the file to delete
+    named.
+
+  - perf(bus): the mailbox is an in-memory engine instead of sqlite behind a
+    global async lock: a log of Arc'd messages per conversation, a queue of
+    unread mail per recipient, and a parking_lot lock that is never held
+    across an await, so send and pull no longer scan or rewrite anything.
+    Send plus pull through the Bus API went from about 8.2k messages/s on an
+    empty mailbox and 434/s at the 8192-message cap to about 1.1M/s at both.
+    The tools, routes, caps and error codes are unchanged.
 
   - feat(tui): started from a terminal, the daemon paints a live view: the
     MENTIS CHAT banner, tiles for where it listens, messages sent, agents and

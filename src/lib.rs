@@ -27,7 +27,6 @@ pub mod errors;
 pub mod instructions;
 pub mod names;
 pub mod rest;
-pub mod store;
 pub mod tools;
 pub mod tui;
 

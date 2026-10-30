@@ -9,8 +9,8 @@ use serde::Serialize;
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
 /// Per-recipient cap on unread messages.
 pub const MAX_PENDING_PER_AGENT: i64 = 1024;
-/// Global cap on rows in `messages`, read and unread. A send at the cap
-/// deletes the oldest read message to make room; when every row is unread it
+/// Global cap on messages, read and unread. A send at the cap deletes the
+/// oldest read message to make room; when every row is unread it
 /// fails `storage_full`.
 pub const MAX_TOTAL_MESSAGES: i64 = 8192;
 /// Max messages returned by one `check_inbox` or `history` page.
@@ -50,11 +50,13 @@ pub struct Registration {
     pub reclaim: bool,
 }
 
-/// A delivered or queued mail row (wire shape).
+/// A delivered or queued mail message (wire shape).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Message {
-    /// Unique id (uuid v4).
+    /// Unique id: the decimal delivery number, increasing across the life of
+    /// the daemon (and across a persisted restart). `history`'s `next` cursor
+    /// is the same number.
     pub id: String,
     /// Sender roster name.
     pub from: String,

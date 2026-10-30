@@ -3,7 +3,6 @@
 //! about.
 #![allow(dead_code)]
 
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -53,15 +52,4 @@ pub fn stats(agents: i64, unread: i64, read: i64) -> Stats {
 /// `secs` from now, for `Bus::sweep_at`.
 pub fn later(secs: u64) -> SystemTime {
     SystemTime::now() + Duration::from_secs(secs)
-}
-
-/// Whether `needle` appears anywhere under the data directory: database,
-/// `-wal` or `-shm`.
-pub fn on_disk(dir: &Path, needle: &str) -> bool {
-    std::fs::read_dir(dir)
-        .unwrap()
-        .flat_map(|entry| std::fs::read(entry.unwrap().path()).unwrap_or_default())
-        .collect::<Vec<u8>>()
-        .windows(needle.len())
-        .any(|w| w == needle.as_bytes())
 }

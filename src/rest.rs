@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::{header, StatusCode};
+use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -57,17 +57,17 @@ pub fn router(bus: Ctx) -> Router {
         .with_state(bus)
 }
 
-pub(crate) fn err_response(e: MailboxError) -> Response {
-    (e.http_status(), Json(e.to_json())).into_response()
+/// The contract error response: [`MailboxError::http_status`] and the
+/// [`MailboxError::to_json`] object. Every REST and WebSocket-upgrade failure
+/// goes through here, so handlers can propagate with `?`.
+impl IntoResponse for MailboxError {
+    fn into_response(self) -> Response {
+        (self.http_status(), Json(self.to_json())).into_response()
+    }
 }
 
-fn ok_response(value: Value) -> Response {
-    (StatusCode::OK, Json(value)).into_response()
-}
-
-fn respond(result: Result<Value, MailboxError>) -> Response {
-    result.map_or_else(err_response, ok_response)
-}
+/// What a handler answers: 200 + JSON, or a contract error.
+type Reply = Result<Json<Value>, MailboxError>;
 
 /// Serialise a pull result with `Cache-Control: no-store` — it mutates live
 /// state and must never be cached.
@@ -81,35 +81,26 @@ fn no_store_response(value: impl serde::Serialize) -> Response {
 }
 
 /// Parse a JSON request body; any extractor rejection is a client error.
-#[allow(clippy::result_large_err)]
-fn json_body(body: Result<Json<Value>, JsonRejection>) -> Result<Value, Response> {
-    match body {
-        Ok(Json(v)) => Ok(v),
-        Err(_) => Err(err_response(MailboxError::InvalidBody)),
-    }
+fn json_body(body: Result<Json<Value>, JsonRejection>) -> Result<Value, MailboxError> {
+    body.map(|Json(v)| v).map_err(|_| MailboxError::InvalidBody)
 }
 
 /// The `{agent}` path segment. A segment axum cannot decode (invalid
 /// percent-encoding or UTF-8) is an `invalid_name` like any other bad name,
 /// not axum's plain-text 400.
-#[allow(clippy::result_large_err)]
-fn path_name(path: Result<Path<String>, PathRejection>) -> Result<AgentName, Response> {
-    let Path(raw) = path.map_err(|_| {
-        err_response(MailboxError::InvalidName {
-            agent: String::new(),
-        })
+fn path_name(path: Result<Path<String>, PathRejection>) -> Result<AgentName, MailboxError> {
+    let Path(raw) = path.map_err(|_| MailboxError::InvalidName {
+        agent: String::new(),
     })?;
-    AgentName::parse(&raw).map_err(err_response)
+    AgentName::parse(&raw)
 }
 
 /// `POST /agents` `{ "agent", "provider"?, "description"?, "reclaim"? }` —
 /// same as register.
-async fn register(State(bus): State<Ctx>, body: Result<Json<Value>, JsonRejection>) -> Response {
-    let v = match json_body(body) {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
-    respond(crate::tools::register_agent(&bus, &v).await)
+async fn register(State(bus): State<Ctx>, body: Result<Json<Value>, JsonRejection>) -> Reply {
+    Ok(Json(
+        crate::tools::register_agent(&bus, &json_body(body)?).await?,
+    ))
 }
 
 /// `GET /agents?after=&limit=` — roster sorted by name ascending, one page,
@@ -117,11 +108,11 @@ async fn register(State(bus): State<Ctx>, body: Result<Json<Value>, JsonRejectio
 async fn list(
     State(bus): State<Ctx>,
     query: Result<Query<HashMap<String, String>>, QueryRejection>,
-) -> Response {
-    let Ok(Query(q)) = query else {
-        return err_response(MailboxError::InvalidBody);
-    };
-    respond(crate::tools::list_agents(&bus, &page_params(&q)).await)
+) -> Reply {
+    let Query(q) = query.map_err(|_| MailboxError::InvalidBody)?;
+    Ok(Json(
+        crate::tools::list_agents(&bus, &page_params(&q)).await?,
+    ))
 }
 
 /// The `after` and `limit` query parameters as the JSON the tools take.
@@ -133,21 +124,16 @@ fn page_params(q: &HashMap<String, String>) -> Value {
 async fn deregister_one(
     State(bus): State<Ctx>,
     path: Result<Path<String>, PathRejection>,
-) -> Response {
-    let agent = match path_name(path) {
-        Ok(a) => a,
-        Err(resp) => return resp,
-    };
-    respond(bus.deregister(&agent).await.map(crate::tools::to_wire))
+) -> Reply {
+    let agent = path_name(path)?;
+    Ok(Json(crate::tools::to_wire(bus.deregister(&agent).await?)))
 }
 
 /// `POST /messages` `{ "from", "to", "body" }` — same as send_message.
-async fn send_msg(State(bus): State<Ctx>, body: Result<Json<Value>, JsonRejection>) -> Response {
-    let v = match json_body(body) {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
-    respond(crate::tools::send_message(&bus, &v).await)
+async fn send_msg(State(bus): State<Ctx>, body: Result<Json<Value>, JsonRejection>) -> Reply {
+    Ok(Json(
+        crate::tools::send_message(&bus, &json_body(body)?).await?,
+    ))
 }
 
 /// `POST /messages/batch` `[{ "from", "to" | "room", "body" }, ...]` — up to
@@ -156,11 +142,10 @@ async fn send_msg(State(bus): State<Ctx>, body: Result<Json<Value>, JsonRejectio
 /// receipt or its contract error object at the same position of the response
 /// array: one failing item does not stop or undo the others. A body that is
 /// not an array of 1 to [`MAX_BATCH_SEND`] items is `invalid_body`.
-async fn send_batch(State(bus): State<Ctx>, body: Result<Json<Value>, JsonRejection>) -> Response {
-    let items = match json_body(body) {
-        Ok(Value::Array(items)) if (1..=MAX_BATCH_SEND).contains(&items.len()) => items,
-        Ok(_) => return err_response(MailboxError::InvalidBody),
-        Err(resp) => return resp,
+async fn send_batch(State(bus): State<Ctx>, body: Result<Json<Value>, JsonRejection>) -> Reply {
+    let items = match json_body(body)? {
+        Value::Array(items) if (1..=MAX_BATCH_SEND).contains(&items.len()) => items,
+        _ => return Err(MailboxError::InvalidBody),
     };
     let mut results = Vec::with_capacity(items.len());
     for item in &items {
@@ -171,7 +156,7 @@ async fn send_batch(State(bus): State<Ctx>, body: Result<Json<Value>, JsonReject
         };
         results.push(outcome.unwrap_or_else(|e| e.to_json()));
     }
-    ok_response(Value::Array(results))
+    Ok(Json(Value::Array(results)))
 }
 
 /// `GET /inboxes/{agent}?wait_ms=&limit=` — same as check_inbox: returned messages
@@ -180,28 +165,15 @@ async fn pull(
     State(bus): State<Ctx>,
     path: Result<Path<String>, PathRejection>,
     query: Result<Query<HashMap<String, String>>, QueryRejection>,
-) -> Response {
-    let agent = match path_name(path) {
-        Ok(a) => a,
-        Err(resp) => return resp,
-    };
-    let Ok(Query(q)) = query else {
-        return err_response(MailboxError::InvalidWait);
-    };
-    let wait_ms = match parse_wait_query(q.get("wait_ms").map(String::as_str)) {
-        Ok(w) => w,
-        Err(e) => return err_response(e),
-    };
-    let limit = match crate::tools::parse_limit(
-        q.get("limit").map(|l| Value::String(l.clone())).as_ref(),
-    ) {
-        Ok(l) => l,
-        Err(e) => return err_response(e),
-    };
-    match bus.check_inbox_limit(&agent, wait_ms, limit).await {
-        Ok(page) => no_store_response(page),
-        Err(e) => err_response(e),
-    }
+) -> Result<Response, MailboxError> {
+    let agent = path_name(path)?;
+    let Query(q) = query.map_err(|_| MailboxError::InvalidWait)?;
+    let wait_ms = parse_wait_query(q.get("wait_ms").map(String::as_str))?;
+    let limit =
+        crate::tools::parse_limit(q.get("limit").map(|l| Value::String(l.clone())).as_ref())?;
+    Ok(no_store_response(
+        bus.check_inbox_limit(&agent, wait_ms, limit).await?,
+    ))
 }
 
 /// `GET /history/{agent}?with=&room=&before=` — same as the history tool.
@@ -209,81 +181,57 @@ async fn history(
     State(bus): State<Ctx>,
     path: Result<Path<String>, PathRejection>,
     query: Result<Query<HashMap<String, String>>, QueryRejection>,
-) -> Response {
-    let agent = match path_name(path) {
-        Ok(a) => a,
-        Err(resp) => return resp,
-    };
-    let Ok(Query(q)) = query else {
-        return err_response(MailboxError::InvalidCursor);
-    };
+) -> Result<Response, MailboxError> {
+    let agent = path_name(path)?;
+    let Query(q) = query.map_err(|_| MailboxError::InvalidCursor)?;
     let field = |key: &str| q.get(key).map(|v| Value::String(v.clone()));
-    let with = match crate::tools::optional_name(field("with").as_ref()) {
-        Ok(w) => w,
-        Err(e) => return err_response(e),
-    };
-    let before = match crate::tools::parse_cursor(field("before").as_ref()) {
-        Ok(b) => b,
-        Err(e) => return err_response(e),
-    };
-    let room = match crate::tools::optional_room(field("room").as_ref()) {
-        Ok(r) => r,
-        Err(e) => return err_response(e),
-    };
+    let with = crate::tools::optional_name(field("with").as_ref())?;
+    let before = crate::tools::parse_cursor(field("before").as_ref())?;
+    let room = crate::tools::optional_room(field("room").as_ref())?;
     let page = match room {
         Some(_) if with.is_some() => Err(MailboxError::InvalidBody),
         Some(room) => bus.room_history(&agent, &room, before).await,
         None => bus.history(&agent, with.as_ref(), before).await,
     };
-    match page {
-        Ok(page) => no_store_response(page),
-        Err(e) => err_response(e),
-    }
+    Ok(no_store_response(page?))
 }
 
 /// `POST /rooms` `{ "agent", "room", "private"?, "description"? }` — same as
 /// create_room.
-async fn create_room(State(bus): State<Ctx>, body: Result<Json<Value>, JsonRejection>) -> Response {
-    let v = match json_body(body) {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
-    respond(crate::tools::create_room(&bus, &v).await)
+async fn create_room(State(bus): State<Ctx>, body: Result<Json<Value>, JsonRejection>) -> Reply {
+    Ok(Json(
+        crate::tools::create_room(&bus, &json_body(body)?).await?,
+    ))
 }
 
 /// `GET /rooms?agent=&after=&limit=` — same as list_rooms.
 async fn list_rooms(
     State(bus): State<Ctx>,
     query: Result<Query<HashMap<String, String>>, QueryRejection>,
-) -> Response {
-    let Ok(Query(q)) = query else {
-        return err_response(MailboxError::InvalidBody);
-    };
+) -> Reply {
+    let Query(q) = query.map_err(|_| MailboxError::InvalidBody)?;
     let mut params = page_params(&q);
     params["agent"] = q.get("agent").map_or(Value::Null, |a| json!(a));
-    respond(crate::tools::list_rooms(&bus, &params).await)
+    Ok(Json(crate::tools::list_rooms(&bus, &params).await?))
 }
 
 /// The `{room}` path segment, as `path_name` does for agents.
-#[allow(clippy::result_large_err)]
-fn path_room(path: Result<Path<String>, PathRejection>) -> Result<String, Response> {
-    path.map(|Path(raw)| raw).map_err(|_| {
-        err_response(MailboxError::InvalidRoom {
+fn path_room(path: Result<Path<String>, PathRejection>) -> Result<String, MailboxError> {
+    path.map(|Path(raw)| raw)
+        .map_err(|_| MailboxError::InvalidRoom {
             room: String::new(),
         })
-    })
 }
 
 /// A request body that must be a JSON object, with the path's `room` set in
 /// it (the path wins over a `room` in the body).
-#[allow(clippy::result_large_err)]
 fn body_with_room(
     body: Result<Json<Value>, JsonRejection>,
     room: String,
-) -> Result<Value, Response> {
+) -> Result<Value, MailboxError> {
     let mut v = json_body(body)?;
     let Some(object) = v.as_object_mut() else {
-        return Err(err_response(MailboxError::InvalidBody));
+        return Err(MailboxError::InvalidBody);
     };
     object.insert("room".to_string(), Value::String(room));
     Ok(v)
@@ -291,11 +239,10 @@ fn body_with_room(
 
 /// The JSON body of a `/rooms/{room}/...` request with the path's room set
 /// in it.
-#[allow(clippy::result_large_err)]
 fn room_request(
     path: Result<Path<String>, PathRejection>,
     body: Result<Json<Value>, JsonRejection>,
-) -> Result<Value, Response> {
+) -> Result<Value, MailboxError> {
     let room = path_room(path)?;
     body_with_room(body, room)
 }
@@ -305,12 +252,10 @@ async fn join_room(
     State(bus): State<Ctx>,
     path: Result<Path<String>, PathRejection>,
     body: Result<Json<Value>, JsonRejection>,
-) -> Response {
-    let v = match room_request(path, body) {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
-    respond(crate::tools::join_room(&bus, &v).await)
+) -> Reply {
+    Ok(Json(
+        crate::tools::join_room(&bus, &room_request(path, body)?).await?,
+    ))
 }
 
 /// `POST /rooms/{room}/invitations` `{ "agent", "invitee" }` — same as invite.
@@ -318,48 +263,44 @@ async fn invite(
     State(bus): State<Ctx>,
     path: Result<Path<String>, PathRejection>,
     body: Result<Json<Value>, JsonRejection>,
-) -> Response {
-    let v = match room_request(path, body) {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
-    respond(crate::tools::invite(&bus, &v).await)
+) -> Reply {
+    Ok(Json(
+        crate::tools::invite(&bus, &room_request(path, body)?).await?,
+    ))
 }
 
 /// `DELETE /rooms/{room}/members/{agent}` — same as leave_room.
 async fn leave_room(
     State(bus): State<Ctx>,
     path: Result<Path<(String, String)>, PathRejection>,
-) -> Response {
-    let Ok(Path((room, agent))) = path else {
-        return err_response(MailboxError::InvalidRoom {
-            room: String::new(),
-        });
-    };
-    respond(crate::tools::leave_room(&bus, &json!({ "agent": agent, "room": room })).await)
+) -> Reply {
+    let Path((room, agent)) = path.map_err(|_| MailboxError::InvalidRoom {
+        room: String::new(),
+    })?;
+    Ok(Json(
+        crate::tools::leave_room(&bus, &json!({ "agent": agent, "room": room })).await?,
+    ))
 }
 
 /// `GET /health` — `{ ok, agents, pending, read }`; counts only.
-async fn health(State(bus): State<Ctx>) -> Response {
-    match bus.stats().await {
-        Ok(stats) => ok_response(json!({
-            "ok": true,
-            "agents": stats.agents,
-            "pending": stats.unread,
-            "read": stats.read,
-        })),
-        Err(e) => err_response(e),
-    }
+async fn health(State(bus): State<Ctx>) -> Reply {
+    let stats = bus.stats().await?;
+    Ok(Json(json!({
+        "ok": true,
+        "agents": stats.agents,
+        "pending": stats.unread,
+        "read": stats.read,
+    })))
 }
 
 /// Unknown REST path.
-async fn not_found() -> Response {
-    err_response(MailboxError::NotFound)
+async fn not_found() -> MailboxError {
+    MailboxError::NotFound
 }
 
 /// Known REST path, method it does not serve.
-async fn method_not_allowed() -> Response {
-    err_response(MailboxError::MethodNotAllowed)
+async fn method_not_allowed() -> MailboxError {
+    MailboxError::MethodNotAllowed
 }
 
 /// Contract wait_ms query semantics: absent/empty -> 0; digit string within

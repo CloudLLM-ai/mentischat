@@ -55,7 +55,7 @@ use tokio::time::Instant;
 use crate::bus::{Bus, Push, StreamSession};
 use crate::errors::MailboxError;
 use crate::names::AgentName;
-use crate::rest::{err_response, MAX_BATCH_BODY_BYTES, MAX_BATCH_SEND};
+use crate::rest::{MAX_BATCH_BODY_BYTES, MAX_BATCH_SEND};
 
 /// How often the server pings.
 const PING_EVERY: Duration = Duration::from_secs(20);
@@ -71,14 +71,14 @@ pub async fn upgrade(
     ws: WebSocketUpgrade,
 ) -> Response {
     let Ok(Query(q)) = query else {
-        return err_response(MailboxError::InvalidBody);
+        return MailboxError::InvalidBody.into_response();
     };
     let agent = match AgentName::parse(q.get("agent").map_or("", String::as_str)) {
         Ok(a) => a,
-        Err(e) => return err_response(e),
+        Err(e) => return e.into_response(),
     };
     if let Err(e) = bus.check_registered(&agent) {
-        return err_response(e);
+        return e.into_response();
     }
     ws.max_message_size(MAX_BATCH_BODY_BYTES)
         .on_upgrade(move |socket| run(bus, agent, socket))

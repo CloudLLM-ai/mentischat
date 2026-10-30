@@ -304,10 +304,44 @@ pub async fn check_inbox(bus: &Bus, params: &Value) -> Result<InboxPage, Mailbox
 /// Pull a required name field: missing or empty is `invalid_name`, a
 /// non-string value is `invalid_body`.
 fn required_name(params: &Value, key: &str) -> Result<AgentName, MailboxError> {
-    match params.get(key) {
-        None | Some(Value::Null) => AgentName::parse(""),
-        Some(Value::String(raw)) => AgentName::parse(raw),
+    required(params.get(key), AgentName::parse)
+}
+
+/// A required string field, validated by `parse`: missing, null or empty goes
+/// to `parse("")` (its own "empty" error), a non-string is `invalid_body`.
+fn required<T>(
+    v: Option<&Value>,
+    parse: fn(&str) -> Result<T, MailboxError>,
+) -> Result<T, MailboxError> {
+    match v {
+        None | Some(Value::Null) => parse(""),
+        Some(Value::String(raw)) => parse(raw),
         Some(_) => Err(MailboxError::InvalidBody),
+    }
+}
+
+/// An optional string field, validated by `parse`: absent, null or `""` ->
+/// `None`; a string -> `parse(string)`; any other JSON type -> `invalid_body`.
+fn optional<T>(
+    v: Option<&Value>,
+    parse: fn(&str) -> Result<T, MailboxError>,
+) -> Result<Option<T>, MailboxError> {
+    match v {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if s.is_empty() => Ok(None),
+        Some(Value::String(s)) => parse(s).map(Some),
+        Some(_) => Err(MailboxError::InvalidBody),
+    }
+}
+
+/// A non-negative integer given as a JSON number or a string of ASCII
+/// digits (query strings and some local models quote numbers); `None` for
+/// anything else, including a value above `u64::MAX`.
+pub fn uint(v: &Value) -> Option<u64> {
+    match v {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) if s.bytes().all(|b| b.is_ascii_digit()) => s.parse().ok(),
+        _ => None,
     }
 }
 
@@ -460,9 +494,7 @@ pub fn parse_limit(v: Option<&Value>) -> Result<Option<usize>, MailboxError> {
     let parsed = match v {
         None | Some(Value::Null) => return Ok(None),
         Some(Value::String(s)) if s.is_empty() => return Ok(None),
-        Some(Value::Number(n)) => n.as_u64(),
-        Some(Value::String(s)) if s.bytes().all(|b| b.is_ascii_digit()) => s.parse().ok(),
-        Some(_) => None,
+        Some(v) => uint(v),
     };
     parsed
         .filter(|l| *l > 0)
@@ -473,22 +505,13 @@ pub fn parse_limit(v: Option<&Value>) -> Result<Option<usize>, MailboxError> {
 /// The required `room` field: missing or empty is `invalid_room`, a
 /// non-string value is `invalid_body`.
 fn required_room(params: &Value) -> Result<RoomName, MailboxError> {
-    match params.get("room") {
-        None | Some(Value::Null) => RoomName::parse(""),
-        Some(Value::String(raw)) => RoomName::parse(raw),
-        Some(_) => Err(MailboxError::InvalidBody),
-    }
+    required(params.get("room"), RoomName::parse)
 }
 
 /// An optional `room` field: absent, null or `""` -> `None`; a string -> a
 /// validated room name; any other JSON type -> `invalid_body`.
 pub fn optional_room(v: Option<&Value>) -> Result<Option<RoomName>, MailboxError> {
-    match v {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(s)) if s.is_empty() => Ok(None),
-        Some(Value::String(s)) => RoomName::parse(s).map(Some),
-        Some(_) => Err(MailboxError::InvalidBody),
-    }
+    optional(v, RoomName::parse)
 }
 
 /// A bus result as its JSON wire shape.
@@ -535,12 +558,7 @@ pub fn parse_reclaim(v: Option<&Value>) -> Result<bool, MailboxError> {
 /// An optional name field such as `with`: absent, null or `""` -> `None`; a
 /// string -> a validated name; any other JSON type -> `invalid_body`.
 pub fn optional_name(v: Option<&Value>) -> Result<Option<AgentName>, MailboxError> {
-    match v {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(s)) if s.is_empty() => Ok(None),
-        Some(Value::String(s)) => AgentName::parse(s).map(Some),
-        Some(_) => Err(MailboxError::InvalidBody),
-    }
+    optional(v, AgentName::parse)
 }
 
 /// Contract `before` semantics: absent, null or `""` -> `None`; a positive
@@ -550,9 +568,7 @@ pub fn parse_cursor(v: Option<&Value>) -> Result<Option<i64>, MailboxError> {
     let parsed = match v {
         None | Some(Value::Null) => return Ok(None),
         Some(Value::String(s)) if s.is_empty() => return Ok(None),
-        Some(Value::Number(n)) => n.as_i64(),
-        Some(Value::String(s)) if s.bytes().all(|b| b.is_ascii_digit()) => s.parse().ok(),
-        Some(_) => None,
+        Some(v) => uint(v).and_then(|c| i64::try_from(c).ok()),
     };
     parsed
         .filter(|c| *c > 0)
@@ -565,24 +581,10 @@ pub fn parse_cursor(v: Option<&Value>) -> Result<Option<i64>, MailboxError> {
 pub fn parse_wait_ms(v: Option<&Value>) -> Result<u32, MailboxError> {
     let raw = match v {
         None | Some(Value::Null) => return Ok(0),
-        Some(Value::Number(n)) => {
-            return n
-                .as_u64()
-                .filter(|w| *w <= u64::from(crate::bus::MAX_WAIT_MS))
-                .map(|w| w as u32)
-                .ok_or(MailboxError::InvalidWait);
-        }
-        Some(Value::String(s)) => s,
-        Some(_) => return Err(MailboxError::InvalidWait),
+        Some(Value::String(s)) if s.is_empty() => return Ok(0),
+        Some(v) => uint(v),
     };
-    if raw.is_empty() {
-        return Ok(0);
-    }
-    if !raw.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(MailboxError::InvalidWait);
-    }
-    raw.parse::<u32>()
-        .ok()
+    raw.and_then(|w| u32::try_from(w).ok())
         .filter(|w| *w <= crate::bus::MAX_WAIT_MS)
         .ok_or(MailboxError::InvalidWait)
 }

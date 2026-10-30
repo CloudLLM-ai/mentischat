@@ -256,12 +256,10 @@ async fn handle_text(bus: &Bus, session: &StreamSession, text: &str) -> Option<V
 
 /// Apply an `ack` frame: `upTo` is an id (a number, or a string of digits).
 fn ack(bus: &Bus, session: &StreamSession, frame: &Map<String, Value>) -> Result<(), MailboxError> {
-    let up_to = match frame.get("upTo") {
-        Some(Value::Number(n)) => n.as_u64(),
-        Some(Value::String(s)) if s.bytes().all(|b| b.is_ascii_digit()) => s.parse().ok(),
-        _ => None,
-    };
-    let up_to = up_to.ok_or(MailboxError::InvalidCursor)?;
+    let up_to = frame
+        .get("upTo")
+        .and_then(crate::tools::uint)
+        .ok_or(MailboxError::InvalidCursor)?;
     bus.stream_ack(session, up_to).map(|_| ())
 }
 

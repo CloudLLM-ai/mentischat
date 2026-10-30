@@ -12,7 +12,7 @@ filtering; mentischat owns the mailbox semantics.
 ## Design
 
 A **mailbox with a short memory**. Agents register under names they choose,
-mail waits in sqlite until its recipient pulls it, and read mail is kept for a
+mail waits in memory until its recipient pulls it, and read mail is kept for a
 day so either side can look back at the conversation with `history`. Nothing
 outlives the server run.
 
@@ -53,13 +53,14 @@ Key behaviors:
   discards the roster, held names and all mail, read or not, and startup
   does the same to whatever a crashed run left. `MENTISCHAT_PERSIST=1` keeps
   the roster and mail instead.
-- **Nothing left on disk once deleted** — expired, discarded and wiped text is
-  overwritten (`secure_delete`), the write-ahead log is truncated after every
-  deregister, sweep, prune and wipe, and a wipe compacts the file.
+- **Nothing on disk** — the mailbox lives in memory, so expired, discarded and
+  wiped mail has no file to linger in. Only `MENTISCHAT_PERSIST=1` writes
+  anything: a `snapshot.json` (`0600`) on a clean stop, read and deleted at
+  the next start.
 - **Single instance** — binding `127.0.0.1:9480` twice exits non-zero.
-- **Current schema only** — a `pending.sqlite` written by an older build is
+- **Readable snapshot only** — a `snapshot.json` this build cannot read is
   replaced at startup (it would be wiped anyway). With `MENTISCHAT_PERSIST=1`
-  the daemon refuses to start instead and names the files to delete.
+  the daemon refuses to start instead and names the file to delete.
 
 ## Quick start
 
@@ -80,8 +81,9 @@ cargo install --path . --locked && mentischat
 `mentischat` takes no arguments except `--help` and `--version`; anything else
 exits 2.
 
-Mail lives in `~/.cloudllm/mentischat/pending.sqlite` (`0700` dir /
-`0600` file) for at most one server run. Override with `MENTISCHAT_DIR`. The listen address is compile-time
+Mail lives in memory for at most one server run; with `MENTISCHAT_PERSIST=1` a
+clean stop writes it to `~/.cloudllm/mentischat/snapshot.json` (`0700` dir /
+`0600` file). Override the directory with `MENTISCHAT_DIR`. The listen address is compile-time
 fixed to `127.0.0.1:9480`; `MENTISCHAT_PORT` only affects `make stop`.
 
 ## Terminal view
@@ -257,7 +259,7 @@ A failure is `{"error": "<code>", ...context}` with the HTTP status below
 | `roster_full` | 409 | `agents` | The roster holds 256 agents |
 | `too_many_waiters` | 409 | `agent`, `waiting` | That name already has 8 pulls parked |
 | `storage_full` | 507 | `pending` | 8192 unread messages in total (read mail makes room instead of failing a send) |
-| `storage_error` | 500 | | A sqlite failure |
+| `storage_error` | 500 | | A storage failure; the in-memory mailbox does not raise it, the code stays reserved |
 | `shutting_down` | 503 | | The daemon is stopping |
 
 A complete round trip: register two agents, send, pull, look back.
@@ -362,13 +364,12 @@ launchd retries every 30 seconds until the port is free.
 |---|---|
 | `src/main.rs` | Daemon entry: arguments, data directory, startup, graceful shutdown |
 | `src/lib.rs` | Router composition and the loopback guards |
-| `src/bus/` | The mailbox: `mod.rs` (the `Bus` API), `model.rs` (caps and public types), `waiters.rs`, `delivery.rs`, `clock.rs` |
-| `src/store.rs` | SQLite open and schema |
+| `src/bus/` | The mailbox: `mod.rs` (the `Bus` API), `model.rs` (caps and public types), `state.rs` (roster, unread queues, conversation logs), `log.rs`, `park.rs` (blocking pulls), `delivery.rs` (history), `snapshot.rs`, `clock.rs` |
 | `src/rest.rs`, `src/tools.rs` | REST routes and the six MCP tools over the same bus |
 | `src/instructions.rs` | What agents are told when they connect: names, reply markers, when to wait |
 | `src/errors.rs`, `src/names.rs` | Typed mailbox errors; agent-name validation and the suggested names |
 | `src/tui/` | The terminal view: `mod.rs` (dashboard), `banner.rs`, `log_buffer.rs`, `terminal.rs` |
-| `tests/` | `bus`, `names`, `history`, `retention`, `http`, `mcp`, `store`, `tui`; shared helpers in `common/` |
+| `tests/` | `bus`, `names`, `history`, `retention`, `http`, `mcp`, `engine`, `snapshot`, `tui`; shared helpers in `common/` |
 | `launchd/`, `skills/` | Optional launchd service; engineering-style notes |
 | `changelog.txt` | Release notes |
 

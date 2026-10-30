@@ -50,8 +50,9 @@
 //! Names are folded (ASCII-lowercased) for every key and compared without
 //! regard to case; entries keep the spelling they were registered with.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::hash::{BuildHasher, Hasher};
+use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
 
@@ -175,6 +176,28 @@ impl<V: Clone> Sharded<V> {
             .collect()
     }
 
+    /// Every entry whose key `keep` accepts.
+    pub(super) fn entries_where(&self, keep: impl Fn(&str) -> bool) -> Vec<(String, V)> {
+        self.shards
+            .iter()
+            .flat_map(|s| {
+                let map = s.0.read();
+                map.iter()
+                    .filter(|(k, _)| keep(k))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Remove the entry under `key` if `is_it` accepts its value.
+    pub(super) fn remove_if(&self, key: &str, is_it: impl Fn(&V) -> bool) {
+        let mut map = self.shard(key).write();
+        if map.get(key).is_some_and(is_it) {
+            map.remove(key);
+        }
+    }
+
     /// Every value whose key `keep` accepts.
     pub(super) fn values_where(&self, keep: impl Fn(&str) -> bool) -> Vec<V> {
         self.shards
@@ -202,6 +225,15 @@ impl<V: Clone> Sharded<V> {
             }
         }
         best.map(|(_, v)| v)
+    }
+
+    /// Call `visit` on every value, one shard at a time, holding that
+    /// shard's read lock (so `visit` may lock an agent, but not change the
+    /// map).
+    pub(super) fn for_each(&self, mut visit: impl FnMut(&V)) {
+        for shard in self.shards.iter() {
+            shard.0.read().values().for_each(&mut visit);
+        }
     }
 
     pub(super) fn len(&self) -> usize {
@@ -267,6 +299,9 @@ pub(super) struct Agent {
     /// Read time and id of the front of the read queue, [`NEVER`] when it is
     /// empty. Written under the agent's lock, readable without it.
     pub oldest_read: (AtomicU64, AtomicU64),
+    /// Whether the agent is in `State::readers`. Changed only under the
+    /// agent's lock.
+    pub indexed: AtomicBool,
     pub inner: Mutex<AgentState>,
 }
 
@@ -287,6 +322,7 @@ impl Agent {
             gen,
             signal: Arc::new(Signal::default()),
             oldest_read: (AtomicU64::new(NEVER), AtomicU64::new(NEVER)),
+            indexed: AtomicBool::new(false),
             inner: Mutex::new(AgentState {
                 provider,
                 description,
@@ -412,6 +448,9 @@ enum Refused {
     NoRoom,
 }
 
+/// How many roster names an `unregistered` error lists.
+pub(super) const MAX_KNOWN: usize = 256;
+
 /// Mail taken by a pull.
 pub(super) struct Batch {
     /// Direct and room messages together, oldest first.
@@ -430,6 +469,15 @@ pub(super) struct State {
     /// Released names by folded name; also the lock that serializes changes
     /// to the roster's membership.
     pub holds: Mutex<HashMap<String, Hold>>,
+    /// Folded roster names in order, for paging and for the `known` list
+    /// without sorting the roster. Changed under `holds`.
+    pub names: RwLock<BTreeSet<String>>,
+    /// Agents that have read mail, by folded name: the only ones a prune or
+    /// an expiry has to look at (at most [`MAX_TOTAL_MESSAGES`]). Entries
+    /// are added, and removed, under the agent's lock.
+    pub readers: Sharded<Arc<Agent>>,
+    /// Folded room names in order, for paging `list_rooms`.
+    pub room_names: RwLock<BTreeSet<String>>,
     /// Conversations by [`convo_key`].
     pub convos: Sharded<Arc<Convo>>,
     /// Rooms by folded name.
@@ -463,6 +511,9 @@ impl State {
         Self {
             roster: Sharded::new(),
             holds: Mutex::default(),
+            names: RwLock::default(),
+            readers: Sharded::new(),
+            room_names: RwLock::default(),
             convos: Sharded::new(),
             rooms: Sharded::new(),
             room_capacity: super::DEFAULT_ROOM_CAPACITY,
@@ -478,25 +529,45 @@ impl State {
         }
     }
 
-    /// Roster entries sorted by folded name.
+    /// Roster entries sorted by folded name. Walks the whole roster: for
+    /// snapshots, not for requests.
     pub(super) fn agents_sorted(&self) -> Vec<Arc<Agent>> {
         sorted_by_key(self.roster.entries())
     }
 
-    /// Roster names, sorted without regard to case.
-    pub(super) fn names_sorted(&self) -> Vec<String> {
-        self.agents_sorted()
-            .iter()
-            .map(|a| a.name.to_string())
-            .collect()
+    /// Put `agent` on the roster under `key` (a folded name). The caller
+    /// holds `holds`.
+    pub(super) fn add_agent(&self, key: String, agent: Arc<Agent>) {
+        self.names.write().insert(key.clone());
+        self.roster.insert(key, agent);
     }
 
-    /// The `unregistered` error for `name`, with the roster. Takes roster
-    /// locks: call it with none of the later locks held.
+    /// Up to `limit` roster entries after `after` (a folded name; from the
+    /// start for `None`), in name order, and whether more follow. O(limit),
+    /// however large the roster.
+    pub(super) fn agents_page(&self, after: Option<&str>, limit: usize) -> (Vec<Arc<Agent>>, bool) {
+        let lower = after.map_or(Bound::Unbounded, Bound::Excluded);
+        let mut keys: Vec<String> = self
+            .names
+            .read()
+            .range::<str, _>((lower, Bound::Unbounded))
+            .take(limit + 1)
+            .cloned()
+            .collect();
+        let more = keys.len() > limit;
+        keys.truncate(limit);
+        let agents = keys.iter().filter_map(|k| self.roster.get(k)).collect();
+        (agents, more)
+    }
+
+    /// The `unregistered` error for `name`, with the first
+    /// [`MAX_KNOWN`] names on the roster. Takes roster locks: call it with none
+    /// of the later locks held.
     pub(super) fn unregistered(&self, name: &str) -> MailErr {
+        let (agents, _) = self.agents_page(None, MAX_KNOWN);
         MailErr::Unregistered {
             agent: name.to_string(),
-            known: self.names_sorted(),
+            known: agents.iter().map(|a| a.name.to_string()).collect(),
         }
     }
 
@@ -516,24 +587,17 @@ impl State {
         }
     }
 
-    /// Suggested names that are neither on the roster nor held at `now_ms`.
+    /// Suggested names that are neither on the roster nor held at `now_ms`:
+    /// a lookup per suggestion, not a pass over the roster.
     pub(super) fn free_suggestions(
         &self,
         holds: &HashMap<String, Hold>,
         now_ms: u64,
     ) -> Vec<String> {
-        let held = holds
-            .iter()
-            .filter(|(_, h)| h.until_ms > now_ms)
-            .map(|(key, _)| key.clone());
-        let taken: HashSet<String> = self
-            .roster
-            .entries()
-            .into_iter()
-            .map(|(key, _)| key)
-            .chain(held)
-            .collect();
-        crate::names::suggestions(|n| taken.contains(&n.to_ascii_lowercase()))
+        crate::names::suggestions(|n| {
+            let key = n.to_ascii_lowercase();
+            self.roster.get(&key).is_some() || holds.get(&key).is_some_and(|h| h.until_ms > now_ms)
+        })
     }
 
     /// The agent under `key` (a folded name), or `unregistered` for `name`.
@@ -545,18 +609,13 @@ impl State {
     pub(super) fn messages_sent(&self) -> u64 {
         // An agent removed since the snapshot already folded its count into
         // `sent_by_gone`, under the same lock.
-        let live: u64 = self
-            .agents_sorted()
-            .iter()
-            .map(|a| {
-                let st = a.inner.lock();
-                if st.removed {
-                    0
-                } else {
-                    st.sent
-                }
-            })
-            .sum();
+        let mut live = 0;
+        self.roster.for_each(|a| {
+            let st = a.inner.lock();
+            if !st.removed {
+                live += st.sent;
+            }
+        });
         live + self.sent_by_gone.load(Relaxed)
     }
 
@@ -726,7 +785,7 @@ impl State {
     /// sweep. False when no read message is left to delete.
     fn prune_oldest_read(&self) -> bool {
         loop {
-            let oldest = self.roster.min_by_rank(|a| {
+            let oldest = self.readers.min_by_rank(|a| {
                 let read_ms = a.oldest_read.0.load(Relaxed);
                 (read_ms != NEVER).then(|| (read_ms, a.oldest_read.1.load(Relaxed)))
             });
@@ -756,6 +815,8 @@ impl State {
             let convo = self.convo(key);
             let mut log = convo.log.lock();
             if log.retired {
+                drop(log);
+                self.convos.remove_if(key, |c| Arc::ptr_eq(c, &convo));
                 continue;
             }
             let id = self.next_id.0.fetch_add(1, Relaxed);
@@ -789,7 +850,7 @@ impl State {
     /// serialized JSON, the first always included. Taking and marking happen
     /// under the agent's lock in this one call, so a pull hands each message
     /// out exactly once.
-    pub(super) fn pull(&self, agent: &Agent, now_ms: u64) -> Option<Option<Batch>> {
+    pub(super) fn pull(&self, agent: &Arc<Agent>, now_ms: u64) -> Option<Option<Batch>> {
         let mut st = agent.inner.lock();
         if st.removed {
             return None;
@@ -811,7 +872,7 @@ impl State {
     /// `now_ms` and hand it out, oldest first, within the batch caps.
     fn take_direct(
         &self,
-        agent: &Agent,
+        agent: &Arc<Agent>,
         st: &mut AgentState,
         now_ms: u64,
         n: usize,
@@ -826,7 +887,7 @@ impl State {
     /// Move the first `take` unread messages to the read queue.
     fn read_first(
         &self,
-        agent: &Agent,
+        agent: &Arc<Agent>,
         st: &mut AgentState,
         take: usize,
         now_ms: u64,
@@ -837,6 +898,10 @@ impl State {
         }
         st.read.extend(batch.iter().cloned());
         agent.publish_oldest_read(st);
+        if !agent.indexed.swap(true, Relaxed) {
+            self.readers
+                .insert(Key::fold(&agent.name).as_str().to_string(), agent.clone());
+        }
         self.unread.0.fetch_sub(take, Relaxed);
         batch
     }
@@ -847,7 +912,7 @@ impl State {
     /// taken, and its skipped count is reported and reset.
     fn take_merged(
         &self,
-        agent: &Agent,
+        agent: &Arc<Agent>,
         st: &mut AgentState,
         rooms: &[Arc<Room>],
         now_ms: u64,
@@ -906,7 +971,17 @@ impl State {
     /// Delete read mail read before `cutoff_ms`. Returns how many.
     pub(super) fn expire_read(&self, cutoff_ms: u64) -> i64 {
         let mut expired = 0;
-        for (_, agent) in self.roster.entries() {
+        for (key, agent) in self.readers.entries() {
+            if agent.oldest_read.0.load(Relaxed) == NEVER {
+                // Drained since it was indexed: drop it from the index,
+                // unless a pull refilled it first.
+                let st = agent.inner.lock();
+                if st.read.is_empty() {
+                    agent.indexed.store(false, Relaxed);
+                    self.readers.remove_if(&key, |a| Arc::ptr_eq(a, &agent));
+                }
+                continue;
+            }
             if agent.oldest_read.0.load(Relaxed) >= cutoff_ms {
                 continue;
             }
@@ -934,12 +1009,15 @@ impl State {
     pub(super) fn remove_agent(&self, key: &str, until_ms: u64) -> Option<(Arc<Agent>, i64)> {
         let mut holds = self.holds.lock();
         let agent = self.roster.remove(key)?;
+        self.names.write().remove(key);
         let rooms;
         let queued = {
             let mut st = agent.inner.lock();
             st.removed = true;
             st.read.clear();
             agent.publish_oldest_read(&st);
+            agent.indexed.store(false, Relaxed);
+            self.readers.remove(key);
             rooms = std::mem::take(&mut st.rooms);
             self.sent_by_gone.fetch_add(st.sent, Relaxed);
             holds.insert(
@@ -964,28 +1042,25 @@ impl State {
     /// name `key`, and tidy what that leaves behind. Returns how many it
     /// killed.
     fn discard_mail_to(&self, key: &str, gen: u64) -> usize {
-        let convos = self.convos.values_where(|k| convo_has(k, key));
+        let convos = self.convos.entries_where(|k| convo_has(k, key));
         let (mut discarded, mut freed) = (0, 0);
-        for convo in convos {
+        for (convo_key, convo) in convos {
             let mut log = convo.log.lock();
             for msg in log.live().filter(|m| m.to_gen == gen && m.kill()) {
                 discarded += 1;
                 freed += msg.body.len();
             }
             log.compact();
+            log.retired = log.is_empty();
+            let gone = log.retired;
+            drop(log);
+            if gone {
+                self.convos
+                    .remove_if(&convo_key, |c| Arc::ptr_eq(c, &convo));
+            }
         }
-        self.reap_empty_convos();
         self.release_bytes(freed);
         discarded
-    }
-
-    /// Remove the conversations that hold no live message.
-    fn reap_empty_convos(&self) {
-        self.convos.retain(|convo| {
-            let mut log = convo.log.lock();
-            log.retired = log.is_empty();
-            !log.retired
-        });
     }
 
     /// Drop dead entries from every conversation, and the conversations left
@@ -1001,9 +1076,8 @@ impl State {
 
     /// Wake every parked pull: the agents are gone, or the bus closed.
     pub(super) fn wake_all(&self) {
-        for (_, agent) in self.roster.entries() {
-            agent.signal.notify.notify_waiters();
-        }
+        self.roster
+            .for_each(|agent| agent.signal.notify.notify_waiters());
     }
 
     /// Drop everything: roster, mail, holds. Wakes every parked pull (they
@@ -1012,6 +1086,9 @@ impl State {
     pub(super) fn clear(&self) -> (i64, i64) {
         let mut holds = self.holds.lock();
         let agents = self.roster.drain();
+        self.names.write().clear();
+        self.readers.drain();
+        self.room_names.write().clear();
         let counts = (self.total.0.load(Relaxed) as i64, agents.len() as i64);
         for agent in agents {
             let mut st = agent.inner.lock();

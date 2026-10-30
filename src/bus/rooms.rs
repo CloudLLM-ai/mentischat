@@ -22,6 +22,7 @@
 //! still claim a member's name, so it is etiquette, not a security boundary.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ops::Bound;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 
@@ -29,8 +30,10 @@ use parking_lot::Mutex;
 
 use super::log::{Msg, Target};
 use super::park::Signal;
-use super::state::{fitting, sorted_by_key, Agent, Key, State};
-use super::{MailErr, RoomEntry, RoomInfo, MAX_BATCH, MAX_ROOMS};
+use super::state::{fitting, Agent, Key, State};
+use super::{
+    MailErr, RoomEntry, RoomInfo, MAX_BATCH, MAX_ROOMS, MAX_ROOMS_PER_AGENT, MAX_ROOM_MEMBERS,
+};
 use crate::names::RoomName;
 
 /// One agent's place in a room.
@@ -215,6 +218,12 @@ impl State {
                 rooms: self.rooms.len() as i64,
             });
         }
+        if agent.inner.lock().rooms.len() >= MAX_ROOMS_PER_AGENT {
+            return Err(MailErr::TooManyRooms {
+                agent: agent.name.to_string(),
+                rooms: MAX_ROOMS_PER_AGENT as i64,
+            });
+        }
         let made = Arc::new(Room {
             name: room.as_str().into(),
             private,
@@ -227,11 +236,25 @@ impl State {
             st.members
                 .insert(Key::fold(&agent.name).as_str().to_string(), member);
         }
-        self.rooms
-            .try_insert(&room.folded(), made.clone())
-            .map_err(|_| MailErr::RoomExists {
-                room: room.to_string(),
-            })?;
+        let key = room.folded();
+        loop {
+            match self.rooms.try_insert(&key, made.clone()) {
+                Ok(()) => break,
+                Err(_) => match self.rooms.get(&key) {
+                    // A room deleted a moment ago that has not left the map
+                    // yet is not a name in use.
+                    Some(old) if old.inner.lock().retired => {
+                        self.rooms.remove_if(&key, |r| Arc::ptr_eq(r, &old));
+                    }
+                    _ => {
+                        return Err(MailErr::RoomExists {
+                            room: room.to_string(),
+                        })
+                    }
+                },
+            }
+        }
+        self.room_names.write().insert(key);
         self.remember_room(agent, &made);
         let info = made.inner.lock().info(&made);
         Ok(info)
@@ -254,6 +277,18 @@ impl State {
                 });
             }
             if !st.members.contains_key(key.as_str()) {
+                if st.members.len() >= MAX_ROOM_MEMBERS {
+                    return Err(MailErr::RoomFull {
+                        room: found.name.to_string(),
+                        members: st.members.len() as i64,
+                    });
+                }
+                if agent.inner.lock().rooms.len() >= MAX_ROOMS_PER_AGENT {
+                    return Err(MailErr::TooManyRooms {
+                        agent: agent.name.to_string(),
+                        rooms: MAX_ROOMS_PER_AGENT as i64,
+                    });
+                }
                 if found.private && !st.invited.remove(key.as_str()) {
                     return Err(MailErr::PrivateRoom {
                         room: found.name.to_string(),
@@ -306,7 +341,7 @@ impl State {
         };
         agent.inner.lock().rooms.retain(|r| !Arc::ptr_eq(r, &found));
         if emptied {
-            self.reap_empty_rooms();
+            self.reap_room(&found);
         }
         Ok(emptied)
     }
@@ -315,28 +350,32 @@ impl State {
     /// the agent held, taken under its lock; none is held here.
     pub(super) fn leave_all_rooms(&self, agent: &Agent, rooms: Vec<Arc<Room>>) {
         let key = Key::fold(&agent.name);
-        let mut emptied = false;
         for room in rooms {
-            let mut st = room.inner.lock();
-            if st.members.remove(key.as_str()).is_some() {
-                emptied |= st.members.is_empty();
+            let emptied = {
+                let mut st = room.inner.lock();
+                st.members.remove(key.as_str()).is_some() && st.members.is_empty()
+            };
+            if emptied {
+                self.reap_room(&room);
             }
-        }
-        if emptied {
-            self.reap_empty_rooms();
         }
     }
 
-    /// Remove the rooms that have no members.
-    pub(super) fn reap_empty_rooms(&self) {
-        self.rooms.retain(|room| {
+    /// Delete `room` if it has no members: retire it, give its bytes back and
+    /// take it out of the maps. Looks at this room only, so deleting rooms
+    /// costs the same however many exist.
+    fn reap_room(&self, room: &Arc<Room>) {
+        {
             let mut st = room.inner.lock();
-            st.retired = st.members.is_empty();
-            if st.retired {
-                self.release_bytes(st.log.iter().map(|m| m.body.len()).sum());
+            if !st.members.is_empty() || st.retired {
+                return;
             }
-            !st.retired
-        });
+            st.retired = true;
+            self.release_bytes(st.log.iter().map(|m| m.body.len()).sum());
+        }
+        let key = Key::fold(&room.name);
+        self.rooms.remove_if(key.as_str(), |r| Arc::ptr_eq(r, room));
+        self.room_names.write().remove(key.as_str());
     }
 
     /// Note on the agent that it is in `room`, so a pull knows where to look.
@@ -437,30 +476,59 @@ impl State {
 
     /// The rooms `agent` can see: every public room, and the private ones it
     /// is in or was invited to.
-    pub(super) fn list_rooms(&self, agent: &Agent) -> Vec<RoomEntry> {
+    pub(super) fn list_rooms(
+        &self,
+        agent: &Agent,
+        after: Option<&str>,
+        limit: usize,
+    ) -> (Vec<RoomEntry>, bool) {
         let key = Key::fold(&agent.name);
         let mut entries = Vec::new();
-        for (folded, room) in self.rooms.entries() {
-            let st = room.inner.lock();
-            let member = st.members.get(key.as_str());
-            if st.retired
-                || (room.private && member.is_none() && !st.invited.contains(key.as_str()))
-            {
-                continue;
-            }
-            entries.push((
-                folded,
-                RoomEntry {
+        let mut cursor: Option<String> = after.map(str::to_string);
+        // Walk the name index in chunks until a page of visible rooms is
+        // found; private rooms the agent cannot see are skipped.
+        loop {
+            let chunk: Vec<String> = {
+                let names = self.room_names.read();
+                let from = cursor.as_deref();
+                let bound = from.map_or(Bound::Unbounded, Bound::Excluded);
+                names
+                    .range::<str, _>((bound, Bound::Unbounded))
+                    .take(limit + 1)
+                    .cloned()
+                    .collect()
+            };
+            let Some(last) = chunk.last().cloned() else {
+                return (entries, false);
+            };
+            let exhausted = chunk.len() <= limit;
+            for folded in chunk {
+                let Some(room) = self.rooms.get(&folded) else {
+                    continue;
+                };
+                let st = room.inner.lock();
+                let member = st.members.get(key.as_str());
+                let hidden = room.private && member.is_none() && !st.invited.contains(key.as_str());
+                if st.retired || hidden {
+                    continue;
+                }
+                if entries.len() == limit {
+                    return (entries, true);
+                }
+                entries.push(RoomEntry {
                     room: room.name.to_string(),
                     description: room.description.clone(),
                     private: room.private,
                     members: st.members.len(),
                     joined: member.is_some(),
                     unread: member.map_or(0, |m| m.unread),
-                },
-            ));
+                });
+            }
+            if exhausted {
+                return (entries, false);
+            }
+            cursor = Some(last);
         }
-        sorted_by_key(entries)
     }
 
     /// One page of the retained messages of `room`, for a member: the

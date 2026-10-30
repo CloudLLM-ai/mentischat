@@ -180,12 +180,32 @@ fn metadata_for(tool_name: &str) -> Option<ToolMetadata> {
                 "list_rooms",
                 "Rooms you can see: every public room, and the private ones you are in or were invited to. Each has its description, how many members it has, whether you have joined, and how many of its messages you have not read yet.",
             )
-            .with_parameter(str_param("agent", "Your registered name")),
+            .with_parameter(str_param("agent", "Your registered name"))
+            .with_parameter(
+                ToolParameter::new("after", ToolParameterType::String).with_description(
+                    "The next value from a previous list_rooms reply, for the following page; omit for the first",
+                ),
+            )
+            .with_parameter(
+                ToolParameter::new("limit", ToolParameterType::Integer)
+                    .with_description("Rooms per page, 1-256 (default 256)"),
+            ),
         ),
-        "list_agents" => Some(ToolMetadata::new(
-            "list_agents",
-            "Names on the roster, each with its provider, description, when it was last seen, and how many unread messages are queued for it, plus suggestions: free names you can register. Call before register and before send_message.",
-        )),
+        "list_agents" => Some(
+            ToolMetadata::new(
+                "list_agents",
+                "Names on the roster, each with its provider, description, when it was last seen, and how many unread messages are queued for it, plus suggestions: free names you can register. Call before register and before send_message. A long roster comes in pages of up to 256: when the reply has next, pass it as after for the following page.",
+            )
+            .with_parameter(
+                ToolParameter::new("after", ToolParameterType::String).with_description(
+                    "The next value from a previous list_agents reply, for the following page; omit for the first",
+                ),
+            )
+            .with_parameter(
+                ToolParameter::new("limit", ToolParameterType::Integer)
+                    .with_description("Agents per page, 1-256 (default 256)"),
+            ),
+        ),
         _ => None,
     }
 }
@@ -218,7 +238,7 @@ impl ToolProtocol for MailboxProtocol {
             "send_message" => send_message(bus, &parameters).await,
             "check_inbox" => check_inbox(bus, &parameters).await,
             "history" => history(bus, &parameters).await,
-            "list_agents" => bus.list_agents().await.map(to_wire),
+            "list_agents" => list_agents(bus, &parameters).await,
             "create_room" => create_room(bus, &parameters).await,
             "join_room" => join_room(bus, &parameters).await,
             "invite" => invite(bus, &parameters).await,
@@ -378,10 +398,40 @@ pub async fn leave_room(bus: &Bus, params: &Value) -> Result<Value, MailboxError
     Ok(to_wire(bus.leave_room(&agent, &room).await?))
 }
 
-/// List rooms per the tool and `GET /rooms?agent=` contract.
+/// List rooms per the tool and `GET /rooms?agent=` contract: `agent` is
+/// required; `after` (a previous page's `next`) and `limit` are optional.
 pub async fn list_rooms(bus: &Bus, params: &Value) -> Result<Value, MailboxError> {
     let agent = required_name(params, "agent")?;
-    Ok(to_wire(bus.list_rooms(&agent).await?))
+    let after = optional_room(params.get("after"))?;
+    let limit = parse_limit(params.get("limit"))?;
+    Ok(to_wire(
+        bus.list_rooms_page(&agent, after.as_ref(), limit).await?,
+    ))
+}
+
+/// List agents per the tool and `GET /agents` contract: `after` (a previous
+/// page's `next`) and `limit` are optional.
+pub async fn list_agents(bus: &Bus, params: &Value) -> Result<Value, MailboxError> {
+    let after = optional_name(params.get("after"))?;
+    let limit = parse_limit(params.get("limit"))?;
+    Ok(to_wire(bus.list_agents_page(after.as_ref(), limit).await?))
+}
+
+/// A page `limit`: absent, null or `""` -> the largest page; a positive
+/// integer, or a string of digits holding one -> its value (the bus caps it
+/// at [`crate::bus::MAX_PAGE`]); anything else -> `invalid_body`.
+pub fn parse_limit(v: Option<&Value>) -> Result<usize, MailboxError> {
+    let parsed = match v {
+        None | Some(Value::Null) => return Ok(crate::bus::MAX_PAGE),
+        Some(Value::String(s)) if s.is_empty() => return Ok(crate::bus::MAX_PAGE),
+        Some(Value::Number(n)) => n.as_u64(),
+        Some(Value::String(s)) if s.bytes().all(|b| b.is_ascii_digit()) => s.parse().ok(),
+        Some(_) => None,
+    };
+    parsed
+        .filter(|l| *l > 0)
+        .map(|l| usize::try_from(l).unwrap_or(usize::MAX))
+        .ok_or(MailboxError::InvalidBody)
 }
 
 /// The required `room` field: missing or empty is `invalid_room`, a

@@ -54,6 +54,7 @@ pub use model::{
     LeaveOutcome, RoomEntry, RoomInfo, RoomListing, DEFAULT_ROOM_CAPACITY, MAX_RETAINED_BYTES,
     MAX_ROOMS,
 };
+pub use model::{MAX_OVERVIEW_AGENTS, MAX_PAGE, MAX_ROOMS_PER_AGENT, MAX_ROOM_MEMBERS};
 pub use snapshot::{remove_snapshot, SnapshotError};
 
 use clock::{now_ms, rfc3339_ms, unix_ms};
@@ -243,7 +244,7 @@ impl Bus {
             now,
         );
         let outcome = register_outcome(&agent, true);
-        state.roster.insert(key.clone(), Arc::new(agent));
+        state.add_agent(key.clone(), Arc::new(agent));
         holds.remove(&key);
         Ok(outcome)
     }
@@ -268,12 +269,23 @@ impl Bus {
     /// description and unread count, plus free names to suggest. Read-only:
     /// does not touch `last_seen`.
     pub async fn list_agents(&self) -> Result<RosterListing, MailErr> {
+        self.list_agents_page(None, MAX_PAGE).await
+    }
+
+    /// One page of [`list_agents`](Self::list_agents): up to `limit` (at most
+    /// [`MAX_PAGE`], at least 1) agents after `after`, which is the `next` of
+    /// the previous page. Costs O(limit), however large the roster, and
+    /// `next` is present when more follow.
+    pub async fn list_agents_page(
+        &self,
+        after: Option<&AgentName>,
+        limit: usize,
+    ) -> Result<RosterListing, MailErr> {
         let state = self.open()?;
-        let rows: Vec<_> = state
-            .agents_sorted()
-            .iter()
-            .map(|a| roster_row(state, a))
-            .collect();
+        let after = after.map(AgentName::folded);
+        let (page, more) = state.agents_page(after.as_deref(), limit.clamp(1, MAX_PAGE));
+        let rows: Vec<_> = page.iter().map(|a| roster_row(state, a)).collect();
+        let next = more.then(|| rows.last().map(|r| r.name.clone())).flatten();
         let suggestions = state.free_suggestions(&state.holds.lock(), now_ms());
         let agents = rows
             .into_iter()
@@ -287,12 +299,13 @@ impl Bus {
             .collect();
         Ok(RosterListing {
             agents,
+            next,
             suggestions,
         })
     }
 
-    /// The roster with each agent's provider, description, unread count and
-    /// last-seen age, plus the number of messages sent since the daemon
+    /// The first [`MAX_OVERVIEW_AGENTS`] agents of the roster, with each
+    /// agent's provider, description, unread count and last-seen age, plus the number of messages sent since the daemon
     /// started, for the operator terminal view.
     ///
     /// Shares its rows with [`list_agents`](Self::list_agents); this shape
@@ -307,7 +320,8 @@ impl Bus {
         let now = now_ms();
         let state = self.open()?;
         let agents = state
-            .agents_sorted()
+            .agents_page(None, MAX_OVERVIEW_AGENTS)
+            .0
             .iter()
             .map(|a| roster_row(state, a))
             .map(|row| AgentOverview {
@@ -580,10 +594,23 @@ impl Bus {
     /// The rooms `agent` can see: every public room, and the private ones it
     /// is in or was invited to, sorted by name.
     pub async fn list_rooms(&self, agent: &AgentName) -> Result<RoomListing, MailErr> {
+        self.list_rooms_page(agent, None, MAX_PAGE).await
+    }
+
+    /// One page of [`list_rooms`](Self::list_rooms): up to `limit` (at most
+    /// [`MAX_PAGE`], at least 1) rooms after `after`, the `next` of the
+    /// previous page.
+    pub async fn list_rooms_page(
+        &self,
+        agent: &AgentName,
+        after: Option<&RoomName>,
+        limit: usize,
+    ) -> Result<RoomListing, MailErr> {
         let (state, agent) = self.active(agent)?;
-        Ok(RoomListing {
-            rooms: state.list_rooms(&agent),
-        })
+        let after = after.map(RoomName::folded);
+        let (rooms, more) = state.list_rooms(&agent, after.as_deref(), limit.clamp(1, MAX_PAGE));
+        let next = more.then(|| rooms.last().map(|r| r.room.clone())).flatten();
+        Ok(RoomListing { rooms, next })
     }
 
     /// Send `body` to every other member of `room`, which `from` must be in.

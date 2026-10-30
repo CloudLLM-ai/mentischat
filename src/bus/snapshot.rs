@@ -274,7 +274,7 @@ fn rebuild(snapshot: Snapshot) -> State {
             rec.registered_ms,
             rec.last_seen_ms,
         );
-        state.roster.insert(key, Arc::new(agent));
+        state.add_agent(key, Arc::new(agent));
     }
     {
         let mut holds = state.holds.lock();
@@ -313,6 +313,9 @@ fn rebuild(snapshot: Snapshot) -> State {
             let mut st = agent.inner.lock();
             st.read.push_back(msg);
             agent.publish_oldest_read(&st);
+            if !agent.indexed.swap(true, Relaxed) {
+                state.readers.insert(key.clone(), agent.clone());
+            }
         }
     }
     state
@@ -437,5 +440,7 @@ fn restore_room(state: &State, rec: RoomRec) {
     }
     let key = name.to_ascii_lowercase();
     // A duplicate room name in a hand-edited snapshot keeps the first.
-    let _ = state.rooms.try_insert(&key, room);
+    if state.rooms.try_insert(&key, room).is_ok() {
+        state.room_names.write().insert(key);
+    }
 }

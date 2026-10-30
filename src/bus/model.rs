@@ -23,7 +23,7 @@ pub const MAX_WAIT_MS: u32 = 30_000;
 /// Max parked pulls per name; an additional park fails.
 pub const MAX_WAITERS_PER_AGENT: usize = 8;
 /// Cap on roster rows — bounds the number of parked pulls (8 per name).
-pub const MAX_ROSTER: i64 = 256;
+pub const MAX_ROSTER: i64 = 65_536;
 /// Budget for the message bodies the daemon holds at once, direct and room
 /// together (256 MiB). A send that would pass it first makes room the same way
 /// the message cap does (a direct send deletes the oldest read message, a
@@ -36,7 +36,18 @@ pub const MAX_RETAINED_BYTES: usize = 256 * 1024 * 1024;
 pub const DEFAULT_ROOM_CAPACITY: usize = 1024;
 /// Cap on rooms: bounds the memory rooms can hold, as [`MAX_ROSTER`] bounds
 /// the roster.
-pub const MAX_ROOMS: usize = 256;
+pub const MAX_ROOMS: usize = 65_536;
+/// Cap on the rooms one agent is in; a further `create_room` or `join_room`
+/// fails `too_many_rooms`.
+pub const MAX_ROOMS_PER_AGENT: usize = 256;
+/// Cap on the members of one room: a send touches every member, so this
+/// bounds what one send costs. A further `join_room` fails `room_full`.
+pub const MAX_ROOM_MEMBERS: usize = 1024;
+/// Most entries `list_agents` and `list_rooms` return in one page, and the
+/// default; ask for the next page with `after`.
+pub const MAX_PAGE: usize = 256;
+/// Most rows the terminal view reads from the roster.
+pub const MAX_OVERVIEW_AGENTS: usize = 1024;
 /// Default time a read message is kept after it was read.
 const DEFAULT_READ_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Default time an agent stays on the roster without a `register`,
@@ -142,8 +153,11 @@ pub struct RosterEntry {
 /// Wire shape of `list_agents`: the roster and some names free to take.
 #[derive(Debug, Clone, Serialize)]
 pub struct RosterListing {
-    /// Registered agents, sorted by name.
+    /// Registered agents, sorted by name: one page of at most [`MAX_PAGE`].
     pub agents: Vec<RosterEntry>,
+    /// Present when more agents follow: pass it as `after` for the next page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
     /// Up to [`crate::names::SUGGESTION_COUNT`] names from
     /// [`crate::names::SUGGESTED_NAMES`] that are neither registered nor held.
     pub suggestions: Vec<String>,
@@ -265,8 +279,11 @@ pub struct RoomEntry {
 /// in or was invited to, sorted by name.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RoomListing {
-    /// The rooms the asking agent can see.
+    /// The rooms the asking agent can see, one page of at most [`MAX_PAGE`].
     pub rooms: Vec<RoomEntry>,
+    /// Present when more rooms follow: pass it as `after` for the next page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
 }
 
 /// Wire shape of `leave_room`.

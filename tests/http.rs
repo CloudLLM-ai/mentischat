@@ -565,3 +565,59 @@ async fn room_errors_map_to_contract_statuses() {
         );
     }
 }
+
+#[tokio::test]
+async fn agents_and_rooms_list_in_pages_over_rest() {
+    let (_d, mut app) = app();
+    for i in 0..5 {
+        send(&mut app, post("/agents", &format!(r#"{{"agent":"n{i}"}}"#))).await;
+    }
+    let (s, page) = send(&mut app, req("GET", "/agents?limit=2")).await;
+    assert_eq!(s, 200);
+    assert_eq!(page["agents"].as_array().unwrap().len(), 2);
+    assert_eq!(page["next"], "n1");
+    let (_, page) = send(&mut app, req("GET", "/agents?limit=2&after=n1")).await;
+    assert_eq!(page["agents"][0]["name"], "n2");
+    let (_, last) = send(&mut app, req("GET", "/agents?after=n3")).await;
+    assert_eq!(last["agents"].as_array().unwrap().len(), 1);
+    assert!(last.get("next").is_none());
+    for bad in ["limit=0", "limit=x", "limit=-1", "after=-x"] {
+        let (s, v) = send(&mut app, req("GET", &format!("/agents?{bad}"))).await;
+        assert_eq!(s, 400, "{bad}: {v}");
+    }
+
+    for i in 0..3 {
+        send(
+            &mut app,
+            post("/rooms", &format!(r#"{{"agent":"n0","room":"r{i}"}}"#)),
+        )
+        .await;
+    }
+    let (_, page) = send(&mut app, req("GET", "/rooms?agent=n1&limit=2")).await;
+    assert_eq!(page["rooms"].as_array().unwrap().len(), 2);
+    assert_eq!(page["next"], "r1");
+    let (_, page) = send(&mut app, req("GET", "/rooms?agent=n1&limit=2&after=r1")).await;
+    assert_eq!(page["rooms"][0]["room"], "r2");
+    assert!(page.get("next").is_none());
+}
+
+#[tokio::test]
+async fn room_size_limits_are_conflicts_over_rest() {
+    let (_d, mut app) = app();
+    send(&mut app, post("/agents", r#"{"agent":"a"}"#)).await;
+    for i in 0..256 {
+        let (s, _) = send(
+            &mut app,
+            post("/rooms", &format!(r#"{{"agent":"a","room":"r{i}"}}"#)),
+        )
+        .await;
+        assert_eq!(s, 200);
+    }
+    let (s, v) = send(&mut app, post("/rooms", r#"{"agent":"a","room":"extra"}"#)).await;
+    assert_eq!(
+        (s, v["error"].as_str()),
+        (409, Some("too_many_rooms")),
+        "{v}"
+    );
+    assert_eq!(v["rooms"], 256);
+}

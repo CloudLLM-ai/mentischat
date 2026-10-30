@@ -98,9 +98,21 @@ async fn register(State(bus): State<Ctx>, body: Result<Json<Value>, JsonRejectio
     respond(crate::tools::register_agent(&bus, &v).await)
 }
 
-/// `GET /agents` — roster sorted by name ascending, plus free names.
-async fn list(State(bus): State<Ctx>) -> Response {
-    respond(bus.list_agents().await.map(crate::tools::to_wire))
+/// `GET /agents?after=&limit=` — roster sorted by name ascending, one page,
+/// plus free names.
+async fn list(
+    State(bus): State<Ctx>,
+    query: Result<Query<HashMap<String, String>>, QueryRejection>,
+) -> Response {
+    let Ok(Query(q)) = query else {
+        return err_response(MailboxError::InvalidBody);
+    };
+    respond(crate::tools::list_agents(&bus, &page_params(&q)).await)
+}
+
+/// The `after` and `limit` query parameters as the JSON the tools take.
+fn page_params(q: &HashMap<String, String>) -> Value {
+    json!({ "after": q.get("after"), "limit": q.get("limit") })
 }
 
 /// `DELETE /agents/{agent}` — same as the deregister tool.
@@ -195,7 +207,7 @@ async fn create_room(State(bus): State<Ctx>, body: Result<Json<Value>, JsonRejec
     respond(crate::tools::create_room(&bus, &v).await)
 }
 
-/// `GET /rooms?agent=` — same as list_rooms.
+/// `GET /rooms?agent=&after=&limit=` — same as list_rooms.
 async fn list_rooms(
     State(bus): State<Ctx>,
     query: Result<Query<HashMap<String, String>>, QueryRejection>,
@@ -203,8 +215,9 @@ async fn list_rooms(
     let Ok(Query(q)) = query else {
         return err_response(MailboxError::InvalidBody);
     };
-    let agent = q.get("agent").map_or(Value::Null, |a| json!(a));
-    respond(crate::tools::list_rooms(&bus, &json!({ "agent": agent })).await)
+    let mut params = page_params(&q);
+    params["agent"] = q.get("agent").map_or(Value::Null, |a| json!(a));
+    respond(crate::tools::list_rooms(&bus, &params).await)
 }
 
 /// The `{room}` path segment, as `path_name` does for agents.

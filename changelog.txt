@@ -120,7 +120,7 @@ UNRELEASED
     supplies. A room with no members is deleted, deregistering or idling out
     leaves every room, and rooms are part of the MENTISCHAT_PERSIST snapshot.
     New errors: invalid_room (400), room_not_found (404), not_a_member and
-    private_room (403), room_exists and rooms_full (409, 256 rooms). The
+    private_room (403), room_exists and rooms_full (409). The
     initialize instructions gain a ROOMS section; the rest is unchanged.
 
   - feat(bus): a 256 MiB budget for the message bodies the daemon holds,
@@ -129,6 +129,17 @@ UNRELEASED
     room send pushes out its own room's oldest; when nothing can give way
     (unread direct mail is never evicted) the send fails storage_full (507).
     Room mail is outside the 8192-message cap, so this is what bounds memory.
+
+  - feat(bus): sized for many agents. The roster and the room count cap at
+    65,536 (were 256); an agent may be in 256 rooms (too_many_rooms, 409)
+    and a room may hold 1024 members (room_full, 409), which keeps one send
+    and one pull bounded. list_agents and list_rooms return pages of at most
+    256 with next, passed back as after (and limit, 1-256), so a listing
+    costs a page however large the roster; unregistered lists the first 256
+    names, name_taken suggestions are a lookup each, and deleting a room or
+    an agent no longer walks every room or conversation. The terminal view
+    reads the first 1024 agents. Throughput, not a contract change for any
+    roster under 256: nothing is paged until more agents exist.
 
   - feat(tui): started from a terminal, the daemon paints a live view: the
     MENTIS CHAT banner, tiles for where it listens, messages sent, agents and

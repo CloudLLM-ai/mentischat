@@ -71,6 +71,10 @@ pub enum MailboxError {
     PrivateRoom { room: String },
     /// The daemon already holds [`crate::bus::MAX_ROOMS`] rooms.
     RoomsFull { rooms: i64 },
+    /// The agent is in [`crate::bus::MAX_ROOMS_PER_AGENT`] rooms already.
+    TooManyRooms { agent: String, rooms: i64 },
+    /// The room holds [`crate::bus::MAX_ROOM_MEMBERS`] members already.
+    RoomFull { room: String, members: i64 },
     /// REST path that is not a known route.
     NotFound,
     /// Known REST path, HTTP method it does not serve.
@@ -101,6 +105,8 @@ impl MailboxError {
             Self::NotAMember { .. } => "not_a_member",
             Self::PrivateRoom { .. } => "private_room",
             Self::RoomsFull { .. } => "rooms_full",
+            Self::TooManyRooms { .. } => "too_many_rooms",
+            Self::RoomFull { .. } => "room_full",
             Self::NotFound => "not_found",
             Self::MethodNotAllowed => "method_not_allowed",
             Self::ShuttingDown => "shutting_down",
@@ -127,6 +133,8 @@ impl MailboxError {
             | Self::RosterFull { .. }
             | Self::RoomExists { .. }
             | Self::RoomsFull { .. }
+            | Self::TooManyRooms { .. }
+            | Self::RoomFull { .. }
             | Self::NameTaken { .. } => StatusCode::CONFLICT,
             Self::StorageFull { .. } => StatusCode::INSUFFICIENT_STORAGE,
             Self::StorageError => StatusCode::INTERNAL_SERVER_ERROR,
@@ -181,6 +189,12 @@ impl MailboxError {
                 json!({ "error": self.code(), "agent": agent, "room": room })
             }
             Self::RoomsFull { rooms } => json!({ "error": self.code(), "rooms": rooms }),
+            Self::TooManyRooms { agent, rooms } => {
+                json!({ "error": self.code(), "agent": agent, "rooms": rooms })
+            }
+            Self::RoomFull { room, members } => {
+                json!({ "error": self.code(), "room": room, "members": members })
+            }
             Self::NotFound | Self::MethodNotAllowed => json!({ "error": self.code() }),
             Self::ShuttingDown => json!({ "error": self.code() }),
         }

@@ -665,7 +665,8 @@ async fn room_tools_describe_themselves_with_primitive_schemas() {
     assert_eq!(props("join_room"), ["agent", "room"]);
     assert_eq!(props("invite"), ["agent", "invitee", "room"]);
     assert_eq!(props("leave_room"), ["agent", "room"]);
-    assert_eq!(props("list_rooms"), ["agent"]);
+    assert_eq!(props("list_rooms"), ["after", "agent", "limit"]);
+    assert_eq!(props("list_agents"), ["after", "limit"]);
     assert_eq!(props("send_message"), ["body", "from", "room", "to"]);
     assert_eq!(
         tool("send_message")["inputSchema"]["required"],

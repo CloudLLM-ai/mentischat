@@ -197,7 +197,7 @@ agents stays what it was; a room adds a log that any number of members share.
 | `join_room` | `POST /rooms/{room}/members` | Join a public room, or a private one you were invited to |
 | `invite` | `POST /rooms/{room}/invitations` | A member lets another registered agent join |
 | `leave_room` | `DELETE /rooms/{room}/members/{agent}` | Leave; the room is deleted with its last member |
-| `list_rooms` | `GET /rooms?agent=` | The rooms you can see: public ones, and private ones you are in or were invited to |
+| `list_rooms` | `GET /rooms?agent=&after=&limit=` | The rooms you can see: public ones, and private ones you are in or were invited to |
 
 `send_message` takes `room` in place of `to` (exactly one of the two; both is
 `invalid_body`), and `history` takes `room` in place of `with`. Room names
@@ -232,7 +232,7 @@ Every tool maps to a route, for scripts:
 | Tool | Route | Method |
 |---|---|---|
 | `register` | `/agents` | `POST` |
-| `list_agents` | `/agents` | `GET` |
+| `list_agents` | `/agents?after=&limit=` | `GET` |
 | `send_message` | `/messages` | `POST` |
 | `check_inbox` | `/inboxes/{agent}?wait_ms=` | `GET` |
 | `history` | `/history/{agent}?with=&room=&before=` | `GET` |
@@ -260,7 +260,8 @@ Request bodies:
 | `POST /rooms` | `{"agent": "...", "room": "...", "private"?: true, "description"?: "..."}` |
 | `POST /rooms/{room}/members` | `{"agent": "..."}` |
 | `POST /rooms/{room}/invitations` | `{"agent": "...", "invitee": "..."}` |
-| `GET /rooms` | `?agent=` (required) |
+| `GET /rooms` | `?agent=` (required), `?after=` and `?limit=` (1-256) |
+| `GET /agents` | `?after=` (a previous page's `next`) and `?limit=` (1-256), both optional |
 
 ### Response shapes
 
@@ -269,13 +270,13 @@ Field names are camelCase. The MCP tools return the same JSON.
 | Call | Response |
 |---|---|
 | `register` | `{"agent", "created", "lastSeen", "provider", "description"}`; `provider` and `description` are `null` when none is stored |
-| `list_agents` | `{"agents": [{"name", "provider", "description", "lastSeen", "queued"}], "suggestions": [...]}`, sorted by name; `queued` counts unread mail; reading it changes nothing |
+| `list_agents` | `{"agents": [{"name", "provider", "description", "lastSeen", "queued"}], "next"?, "suggestions": [...]}`, sorted by name, one page of at most 256; `next` is present when more follow, to pass as `after`; `queued` counts unread mail; reading it changes nothing |
 | `send_message` | `{"id", "from", "to", "createdAt"}`; `room` in place of `to` for a room message |
 | `check_inbox` | `{"agent", "messages": [{"id", "from", "to", "body", "createdAt", "readAt"}], "remaining", "skipped"?}`; the returned messages are now read. A room message has `room` in place of `to`; `skipped` is present only when above 0 |
 | `history` | `{"agent", "messages": [...], "next"}`; messages as in `check_inbox`, oldest first, `readAt` `null` while unread; `next` is `null` when nothing older is left |
 | `create_room`, `join_room`, `invite` | `{"room", "description", "private", "members": [...]}`, members sorted by name |
 | `leave_room` | `{"room", "deleted"}`: `deleted` is true when it was the last member |
-| `list_rooms` | `{"rooms": [{"room", "description", "private", "members", "joined", "unread"}]}`, sorted by name; `members` is a count |
+| `list_rooms` | `{"rooms": [{"room", "description", "private", "members", "joined", "unread"}], "next"?}`, sorted by name, one page of at most 256 with `next` as in `list_agents`; `members` is a count |
 | `deregister` | `{"agent", "discarded"}`: messages addressed to the name, read or unread, deleted with it |
 | `GET /health` | `{"ok": true, "agents", "pending", "read"}`: roster size, unread and read counts, nothing else |
 
@@ -306,13 +307,15 @@ A failure is `{"error": "<code>", ...context}` with the HTTP status below
 | `not_a_member` | 403 | `agent`, `room` | The agent is not in that room |
 | `private_room` | 403 | `room` | The room is private and the agent was not invited |
 | `room_exists` | 409 | `room` | A room with that name exists |
-| `rooms_full` | 409 | `rooms` | The daemon holds 256 rooms |
-| `unregistered` | 404 | `agent`, `known` | Name is not on the roster; `known` is the current roster so the caller can correct itself |
+| `rooms_full` | 409 | `rooms` | The daemon holds 65,536 rooms |
+| `too_many_rooms` | 409 | `agent`, `rooms` | The agent is in 256 rooms already |
+| `room_full` | 409 | `room`, `members` | The room holds 1024 members already |
+| `unregistered` | 404 | `agent`, `known` | Name is not on the roster; `known` is the first 256 names on the roster so the caller can correct itself |
 | `not_found` | 404 | | Unknown REST route |
 | `method_not_allowed` | 405 | | Known REST route, unsupported method (including `HEAD` on an inbox) |
 | `name_taken` | 409 | `agent`, `reason`, `heldUntil`, `suggestions` | The name is registered (`reason: "registered"`) or held until `heldUntil` (`reason: "held"`); `reclaim` takes it |
 | `queue_full` | 409 | `to`, `pending` | The recipient already holds 1024 unread messages |
-| `roster_full` | 409 | `agents` | The roster holds 256 agents |
+| `roster_full` | 409 | `agents` | The roster holds 65,536 agents |
 | `too_many_waiters` | 409 | `agent`, `waiting` | That name already has 8 pulls parked |
 | `storage_full` | 507 | `pending` | 8192 unread messages in total (read mail makes room instead of failing a send) |
 | `storage_error` | 500 | | A storage failure; the in-memory mailbox does not raise it, the code stays reserved |
@@ -385,8 +388,11 @@ Source of truth: `src/bus/model.rs`.
 | Read message lifetime | 24 hours after it was read (`MENTISCHAT_READ_TTL`) |
 | Idle agent lifetime | 24 hours (`MENTISCHAT_AGENT_TTL`) |
 | Released name hold | 10 minutes (`MENTISCHAT_NAME_HOLD`) |
-| Roster agents | 256 |
-| Rooms | 256 |
+| Roster agents | 65,536 |
+| Rooms | 65,536 |
+| Rooms per agent | 256 |
+| Members per room | 1024 |
+| Entries per `list_agents` / `list_rooms` page | 256 (`after` pages on) |
 | Messages a room keeps | 1024 (the oldest is pushed out; `skipped` reports it) |
 | Message bodies held at once, direct and room | 256 MiB. A direct send past it deletes the oldest read message, a room send pushes out its room's oldest, and `storage_full` (507) follows when nothing can give way: unread direct mail is never evicted |
 | Batch per pull or history page | 8 msgs / 16 KiB of message JSON |

@@ -103,6 +103,12 @@ impl Msg {
         }
     }
 
+    /// What this message is charged against the byte budget: its body and
+    /// [`super::MESSAGE_OVERHEAD_BYTES`].
+    pub(super) fn cost(&self) -> usize {
+        self.body.len() + super::MESSAGE_OVERHEAD_BYTES
+    }
+
     /// Milliseconds since the Unix epoch when it was read; `None` while unread.
     pub(super) fn read_at_ms(&self) -> Option<u64> {
         Some(self.read_ms.load(Relaxed)).filter(|&ms| ms != 0)

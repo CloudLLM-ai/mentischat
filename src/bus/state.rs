@@ -690,7 +690,7 @@ impl State {
                 Some(Ok(done)) => break done,
                 Some(Err(Refused::Error(e))) => return Err(e),
                 Some(Err(Refused::NoRoom)) => {
-                    if !self.prune_oldest_read() {
+                    if !self.prune_oldest_read() && !self.evict_from_rooms() {
                         return Err(MailErr::StorageFull {
                             pending: self.unread.0.load(Relaxed) as i64,
                         });
@@ -733,7 +733,10 @@ impl State {
                 pending: pending as i64,
             }));
         }
-        let len = out.body.as_ref().map_or(0, |b| b.len());
+        let len = out
+            .body
+            .as_ref()
+            .map_or(0, |b| b.len() + super::MESSAGE_OVERHEAD_BYTES);
         if !self.try_reserve_bytes(len) {
             return Err(Refused::NoRoom);
         }
@@ -823,7 +826,7 @@ impl State {
             agent.publish_oldest_read(&st);
             if let Some(msg) = killed {
                 self.total.0.fetch_sub(1, Relaxed);
-                self.release_bytes(msg.body.len());
+                self.release_bytes(msg.cost());
                 return true;
             }
         }
@@ -1026,7 +1029,7 @@ impl State {
                 }
                 if let Some(msg) = st.read.pop_front().filter(|m| m.kill()) {
                     self.total.0.fetch_sub(1, Relaxed);
-                    self.release_bytes(msg.body.len());
+                    self.release_bytes(msg.cost());
                     expired += 1;
                 }
             }
@@ -1082,7 +1085,7 @@ impl State {
             let mut log = convo.log.lock();
             for msg in log.live().filter(|m| m.to_gen == gen && m.kill()) {
                 discarded += 1;
-                freed += msg.body.len();
+                freed += msg.cost();
             }
             log.compact();
             log.retired = log.is_empty();

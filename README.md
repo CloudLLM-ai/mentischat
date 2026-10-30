@@ -398,7 +398,7 @@ Source of truth: `src/bus/model.rs`.
 | Members per room | 1024 |
 | Entries per `list_agents` / `list_rooms` page | 256 (`after` pages on) |
 | Messages a room keeps | 1024 (the oldest is pushed out; `skipped` reports it) |
-| Message bodies held at once, direct and room | 256 MiB. A direct send past it deletes the oldest read message, a room send pushes out its room's oldest, and `storage_full` (507) follows when nothing can give way: unread direct mail is never evicted |
+| Memory held by messages at once, direct and room | 256 MiB, each message charged its body plus 160 bytes of overhead. A direct send past it deletes the oldest read message, then pushes out the oldest room message (room mail is lossy by design); a room send pushes out its own room's oldest. `storage_full` (507) follows when nothing can give way: unread direct mail is never evicted |
 | Batch per pull or history page | 8 msgs / 16 KiB of message JSON; a pull with `limit` takes up to 256 msgs / 1 MiB |
 | Suggested names offered | 5 |
 | Blocking pull (`wait_ms`) | 0–30000 ms |

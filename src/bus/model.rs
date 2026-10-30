@@ -28,12 +28,19 @@ pub const MAX_WAIT_MS: u32 = 30_000;
 pub const MAX_WAITERS_PER_AGENT: usize = 8;
 /// Cap on roster rows — bounds the number of parked pulls (8 per name).
 pub const MAX_ROSTER: i64 = 65_536;
-/// Budget for the message bodies the daemon holds at once, direct and room
+/// Budget for the memory of the messages the daemon holds at once (each body
+/// plus [`MESSAGE_OVERHEAD_BYTES`]), direct and room
 /// together (256 MiB). A send that would pass it first makes room the same way
 /// the message cap does (a direct send deletes the oldest read message, a
 /// room send pushes out its room's oldest) and fails `storage_full` when
 /// nothing can give way: unread direct mail is never evicted.
 pub const MAX_RETAINED_BYTES: usize = 256 * 1024 * 1024;
+/// What each retained message is charged against the byte budget on top of its
+/// body: its `Msg`, the queue and log slots that point at it, and allocator
+/// slack. Measured at about 150 bytes of resident memory for a one-byte room
+/// message (524k of them in 512 rooms: 8 to 87 MB), rounded up. Without it a
+/// million tiny messages would cost far more than the budget says.
+pub const MESSAGE_OVERHEAD_BYTES: usize = 160;
 /// Default number of messages a room keeps. When a room is full a new message
 /// pushes out the oldest; a member that had not read it is told how many it
 /// missed (`skipped`).

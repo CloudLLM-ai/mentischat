@@ -123,10 +123,11 @@ UNRELEASED
     private_room (403), room_exists and rooms_full (409). The
     initialize instructions gain a ROOMS section; the rest is unchanged.
 
-  - feat(bus): a 256 MiB budget for the message bodies the daemon holds,
-    direct and room together, enforced exactly under the same locks as the
-    message cap. A direct send past it deletes the oldest read message; a
-    room send pushes out its own room's oldest; when nothing can give way
+  - feat(bus): a 256 MiB budget for the memory of the messages the daemon
+    holds (each body plus 160 bytes of overhead), direct and room together,
+    enforced exactly under the same locks as the message cap. A direct send past it deletes the oldest read message; a
+    room send pushes out its own room's oldest; a direct send that still does
+    not fit pushes out the oldest room message; when nothing can give way
     (unread direct mail is never evicted) the send fails storage_full (507).
     Room mail is outside the 8192-message cap, so this is what bounds memory.
 

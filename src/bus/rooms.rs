@@ -23,7 +23,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Bound;
-use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -54,7 +54,7 @@ pub(super) struct Member {
 }
 
 /// What changes about a room.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct RoomState {
     /// The retained messages, sorted by id.
     pub log: VecDeque<Arc<Msg>>,
@@ -62,6 +62,10 @@ pub(super) struct RoomState {
     pub members: HashMap<String, Member>,
     /// Folded names invited to a private room and not yet joined.
     pub invited: HashSet<String>,
+    /// Id of the oldest retained message ([`NO_MESSAGE`] when empty),
+    /// published so the byte budget can find the room whose oldest message is
+    /// oldest without locking every room. Shared with [`Room::oldest`].
+    pub oldest: Arc<AtomicU64>,
     /// Set when the room was removed from the room map; whoever finds it
     /// treats the room as gone.
     pub retired: bool,
@@ -75,10 +79,33 @@ pub(super) struct Room {
     /// Invite-only and unlisted.
     pub private: bool,
     pub description: Option<String>,
+    /// [`RoomState::oldest`], readable without the room's lock.
+    pub oldest: Arc<AtomicU64>,
     pub inner: Mutex<RoomState>,
 }
 
+/// [`RoomState::oldest`] of a room with no messages.
+pub(super) const NO_MESSAGE: u64 = u64::MAX;
+
+impl Default for RoomState {
+    fn default() -> Self {
+        Self {
+            log: VecDeque::new(),
+            members: HashMap::new(),
+            invited: HashSet::new(),
+            oldest: Arc::new(AtomicU64::new(NO_MESSAGE)),
+            retired: false,
+        }
+    }
+}
+
 impl RoomState {
+    /// Publish the id of the oldest retained message.
+    pub(super) fn publish_oldest(&self) {
+        let id = self.log.front().map_or(NO_MESSAGE, |m| m.id);
+        self.oldest.store(id, Relaxed);
+    }
+
     /// Id of the newest retained message, 0 when there is none.
     fn head(&self) -> u64 {
         self.log.back().map_or(0, |m| m.id)
@@ -110,7 +137,8 @@ impl RoomState {
                 member.skipped += 1;
             }
         }
-        Some(oldest.body.len())
+        self.publish_oldest();
+        Some(oldest.cost())
     }
 
     /// Append `msg` (its id exceeds every id in the log; the caller has made
@@ -127,6 +155,7 @@ impl RoomState {
             }
         }
         self.log.push_back(msg);
+        self.publish_oldest();
     }
 
     /// The room as it goes on the wire.
@@ -224,11 +253,13 @@ impl State {
                 rooms: MAX_ROOMS_PER_AGENT as i64,
             });
         }
+        let state = RoomState::default();
         let made = Arc::new(Room {
             name: room.as_str().into(),
             private,
             description,
-            inner: Mutex::default(),
+            oldest: state.oldest.clone(),
+            inner: Mutex::new(state),
         });
         {
             let mut st = made.inner.lock();
@@ -361,6 +392,25 @@ impl State {
         }
     }
 
+    /// Push out the oldest message of the room whose oldest message is the
+    /// oldest anywhere, giving its memory back. Room mail is lossy by design,
+    /// so a direct send does this before failing `storage_full` when the
+    /// budget is held by rooms. False when no room holds a message.
+    pub(super) fn evict_from_rooms(&self) -> bool {
+        loop {
+            let oldest = self.rooms.min_by_rank(|r| {
+                let id = r.oldest.load(Relaxed);
+                (id != NO_MESSAGE).then_some(id)
+            });
+            let Some(room) = oldest else { return false };
+            let mut st = room.inner.lock();
+            if let Some(freed) = st.evict_oldest() {
+                self.release_bytes(freed);
+                return true;
+            }
+        }
+    }
+
     /// Delete `room` if it has no members: retire it, give its bytes back and
     /// take it out of the maps. Looks at this room only, so deleting rooms
     /// costs the same however many exist.
@@ -371,7 +421,7 @@ impl State {
                 return;
             }
             st.retired = true;
-            self.release_bytes(st.log.iter().map(|m| m.body.len()).sum());
+            self.release_bytes(st.log.iter().map(|m| m.cost()).sum());
         }
         let key = Key::fold(&room.name);
         self.rooms.remove_if(key.as_str(), |r| Arc::ptr_eq(r, room));
@@ -419,7 +469,7 @@ impl State {
             }
             // Make room: first the room's own capacity, then the byte budget,
             // each by pushing out this room's oldest message.
-            let len = body.len();
+            let len = body.len() + super::MESSAGE_OVERHEAD_BYTES;
             while st.log.len() >= self.room_capacity {
                 let freed = st.evict_oldest().unwrap_or(0);
                 self.release_bytes(freed);
@@ -430,7 +480,7 @@ impl State {
                 // the budget is held elsewhere: fail before evicting anything.
                 if !checked {
                     checked = true;
-                    let own: usize = st.log.iter().map(|m| m.body.len()).sum();
+                    let own: usize = st.log.iter().map(|m| m.cost()).sum();
                     let others = self.bytes.0.load(Relaxed).saturating_sub(own);
                     if others.saturating_add(len) > self.byte_budget {
                         return Err(MailErr::StorageFull {

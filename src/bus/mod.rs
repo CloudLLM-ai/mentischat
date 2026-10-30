@@ -52,7 +52,7 @@ pub use model::{
 };
 pub use model::{
     LeaveOutcome, RoomEntry, RoomInfo, RoomListing, DEFAULT_ROOM_CAPACITY, MAX_RETAINED_BYTES,
-    MAX_ROOMS,
+    MAX_ROOMS, MESSAGE_OVERHEAD_BYTES,
 };
 pub use model::{
     MAX_LIMITED_PAGE_BYTES, MAX_OVERVIEW_AGENTS, MAX_PAGE, MAX_ROOMS_PER_AGENT, MAX_ROOM_MEMBERS,

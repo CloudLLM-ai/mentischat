@@ -368,7 +368,7 @@ fn restore_message(
         .lock()
         .push(msg.clone());
     state.total.0.fetch_add(1, Relaxed);
-    state.bytes.0.fetch_add(msg.body.len(), Relaxed);
+    state.bytes.0.fetch_add(msg.cost(), Relaxed);
     if rec.read_ms == 0 {
         state.unread.0.fetch_add(1, Relaxed);
         recipient.inner.lock().unread.push_back(msg);
@@ -389,7 +389,10 @@ fn restore_room(state: &State, rec: RoomRec) {
     for m in rec.messages {
         let body: Box<str> = m.body.into();
         let body_len = json_len(&body);
-        state.bytes.0.fetch_add(body.len(), Relaxed);
+        state
+            .bytes
+            .0
+            .fetch_add(body.len() + super::MESSAGE_OVERHEAD_BYTES, Relaxed);
         let from: Arc<str> = m.from.into();
         let target = Target {
             to: state.no_agent.clone(),
@@ -429,10 +432,12 @@ fn restore_room(state: &State, rec: RoomRec) {
     if st.members.is_empty() {
         return;
     }
+    st.publish_oldest();
     let room = Arc::new(Room {
         name: name.clone(),
         private: rec.private,
         description: rec.description,
+        oldest: st.oldest.clone(),
         inner: parking_lot::Mutex::new(st),
     });
     for agent in joined {

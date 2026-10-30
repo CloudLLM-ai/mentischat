@@ -18,7 +18,6 @@ use serde_json::{json, Value};
 
 use crate::bus::Bus;
 use crate::errors::MailboxError;
-use crate::names::AgentName;
 
 type Ctx = Arc<Bus>;
 
@@ -85,14 +84,23 @@ fn json_body(body: Result<Json<Value>, JsonRejection>) -> Result<Value, MailboxE
     body.map(|Json(v)| v).map_err(|_| MailboxError::InvalidBody)
 }
 
-/// The `{agent}` path segment. A segment axum cannot decode (invalid
+/// The `{agent}` path segment, raw: a segment axum cannot decode (invalid
 /// percent-encoding or UTF-8) is an `invalid_name` like any other bad name,
-/// not axum's plain-text 400.
-fn path_name(path: Result<Path<String>, PathRejection>) -> Result<AgentName, MailboxError> {
-    let Path(raw) = path.map_err(|_| MailboxError::InvalidName {
-        agent: String::new(),
-    })?;
-    AgentName::parse(&raw)
+/// not axum's plain-text 400. The tools validate the name itself.
+fn path_agent(path: Result<Path<String>, PathRejection>) -> Result<String, MailboxError> {
+    path.map(|Path(raw)| raw)
+        .map_err(|_| MailboxError::InvalidName {
+            agent: String::new(),
+        })
+}
+
+/// The query parameters named `keys` as the JSON object the tools take
+/// (absent ones are `null`, which the tools treat as omitted).
+fn query_params(q: &HashMap<String, String>, keys: &[&str]) -> Value {
+    keys.iter()
+        .map(|key| ((*key).to_string(), json!(q.get(*key))))
+        .collect::<serde_json::Map<_, _>>()
+        .into()
 }
 
 /// `POST /agents` `{ "agent", "provider"?, "description"?, "reclaim"? }` —
@@ -111,13 +119,8 @@ async fn list(
 ) -> Reply {
     let Query(q) = query.map_err(|_| MailboxError::InvalidBody)?;
     Ok(Json(
-        crate::tools::list_agents(&bus, &page_params(&q)).await?,
+        crate::tools::list_agents(&bus, &query_params(&q, &["after", "limit"])).await?,
     ))
-}
-
-/// The `after` and `limit` query parameters as the JSON the tools take.
-fn page_params(q: &HashMap<String, String>) -> Value {
-    json!({ "after": q.get("after"), "limit": q.get("limit") })
 }
 
 /// `DELETE /agents/{agent}` — same as the deregister tool.
@@ -125,8 +128,8 @@ async fn deregister_one(
     State(bus): State<Ctx>,
     path: Result<Path<String>, PathRejection>,
 ) -> Reply {
-    let agent = path_name(path)?;
-    Ok(Json(crate::tools::to_wire(bus.deregister(&agent).await?)))
+    let params = json!({ "agent": path_agent(path)? });
+    Ok(Json(crate::tools::deregister(&bus, &params).await?))
 }
 
 /// `POST /messages` `{ "from", "to", "body" }` — same as send_message.
@@ -166,13 +169,12 @@ async fn pull(
     path: Result<Path<String>, PathRejection>,
     query: Result<Query<HashMap<String, String>>, QueryRejection>,
 ) -> Result<Response, MailboxError> {
-    let agent = path_name(path)?;
+    let agent = path_agent(path)?;
     let Query(q) = query.map_err(|_| MailboxError::InvalidWait)?;
-    let wait_ms = parse_wait_query(q.get("wait_ms").map(String::as_str))?;
-    let limit =
-        crate::tools::parse_limit(q.get("limit").map(|l| Value::String(l.clone())).as_ref())?;
+    let mut params = query_params(&q, &["wait_ms", "limit"]);
+    params["agent"] = json!(agent);
     Ok(no_store_response(
-        bus.check_inbox_limit(&agent, wait_ms, limit).await?,
+        crate::tools::check_inbox(&bus, &params).await?,
     ))
 }
 
@@ -182,18 +184,13 @@ async fn history(
     path: Result<Path<String>, PathRejection>,
     query: Result<Query<HashMap<String, String>>, QueryRejection>,
 ) -> Result<Response, MailboxError> {
-    let agent = path_name(path)?;
+    let agent = path_agent(path)?;
     let Query(q) = query.map_err(|_| MailboxError::InvalidCursor)?;
-    let field = |key: &str| q.get(key).map(|v| Value::String(v.clone()));
-    let with = crate::tools::optional_name(field("with").as_ref())?;
-    let before = crate::tools::parse_cursor(field("before").as_ref())?;
-    let room = crate::tools::optional_room(field("room").as_ref())?;
-    let page = match room {
-        Some(_) if with.is_some() => Err(MailboxError::InvalidBody),
-        Some(room) => bus.room_history(&agent, &room, before).await,
-        None => bus.history(&agent, with.as_ref(), before).await,
-    };
-    Ok(no_store_response(page?))
+    let mut params = query_params(&q, &["with", "room", "before"]);
+    params["agent"] = json!(agent);
+    Ok(no_store_response(
+        crate::tools::history(&bus, &params).await?,
+    ))
 }
 
 /// `POST /rooms` `{ "agent", "room", "private"?, "description"? }` — same as
@@ -210,8 +207,7 @@ async fn list_rooms(
     query: Result<Query<HashMap<String, String>>, QueryRejection>,
 ) -> Reply {
     let Query(q) = query.map_err(|_| MailboxError::InvalidBody)?;
-    let mut params = page_params(&q);
-    params["agent"] = q.get("agent").map_or(Value::Null, |a| json!(a));
+    let params = query_params(&q, &["agent", "after", "limit"]);
     Ok(Json(crate::tools::list_rooms(&bus, &params).await?))
 }
 
@@ -301,13 +297,4 @@ async fn not_found() -> MailboxError {
 /// Known REST path, method it does not serve.
 async fn method_not_allowed() -> MailboxError {
     MailboxError::MethodNotAllowed
-}
-
-/// Contract wait_ms query semantics: absent/empty -> 0; digit string within
-/// range -> value; anything else -> `invalid_wait`.
-fn parse_wait_query(raw: Option<&str>) -> Result<u32, MailboxError> {
-    match raw {
-        None | Some("") => Ok(0),
-        Some(s) => crate::tools::parse_wait_ms(Some(&Value::String(s.to_string()))),
-    }
 }

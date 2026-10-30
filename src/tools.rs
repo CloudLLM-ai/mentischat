@@ -17,7 +17,7 @@ use mcp::protocol::{
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::bus::{Bus, Registration};
+use crate::bus::{Bus, HistoryPage, InboxPage, Registration};
 use crate::errors::MailboxError;
 use crate::names::{AgentName, Provider, RoomName};
 
@@ -241,8 +241,8 @@ impl ToolProtocol for MailboxProtocol {
             "register" => register_agent(bus, &parameters).await,
             "deregister" => deregister(bus, &parameters).await,
             "send_message" => send_message(bus, &parameters).await,
-            "check_inbox" => check_inbox(bus, &parameters).await,
-            "history" => history(bus, &parameters).await,
+            "check_inbox" => check_inbox(bus, &parameters).await.map(to_wire),
+            "history" => history(bus, &parameters).await.map(to_wire),
             "list_agents" => list_agents(bus, &parameters).await,
             "create_room" => create_room(bus, &parameters).await,
             "join_room" => join_room(bus, &parameters).await,
@@ -285,20 +285,19 @@ impl ToolProtocol for MailboxProtocol {
     }
 }
 
-/// Leave the roster per the tool contract.
-async fn deregister(bus: &Bus, params: &Value) -> Result<Value, MailboxError> {
+/// Leave the roster per the tool and `DELETE /agents/{agent}` contract.
+pub async fn deregister(bus: &Bus, params: &Value) -> Result<Value, MailboxError> {
     let agent = required_name(params, "agent")?;
     Ok(to_wire(bus.deregister(&agent).await?))
 }
 
-/// Pull the next batch per the tool contract.
-async fn check_inbox(bus: &Bus, params: &Value) -> Result<Value, MailboxError> {
+/// Pull the next batch per the tool and `GET /inboxes/{agent}` contract:
+/// `agent` is required; `wait_ms` and `limit` are optional.
+pub async fn check_inbox(bus: &Bus, params: &Value) -> Result<InboxPage, MailboxError> {
     let agent = required_name(params, "agent")?;
     let wait_ms = parse_wait_ms(params.get("wait_ms"))?;
     let limit = parse_limit(params.get("limit"))?;
-    Ok(to_wire(
-        bus.check_inbox_limit(&agent, wait_ms, limit).await?,
-    ))
+    bus.check_inbox_limit(&agent, wait_ms, limit).await
 }
 
 /// Pull a required name field: missing or empty is `invalid_name`, a
@@ -332,15 +331,15 @@ pub async fn register_agent(bus: &Bus, params: &Value) -> Result<Value, MailboxE
 
 /// One history page per the tool contract: `agent` is required, `with`,
 /// `room` (instead of `with`) and `before` optional.
-pub async fn history(bus: &Bus, params: &Value) -> Result<Value, MailboxError> {
+pub async fn history(bus: &Bus, params: &Value) -> Result<HistoryPage, MailboxError> {
     let agent = required_name(params, "agent")?;
     let with = optional_name(params.get("with"))?;
     let room = optional_room(params.get("room"))?;
     let before = parse_cursor(params.get("before"))?;
     match room {
         Some(_) if with.is_some() => Err(MailboxError::InvalidBody),
-        Some(room) => Ok(to_wire(bus.room_history(&agent, &room, before).await?)),
-        None => Ok(to_wire(bus.history(&agent, with.as_ref(), before).await?)),
+        Some(room) => bus.room_history(&agent, &room, before).await,
+        None => bus.history(&agent, with.as_ref(), before).await,
     }
 }
 

@@ -73,6 +73,10 @@ fn op_body(keys: &Keypair, agent: &str, room: &str, counter: u64, op: &SignedOp)
         }
         SignedOp::Remove { target } => v["target"] = json!(target),
         SignedOp::Create { description } => v["description"] = json!(description),
+        SignedOp::Welcome { target, welcome } => {
+            v["target"] = json!(target);
+            v["welcome"] = json!(mentischat::signed::hex_encode(welcome));
+        }
         SignedOp::Join | SignedOp::Leave => {}
     }
     v

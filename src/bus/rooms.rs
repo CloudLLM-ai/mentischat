@@ -613,8 +613,9 @@ impl State {
             if st.retired || st.member(sender).is_none() {
                 return Err(not_in_room(&found, &st, sender, room));
             }
-            st.admit_send(&found, sender, gate)?;
+            st.admit_send(&found, sender, &gate)?;
             self.make_room(&mut st, body.len() + super::MESSAGE_OVERHEAD_BYTES)?;
+            st.record_send(&gate);
             // Under the room's lock, so the log stays sorted by id.
             let id = self.next_id.0.fetch_add(1, Relaxed);
             let msg = Arc::new(Msg::new(

@@ -23,7 +23,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use ed25519_dalek::{Signature as DalekSignature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature as DalekSignature, Signer, SigningKey, VerifyingKey};
 
 /// Domain separation tag every mentischat signature starts with, so a
 /// signature made for another protocol that shares the key (MentisDB signs
@@ -101,6 +101,39 @@ pub fn hex_decode<const N: usize>(s: &str) -> Result<[u8; N], ParseKeyError> {
     Ok(out)
 }
 
+/// Decode any even-length hex string (either case) into bytes.
+///
+/// # Errors
+///
+/// [`ParseKeyError::Length`] for an odd length, [`ParseKeyError::NotHex`].
+///
+/// # Examples
+///
+/// ```
+/// use mentischat::signed::hex_decode_vec;
+///
+/// assert_eq!(hex_decode_vec("00Ff").unwrap(), vec![0, 255]);
+/// assert_eq!(hex_decode_vec("").unwrap(), Vec::<u8>::new());
+/// assert!(hex_decode_vec("abc").is_err());
+/// ```
+pub fn hex_decode_vec(s: &str) -> Result<Vec<u8>, ParseKeyError> {
+    // (`is_multiple_of` needs Rust 1.91; the MSRV is 1.88.)
+    if s.len() & 1 == 1 {
+        return Err(ParseKeyError::Length);
+    }
+    let digit = |c: u8| match c {
+        b'0'..=b'9' => Ok(c - b'0'),
+        b'a'..=b'f' => Ok(c - b'a' + 10),
+        b'A'..=b'F' => Ok(c - b'A' + 10),
+        _ => Err(ParseKeyError::NotHex),
+    };
+    let (pairs, _) = s.as_bytes().as_chunks::<2>();
+    pairs
+        .iter()
+        .map(|[hi, lo]| Ok((digit(*hi)? << 4) | digit(*lo)?))
+        .collect()
+}
+
 /// A validated Ed25519 public key: 32 bytes that decode to a curve point.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PublicKey([u8; 32]);
@@ -110,11 +143,15 @@ impl PublicKey {
     ///
     /// # Errors
     ///
-    /// [`ParseKeyError::NotAPoint`] when they are not a valid point.
+    /// [`ParseKeyError::NotAPoint`] when they are not a valid point, or are a
+    /// small-order point: such a "key" verifies signatures nobody made, so it is
+    /// never a key.
     pub fn from_bytes(bytes: [u8; 32]) -> Result<Self, ParseKeyError> {
         VerifyingKey::from_bytes(&bytes)
+            .ok()
+            .filter(|key| !key.is_weak())
             .map(|_| Self(bytes))
-            .map_err(|_| ParseKeyError::NotAPoint)
+            .ok_or(ParseKeyError::NotAPoint)
     }
 
     /// The raw 32 bytes, as MentisDB's `public_key_bytes`.
@@ -134,7 +171,9 @@ impl PublicKey {
     /// [`BadSignature`] when it does not verify.
     pub fn verify(&self, payload: &[u8], signature: &Signature) -> Result<(), BadSignature> {
         let key = VerifyingKey::from_bytes(&self.0).map_err(|_| BadSignature)?;
-        key.verify(payload, &DalekSignature::from_bytes(&signature.0))
+        // Strict: also rejects non-canonical encodings, as OpenMLS does for the
+        // same key inside a group.
+        key.verify_strict(payload, &DalekSignature::from_bytes(&signature.0))
             .map_err(|_| BadSignature)
     }
 }
@@ -258,9 +297,13 @@ pub enum OpKind {
     Remove,
     /// Send a message to the room.
     Send,
+    /// Hand an invited agent its MLS Welcome (end-to-end encrypted rooms).
+    Welcome,
+    /// Publish MLS KeyPackages for others to add this agent with.
+    PublishKeyPackages,
 }
 
-/// An `op` name that is not one of the seven.
+/// An `op` name that is not one of the nine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnknownOp;
 
@@ -283,6 +326,8 @@ impl OpKind {
             Self::Leave => "leave",
             Self::Remove => "remove",
             Self::Send => "send",
+            Self::Welcome => "welcome",
+            Self::PublishKeyPackages => "key_packages",
         }
     }
 }
@@ -305,6 +350,8 @@ impl FromStr for OpKind {
             "leave" => Self::Leave,
             "remove" => Self::Remove,
             "send" => Self::Send,
+            "welcome" => Self::Welcome,
+            "key_packages" => Self::PublishKeyPackages,
             _ => return Err(UnknownOp),
         })
     }
@@ -340,6 +387,13 @@ pub enum SignedOp {
         /// The message text.
         body: String,
     },
+    /// Leave `welcome` (opaque MLS bytes) for the invited agent `target`.
+    Welcome {
+        /// The invited name the Welcome is for.
+        target: String,
+        /// The serialized MLS Welcome.
+        welcome: Vec<u8>,
+    },
 }
 
 impl SignedOp {
@@ -352,6 +406,7 @@ impl SignedOp {
             Self::Leave => OpKind::Leave,
             Self::Remove { .. } => OpKind::Remove,
             Self::Send { .. } => OpKind::Send,
+            Self::Welcome { .. } => OpKind::Welcome,
         }
     }
 
@@ -372,6 +427,10 @@ impl SignedOp {
             Self::Join | Self::Leave => {}
             Self::Remove { target } => put(&mut out, target.to_ascii_lowercase().as_bytes()),
             Self::Send { body } => put(&mut out, body.as_bytes()),
+            Self::Welcome { target, welcome } => {
+                put(&mut out, target.to_ascii_lowercase().as_bytes());
+                put(&mut out, welcome);
+            }
         }
         out
     }
@@ -383,6 +442,7 @@ impl SignedOp {
             Self::Join | Self::Leave => 0,
             Self::Remove { target } => target.len(),
             Self::Send { body } => body.len(),
+            Self::Welcome { target, welcome } => target.len() + welcome.len() + 8,
         }
     }
 }
@@ -395,6 +455,51 @@ pub fn register_key_payload(signer: &str, key: &PublicKey) -> Vec<u8> {
     let mut out = header(OpKind::RegisterKey, "", signer, 0, 32);
     out.extend_from_slice(key.as_bytes());
     out
+}
+
+/// The bytes signed to publish `packages` (opaque serialized MLS KeyPackages)
+/// for `signer`. The counter is the signer's own, strictly increasing across
+/// its publishes; the room is empty.
+pub fn key_packages_payload(signer: &str, counter: u64, packages: &[Vec<u8>]) -> Vec<u8> {
+    let extra = packages.iter().map(|p| p.len() + 4).sum::<usize>() + 4;
+    let mut out = header(OpKind::PublishKeyPackages, "", signer, counter, extra);
+    out.extend_from_slice(&(packages.len() as u32).to_be_bytes());
+    for package in packages {
+        put(&mut out, package);
+    }
+    out
+}
+
+/// Prefix of the body of an end-to-end encrypted room's Commit message:
+/// `mls/1 commit <epoch> <hex>`.
+pub const MLS_COMMIT_PREFIX: &str = "mls/1 commit ";
+
+/// The epoch a body claims to commit from, if it is an MLS Commit message
+/// (`mls/1 commit <epoch> <payload>`). The daemon uses it to accept exactly
+/// one Commit per epoch, so two members racing cannot fork a group, without
+/// parsing any MLS. `None` for every other body, including a malformed Commit
+/// header (which is then just text, and every member's client ignores it).
+///
+/// # Examples
+///
+/// ```
+/// use mentischat::signed::mls_commit_epoch;
+///
+/// assert_eq!(mls_commit_epoch("mls/1 commit 7 abcd"), Some(7));
+/// assert_eq!(mls_commit_epoch("mls/1 commit x abcd"), None);
+/// assert_eq!(mls_commit_epoch("mls/1 commit 07 abcd"), None);
+/// assert_eq!(mls_commit_epoch("mls/1 app 7 abcd"), None);
+/// assert_eq!(mls_commit_epoch("hello"), None);
+/// ```
+pub fn mls_commit_epoch(body: &str) -> Option<u64> {
+    let rest = body.strip_prefix(MLS_COMMIT_PREFIX)?;
+    let (epoch, _) = rest.split_once(' ')?;
+    // Canonical decimal only: one spelling per epoch, so the daemon and every
+    // client agree on which messages are Commits.
+    let canonical = epoch.bytes().all(|b| b.is_ascii_digit())
+        && !epoch.is_empty()
+        && (epoch == "0" || !epoch.starts_with('0'));
+    canonical.then(|| epoch.parse().ok()).flatten()
 }
 
 /// The `send` payload for a borrowed body: [`SignedOp::payload`] without

@@ -1,0 +1,447 @@
+//! The daemon as an MLS Delivery Service for signed rooms: the KeyPackage
+//! directory, Welcome hand-off to invitees, and one Commit per epoch. The
+//! daemon treats every MLS byte as opaque, so these tests use plain bytes.
+
+mod common;
+
+use common::{fresh_bus, name, register, room};
+use mentischat::bus::{Bus, SignedOutcome, SignedRequest, MAX_KEY_PACKAGES, MAX_KEY_PACKAGE_BYTES};
+use mentischat::errors::MailboxError;
+use mentischat::signed::{
+    key_packages_payload, mls_commit_epoch, register_key_payload, Envelope, Keypair, SignedOp,
+};
+
+struct Actor {
+    name: &'static str,
+    keys: Keypair,
+}
+
+impl Actor {
+    fn new(name: &'static str, seed: u8) -> Self {
+        Self {
+            name,
+            keys: Keypair::from_seed([seed; 32]),
+        }
+    }
+
+    async fn enroll(&self, bus: &Bus) {
+        register(bus, &[self.name]).await;
+        let key = self.keys.public();
+        let sig = self.keys.sign(&register_key_payload(self.name, &key));
+        bus.register_key(&name(self.name), key, &sig).await.unwrap();
+    }
+
+    async fn op(
+        &self,
+        bus: &Bus,
+        room_name: &str,
+        counter: u64,
+        op: SignedOp,
+    ) -> Result<SignedOutcome, MailboxError> {
+        let signature = self.keys.sign(&op.payload(room_name, self.name, counter));
+        bus.signed_op(SignedRequest {
+            agent: name(self.name),
+            room: room(room_name),
+            counter,
+            op,
+            signature,
+        })
+        .await
+    }
+
+    async fn say(&self, bus: &Bus, r: &str, counter: u64, body: &str) -> Result<(), MailboxError> {
+        self.op(bus, r, counter, SignedOp::Send { body: body.into() })
+            .await
+            .map(drop)
+    }
+
+    async fn publish(
+        &self,
+        bus: &Bus,
+        counter: u64,
+        packages: Vec<Vec<u8>>,
+    ) -> Result<usize, MailboxError> {
+        let sig = self
+            .keys
+            .sign(&key_packages_payload(self.name, counter, &packages));
+        bus.publish_key_packages(&name(self.name), counter, packages, &sig)
+            .await
+            .map(|s| s.available)
+    }
+}
+
+/// `alice` owns `den`; `bob` is invited (key pinned) but has not joined.
+async fn den_with_invited_bob(bus: &Bus) -> (Actor, Actor) {
+    let (alice, bob) = (Actor::new("alice", 1), Actor::new("bob", 2));
+    alice.enroll(bus).await;
+    bob.enroll(bus).await;
+    let create = SignedOp::Create {
+        description: String::new(),
+    };
+    alice.op(bus, "den", 1, create).await.unwrap();
+    let invite = SignedOp::Invite {
+        invitee: "bob".into(),
+        invitee_key: bob.keys.public(),
+    };
+    alice.op(bus, "den", 2, invite).await.unwrap();
+    (alice, bob)
+}
+
+/// The room's epoch as its owner sees it.
+async fn epoch(bus: &Bus) -> u64 {
+    let info = bus.signed_room_info(&name("alice"), &room("den")).await;
+    info.unwrap().epoch
+}
+
+fn code(e: MailboxError) -> &'static str {
+    e.code()
+}
+
+/// The Commit header parses only in its exact shape.
+#[test]
+fn commit_epochs_parse_only_from_the_exact_header() {
+    assert_eq!(mls_commit_epoch("mls/1 commit 0 ab"), Some(0));
+    assert_eq!(
+        mls_commit_epoch("mls/1 commit 18446744073709551615 ab"),
+        Some(u64::MAX)
+    );
+    for not_a_commit in [
+        "",
+        "mls/1 commit",
+        "mls/1 commit ",
+        "mls/1 commit  ab",
+        "mls/1 commit 7",
+        "mls/1 commit -1 ab",
+        "mls/1 commit 1x ab",
+        "mls/1 commit 01 ab",
+        "mls/1 commit 00 ab",
+        "mls/1 commit 18446744073709551616 ab",
+        "mls/1 app 7 ab",
+        " mls/1 commit 7 ab",
+        "MLS/1 commit 7 ab",
+    ] {
+        assert_eq!(mls_commit_epoch(not_a_commit), None, "{not_a_commit:?}");
+    }
+}
+
+/// KeyPackages come out oldest first, once each, and an empty directory says so.
+#[tokio::test]
+async fn key_packages_are_handed_out_once_oldest_first() {
+    let (_d, bus) = fresh_bus("kp");
+    let alice = Actor::new("alice", 1);
+    alice.enroll(&bus).await;
+    assert_eq!(
+        alice
+            .publish(&bus, 1, vec![vec![1], vec![2]])
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(alice.publish(&bus, 2, vec![vec![3]]).await.unwrap(), 3);
+    let a = name("alice");
+    for want in [vec![1], vec![2], vec![3]] {
+        assert_eq!(bus.take_key_package(&a).await.unwrap(), want);
+    }
+    assert_eq!(
+        code(bus.take_key_package(&a).await.unwrap_err()),
+        "no_key_package"
+    );
+    assert_eq!(
+        code(bus.take_key_package(&name("ghost")).await.unwrap_err()),
+        "unregistered"
+    );
+}
+
+/// Publishing is signed, replay-protected and bounded.
+#[tokio::test]
+async fn publishing_key_packages_needs_a_key_a_signature_and_a_fresh_counter() {
+    let (_d, bus) = fresh_bus("kpauth");
+    register(&bus, &["keyless"]).await;
+    let keyless = Actor::new("keyless", 9);
+    assert_eq!(
+        code(keyless.publish(&bus, 1, vec![vec![1]]).await.unwrap_err()),
+        "key_required"
+    );
+
+    let alice = Actor::new("alice", 1);
+    alice.enroll(&bus).await;
+    let forged = Actor::new("alice", 77);
+    assert_eq!(
+        code(forged.publish(&bus, 1, vec![vec![1]]).await.unwrap_err()),
+        "invalid_signature"
+    );
+    alice.publish(&bus, 5, vec![vec![1]]).await.unwrap();
+    let err = alice.publish(&bus, 5, vec![vec![2]]).await.unwrap_err();
+    assert!(
+        matches!(err, MailboxError::StaleCounter { last: 5, .. }),
+        "{err:?}"
+    );
+    assert_eq!(
+        code(alice.publish(&bus, 6, vec![]).await.unwrap_err()),
+        "invalid_body"
+    );
+    let big = vec![0u8; MAX_KEY_PACKAGE_BYTES + 1];
+    assert_eq!(
+        code(alice.publish(&bus, 6, vec![big]).await.unwrap_err()),
+        "invalid_body"
+    );
+    let many = vec![vec![1u8]; MAX_KEY_PACKAGES + 1];
+    assert_eq!(
+        code(alice.publish(&bus, 6, many).await.unwrap_err()),
+        "invalid_body"
+    );
+    assert_eq!(
+        code(alice.publish(&bus, 6, vec![vec![]]).await.unwrap_err()),
+        "invalid_body"
+    );
+}
+
+/// A full directory drops its oldest package for the newest.
+#[tokio::test]
+async fn the_key_package_directory_keeps_the_newest() {
+    let (_d, bus) = fresh_bus("kpcap");
+    let alice = Actor::new("alice", 1);
+    alice.enroll(&bus).await;
+    let first: Vec<Vec<u8>> = (0..MAX_KEY_PACKAGES as u8).map(|i| vec![i]).collect();
+    alice.publish(&bus, 1, first).await.unwrap();
+    let available = alice.publish(&bus, 2, vec![vec![200]]).await.unwrap();
+    assert_eq!(available, MAX_KEY_PACKAGES);
+    assert_eq!(
+        bus.take_key_package(&name("alice")).await.unwrap(),
+        vec![1],
+        "0 was dropped"
+    );
+}
+
+/// The inviter leaves a Welcome that only the invitee can read, until it joins.
+#[tokio::test]
+async fn a_welcome_reaches_only_the_invitee_and_goes_away_on_join() {
+    let (_d, bus) = fresh_bus("welcome");
+    let (alice, bob) = den_with_invited_bob(&bus).await;
+    let store = |bytes: Vec<u8>| SignedOp::Welcome {
+        target: "bob".into(),
+        welcome: bytes,
+    };
+    assert_eq!(
+        bus.signed_welcome(&name("bob"), &room("den"))
+            .await
+            .unwrap(),
+        None,
+        "nothing waiting yet"
+    );
+    alice
+        .op(&bus, "den", 3, store(vec![9, 9, 9]))
+        .await
+        .unwrap();
+    assert_eq!(
+        bus.signed_welcome(&name("bob"), &room("den"))
+            .await
+            .unwrap(),
+        Some(vec![9, 9, 9])
+    );
+    // Alice cannot read it back (she is a member, not an invitee) and neither can a stranger.
+    register(&bus, &["eve"]).await;
+    for who in ["alice", "eve"] {
+        let err = bus
+            .signed_welcome(&name(who), &room("den"))
+            .await
+            .unwrap_err();
+        assert_eq!(code(err), "room_not_found", "{who}");
+    }
+    // A newer Welcome replaces the older.
+    alice.op(&bus, "den", 4, store(vec![7])).await.unwrap();
+    assert_eq!(
+        bus.signed_welcome(&name("bob"), &room("den"))
+            .await
+            .unwrap(),
+        Some(vec![7])
+    );
+    bob.op(&bus, "den", 1, SignedOp::Join).await.unwrap();
+    let err = bus
+        .signed_welcome(&name("bob"), &room("den"))
+        .await
+        .unwrap_err();
+    assert_eq!(code(err), "room_not_found", "a member needs no Welcome");
+}
+
+/// Only a member may leave a Welcome, only for an invitee, and within bounds.
+#[tokio::test]
+async fn welcomes_are_for_invitees_from_members_and_bounded() {
+    let (_d, bus) = fresh_bus("welcomeauth");
+    let (alice, bob) = den_with_invited_bob(&bus).await;
+    let eve = Actor::new("eve", 5);
+    eve.enroll(&bus).await;
+    let welcome = |who: &str, bytes: Vec<u8>| SignedOp::Welcome {
+        target: who.into(),
+        welcome: bytes,
+    };
+    let err = eve
+        .op(&bus, "den", 1, welcome("bob", vec![1]))
+        .await
+        .unwrap_err();
+    assert_eq!(code(err), "room_not_found", "a stranger cannot");
+    let err = bob
+        .op(&bus, "den", 1, welcome("bob", vec![1]))
+        .await
+        .unwrap_err();
+    assert_eq!(code(err), "not_a_member", "an invitee cannot write its own");
+    let err = alice
+        .op(&bus, "den", 3, welcome("eve", vec![1]))
+        .await
+        .unwrap_err();
+    assert_eq!(code(err), "not_a_member", "eve was never invited");
+    let err = alice
+        .op(&bus, "den", 3, welcome("bob", vec![]))
+        .await
+        .unwrap_err();
+    assert_eq!(code(err), "invalid_body");
+    let huge = vec![0u8; mentischat::bus::MAX_WELCOME_BYTES + 1];
+    let err = alice
+        .op(&bus, "den", 3, welcome("bob", huge))
+        .await
+        .unwrap_err();
+    assert_eq!(code(err), "invalid_body");
+    alice
+        .op(&bus, "den", 3, welcome("bob", vec![1]))
+        .await
+        .unwrap();
+}
+
+/// Revoking an invitation removes its Welcome too.
+#[tokio::test]
+async fn revoking_an_invitation_drops_its_welcome() {
+    let (_d, bus) = fresh_bus("welcomerevoke");
+    let (alice, _bob) = den_with_invited_bob(&bus).await;
+    let welcome = SignedOp::Welcome {
+        target: "bob".into(),
+        welcome: vec![1],
+    };
+    alice.op(&bus, "den", 3, welcome).await.unwrap();
+    alice
+        .op(
+            &bus,
+            "den",
+            4,
+            SignedOp::Remove {
+                target: "bob".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let err = bus
+        .signed_welcome(&name("bob"), &room("den"))
+        .await
+        .unwrap_err();
+    assert_eq!(code(err), "room_not_found");
+}
+
+/// One Commit per epoch: the first names epoch 0, a racing second one is
+/// stale, and the next must name epoch 1. Other messages are unaffected.
+#[tokio::test]
+async fn the_room_accepts_one_commit_per_epoch() {
+    let (_d, bus) = fresh_bus("epoch");
+    let (alice, bob) = den_with_invited_bob(&bus).await;
+    bob.op(&bus, "den", 1, SignedOp::Join).await.unwrap();
+    assert_eq!(epoch(&bus).await, 0);
+
+    alice
+        .say(&bus, "den", 3, "mls/1 commit 0 aa")
+        .await
+        .unwrap();
+    assert_eq!(epoch(&bus).await, 1);
+    // Bob raced alice from epoch 0 and lost.
+    let err = bob
+        .say(&bus, "den", 2, "mls/1 commit 0 bb")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, MailboxError::StaleEpoch { epoch: 1, .. }),
+        "{err:?}"
+    );
+    // The loss changed nothing: the epoch stands and bob's counter was not burned.
+    assert_eq!(epoch(&bus).await, 1);
+    bob.say(&bus, "den", 2, "mls/1 commit 1 cc").await.unwrap();
+    assert_eq!(epoch(&bus).await, 2);
+    // Application messages and malformed Commit headers never move the epoch.
+    alice.say(&bus, "den", 4, "mls/1 app 2 dd").await.unwrap();
+    alice
+        .say(&bus, "den", 5, "mls/1 commit x ee")
+        .await
+        .unwrap();
+    alice.say(&bus, "den", 6, "plain text").await.unwrap();
+    assert_eq!(epoch(&bus).await, 2);
+}
+
+/// A Commit that cannot be stored does not advance the epoch.
+#[tokio::test]
+async fn a_rejected_commit_does_not_advance_the_epoch() {
+    let (_d, bus) = fresh_bus("epochreject");
+    let (alice, _bob) = den_with_invited_bob(&bus).await;
+    // Blank body: rejected as invalid_body, before the epoch is looked at.
+    assert_eq!(
+        code(alice.say(&bus, "den", 3, "   ").await.unwrap_err()),
+        "invalid_body"
+    );
+    // A stale counter on a Commit for the right epoch is refused and leaves the epoch alone.
+    let err = alice
+        .say(&bus, "den", 2, "mls/1 commit 0 aa")
+        .await
+        .unwrap_err();
+    assert_eq!(code(err), "stale_counter");
+    let info = bus
+        .signed_room_info(&name("alice"), &room("den"))
+        .await
+        .unwrap();
+    assert_eq!(info.epoch, 0);
+}
+
+/// Racing Commits for one epoch: exactly one lands, whatever the schedule.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn racing_commits_for_one_epoch_land_once() {
+    let (_d, bus) = fresh_bus("epochrace");
+    let (alice, bob) = den_with_invited_bob(&bus).await;
+    bob.op(&bus, "den", 1, SignedOp::Join).await.unwrap();
+    let mut tasks = Vec::new();
+    for i in 0..8u64 {
+        let bus = bus.clone();
+        let (who, counter) = if i % 2 == 0 {
+            (&alice, 10 + i)
+        } else {
+            (&bob, 10 + i)
+        };
+        let op = SignedOp::Send {
+            body: format!("mls/1 commit 0 {i:02x}"),
+        };
+        let signature = who.keys.sign(&op.payload("den", who.name, counter));
+        let req = SignedRequest {
+            agent: name(who.name),
+            room: room("den"),
+            counter,
+            op,
+            signature,
+        };
+        tasks.push(tokio::spawn(
+            async move { bus.signed_op(req).await.is_ok() },
+        ));
+    }
+    let mut ok = 0;
+    for t in tasks {
+        ok += usize::from(t.await.unwrap());
+    }
+    assert_eq!(ok, 1);
+    let info = bus
+        .signed_room_info(&name("alice"), &room("den"))
+        .await
+        .unwrap();
+    assert_eq!(info.epoch, 1);
+    let page = bus
+        .room_history(&name("alice"), &room("den"), None)
+        .await
+        .unwrap();
+    let commits = page
+        .messages
+        .iter()
+        .filter(|m| Envelope::parse(&m.body).is_ok_and(|e| mls_commit_epoch(e.body).is_some()))
+        .count();
+    assert_eq!(commits, 1);
+}

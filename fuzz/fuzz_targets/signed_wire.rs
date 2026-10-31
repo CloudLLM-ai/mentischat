@@ -12,11 +12,15 @@ use std::sync::{Arc, OnceLock};
 use libfuzzer_sys::fuzz_target;
 use mentischat::bus::{Bus, SignedRequest};
 use mentischat::names::{AgentName, RoomName};
-use mentischat::signed::{register_key_payload, Envelope, Keypair, PublicKey, Signature, SignedOp};
+use mentischat::signed::{
+    hex_decode_vec, hex_encode, mls_commit_epoch, register_key_payload, Envelope, Keypair,
+    PublicKey, Signature, SignedOp, MLS_COMMIT_PREFIX,
+};
 use serde_json::Value;
 
 /// Codes a signed operation may fail with.
-const CODES: [&str; 14] = [
+const CODES: [&str; 15] = [
+    "stale_epoch",
     "invalid_body",
     "invalid_name",
     "invalid_room",
@@ -49,6 +53,13 @@ fn check_parsers(s: &str) {
         let again = Envelope::encode(env.counter, &env.key, &env.signature, env.body);
         assert_eq!(Envelope::parse(&again), Ok(env.clone()));
         let _ = env.verify("r", "a");
+    }
+    if let Some(epoch) = mls_commit_epoch(s) {
+        let rest = s.strip_prefix(MLS_COMMIT_PREFIX).expect("a Commit has the prefix");
+        assert!(rest.starts_with(&epoch.to_string()));
+    }
+    if let Ok(bytes) = hex_decode_vec(s) {
+        assert!(hex_encode(&bytes).eq_ignore_ascii_case(s));
     }
     if let Ok(key) = s.parse::<PublicKey>() {
         assert!(key.to_hex().eq_ignore_ascii_case(s));

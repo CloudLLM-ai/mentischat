@@ -34,6 +34,8 @@ pub fn router(bus: Ctx) -> Router {
         .route("/agents", post(register).get(list))
         .route("/agents/{agent}", delete(deregister_one))
         .route("/agents/{agent}/key", put(put_key).get(get_key))
+        .route("/agents/{agent}/keypackages", put(put_key_packages))
+        .route("/agents/{agent}/keypackages/take", post(take_key_package))
         .route("/messages", post(send_msg))
         // A batch may carry many messages, so it alone gets a larger body
         // limit than the 1 MiB the rest of the daemon allows.
@@ -52,6 +54,7 @@ pub fn router(bus: Ctx) -> Router {
         .route("/rooms/{room}/invitations", post(invite))
         .route("/signed/ops", post(signed_op))
         .route("/signed/rooms/{room}", get(signed_room))
+        .route("/signed/rooms/{room}/welcome", get(signed_welcome))
         .route("/ws", get(crate::ws::upgrade))
         .route("/health", get(health))
         .fallback(not_found)
@@ -291,6 +294,43 @@ async fn put_key(
 async fn get_key(State(bus): State<Ctx>, path: Result<Path<String>, PathRejection>) -> Reply {
     Ok(Json(
         crate::signed_api::get_key(&bus, &path_agent(path)?).await?,
+    ))
+}
+
+/// `PUT /agents/{agent}/keypackages` `{ "counter", "key_packages", "signature" }`
+/// — offer MLS KeyPackages (see `docs/SIGNED_ROOMS.md`, phase 2).
+async fn put_key_packages(
+    State(bus): State<Ctx>,
+    path: Result<Path<String>, PathRejection>,
+    body: Result<Json<Value>, JsonRejection>,
+) -> Reply {
+    let agent = path_agent(path)?;
+    Ok(Json(
+        crate::signed_api::publish_key_packages(&bus, &agent, &json_body(body)?).await?,
+    ))
+}
+
+/// `POST /agents/{agent}/keypackages/take` — one KeyPackage, used up.
+async fn take_key_package(
+    State(bus): State<Ctx>,
+    path: Result<Path<String>, PathRejection>,
+) -> Reply {
+    Ok(Json(
+        crate::signed_api::take_key_package(&bus, &path_agent(path)?).await?,
+    ))
+}
+
+/// `GET /signed/rooms/{room}/welcome?agent=` — the invitee's pending MLS Welcome.
+async fn signed_welcome(
+    State(bus): State<Ctx>,
+    path: Result<Path<String>, PathRejection>,
+    query: Result<Query<HashMap<String, String>>, QueryRejection>,
+) -> Reply {
+    let room = path_room(path)?;
+    let Query(q) = query.map_err(|_| MailboxError::InvalidBody)?;
+    let agent = q.get("agent").map_or("", String::as_str);
+    Ok(Json(
+        crate::signed_api::signed_welcome(&bus, &room, agent).await?,
     ))
 }
 

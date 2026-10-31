@@ -157,6 +157,19 @@ pub enum MailboxError {
         /// The highest counter this key has used there; sign a higher one.
         last: u64,
     },
+    /// A Commit named an epoch other than the room's current one: another
+    /// member's Commit landed first. Fetch it, apply it and commit again.
+    StaleEpoch {
+        /// The signed room.
+        room: String,
+        /// The epoch the room is at now.
+        epoch: u64,
+    },
+    /// The agent has no KeyPackage left to be added with.
+    NoKeyPackage {
+        /// The agent that has none.
+        agent: String,
+    },
     /// REST path that is not a known route.
     NotFound,
     /// Known REST path, HTTP method it does not serve.
@@ -194,6 +207,8 @@ impl MailboxError {
             Self::KeyRequired { .. } => "key_required",
             Self::KeyConflict { .. } => "key_conflict",
             Self::StaleCounter { .. } => "stale_counter",
+            Self::StaleEpoch { .. } => "stale_epoch",
+            Self::NoKeyPackage { .. } => "no_key_package",
             Self::NotFound => "not_found",
             Self::MethodNotAllowed => "method_not_allowed",
             Self::ShuttingDown => "shutting_down",
@@ -213,9 +228,10 @@ impl MailboxError {
             | Self::InvalidKey
             | Self::InvalidLimit => StatusCode::BAD_REQUEST,
             Self::SignatureRequired { .. } | Self::InvalidSignature => StatusCode::UNAUTHORIZED,
-            Self::Unregistered { .. } | Self::RoomNotFound { .. } | Self::NotFound => {
-                StatusCode::NOT_FOUND
-            }
+            Self::Unregistered { .. }
+            | Self::RoomNotFound { .. }
+            | Self::NoKeyPackage { .. }
+            | Self::NotFound => StatusCode::NOT_FOUND,
             Self::NotAMember { .. } => StatusCode::FORBIDDEN,
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             Self::QueueFull { .. }
@@ -228,6 +244,7 @@ impl MailboxError {
             | Self::KeyRequired { .. }
             | Self::KeyConflict { .. }
             | Self::StaleCounter { .. }
+            | Self::StaleEpoch { .. }
             | Self::NameTaken { .. } => StatusCode::CONFLICT,
             Self::StorageFull { .. } => StatusCode::INSUFFICIENT_STORAGE,
             Self::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
@@ -277,6 +294,10 @@ impl MailboxError {
             }
             Self::KeyRequired { agent } | Self::KeyConflict { agent } => {
                 json!({ "error": self.code(), "agent": agent })
+            }
+            Self::NoKeyPackage { agent } => json!({ "error": self.code(), "agent": agent }),
+            Self::StaleEpoch { room, epoch } => {
+                json!({ "error": self.code(), "room": room, "epoch": epoch })
             }
             Self::StaleCounter { room, last } => {
                 json!({ "error": self.code(), "room": room, "last": last })

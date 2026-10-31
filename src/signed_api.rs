@@ -11,7 +11,7 @@ use serde_json::Value;
 use crate::bus::{Bus, SignedRequest};
 use crate::errors::MailboxError;
 use crate::names::{AgentName, RoomName};
-use crate::signed::{OpKind, PublicKey, Signature, SignedOp};
+use crate::signed::{hex_decode_vec, OpKind, PublicKey, Signature, SignedOp};
 use crate::tools::{to_wire, uint};
 
 /// A required string field; a missing or non-string value is `invalid_body`.
@@ -69,7 +69,7 @@ fn parse_op(params: &Value) -> Result<SignedOp, MailboxError> {
         .map_err(|_| MailboxError::InvalidBody)?;
     let own = |key: &str| text(params, key).map(str::to_string);
     Ok(match kind {
-        OpKind::RegisterKey => return Err(MailboxError::InvalidBody),
+        OpKind::RegisterKey | OpKind::PublishKeyPackages => return Err(MailboxError::InvalidBody),
         OpKind::Create => SignedOp::Create {
             description: match params.get("description") {
                 None | Some(Value::Null) => String::new(),
@@ -87,6 +87,11 @@ fn parse_op(params: &Value) -> Result<SignedOp, MailboxError> {
             target: own("target")?,
         },
         OpKind::Send => SignedOp::Send { body: own("body")? },
+        OpKind::Welcome => SignedOp::Welcome {
+            target: own("target")?,
+            welcome: hex_decode_vec(text(params, "welcome")?)
+                .map_err(|_| MailboxError::InvalidBody)?,
+        },
     })
 }
 
@@ -115,6 +120,70 @@ pub async fn signed_op(bus: &Bus, params: &Value) -> Result<Value, MailboxError>
         signature: signature(params)?,
     };
     Ok(to_wire(bus.signed_op(request).await?))
+}
+
+/// `PUT /agents/{agent}/keypackages` `{ "counter", "key_packages": [hex], "signature" }`:
+/// offer MLS KeyPackages (opaque bytes) for others to add the agent with.
+///
+/// # Errors
+///
+/// See [`Bus::publish_key_packages`], plus `invalid_name` and `invalid_body`
+/// for parameters that do not parse.
+pub async fn publish_key_packages(
+    bus: &Bus,
+    agent: &str,
+    params: &Value,
+) -> Result<Value, MailboxError> {
+    let agent = AgentName::parse(agent)?;
+    let counter = params
+        .get("counter")
+        .and_then(uint)
+        .ok_or(MailboxError::InvalidBody)?;
+    let packages = params
+        .get("key_packages")
+        .and_then(Value::as_array)
+        .ok_or(MailboxError::InvalidBody)?
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .and_then(|s| hex_decode_vec(s).ok())
+                .ok_or(MailboxError::InvalidBody)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let stock = bus
+        .publish_key_packages(&agent, counter, packages, &signature(params)?)
+        .await?;
+    Ok(to_wire(stock))
+}
+
+/// `POST /agents/{agent}/keypackages/take`: one of the agent's KeyPackages,
+/// `{ "agent", "keyPackage": hex }`; it is not offered again.
+///
+/// # Errors
+///
+/// `invalid_name`, `unregistered`, `no_key_package`, `shutting_down`.
+pub async fn take_key_package(bus: &Bus, agent: &str) -> Result<Value, MailboxError> {
+    let agent = AgentName::parse(agent)?;
+    let package = bus.take_key_package(&agent).await?;
+    Ok(
+        serde_json::json!({ "agent": agent.as_str(), "keyPackage": crate::signed::hex_encode(&package) }),
+    )
+}
+
+/// `GET /signed/rooms/{room}/welcome?agent=`: the MLS Welcome waiting for an
+/// invited agent, `{ "room", "welcome": hex | null }`.
+///
+/// # Errors
+///
+/// `invalid_name`, `invalid_room`, and see [`Bus::signed_welcome`].
+pub async fn signed_welcome(bus: &Bus, room: &str, agent: &str) -> Result<Value, MailboxError> {
+    let agent = AgentName::parse(agent)?;
+    let room = RoomName::parse(room)?;
+    let welcome = bus.signed_welcome(&agent, &room).await?;
+    Ok(serde_json::json!({
+        "room": room.as_str(),
+        "welcome": welcome.map(|w| crate::signed::hex_encode(&w)),
+    }))
 }
 
 /// `GET /signed/rooms/{room}?agent=`: the members of a signed room with their

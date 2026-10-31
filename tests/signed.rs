@@ -137,6 +137,20 @@ fn public_keys_roundtrip_and_non_points_are_rejected() {
     assert!("abcd".parse::<PublicKey>().is_err());
 }
 
+/// A small-order point is a valid curve point but no one's key: it would
+/// verify signatures nobody made, so it is refused as a key.
+#[test]
+fn small_order_points_are_not_keys() {
+    let mut identity = [0u8; 32];
+    identity[0] = 1; // the neutral element
+    assert!(PublicKey::from_bytes(identity).is_err());
+    // The order-2 point, (0, -1).
+    let mut order_two = [0xffu8; 32];
+    order_two[0] = 0xec;
+    order_two[31] = 0x7f;
+    assert!(PublicKey::from_bytes(order_two).is_err());
+}
+
 /// A signature binds the exact payload and key.
 #[test]
 fn signatures_verify_only_for_their_payload_and_key() {

@@ -132,6 +132,11 @@ pub(super) struct AgentState {
     /// The Ed25519 key bound to this registration (trust on first use), for
     /// signed rooms. Dies with the roster entry; never snapshotted.
     pub key: Option<crate::signed::PublicKey>,
+    /// Highest counter this agent has signed for a KeyPackage publish.
+    pub key_counter: u64,
+    /// Serialized MLS KeyPackages others may take to add this agent to an
+    /// end-to-end encrypted room, oldest first. Opaque to the daemon.
+    pub key_packages: VecDeque<Vec<u8>>,
 }
 
 /// A roster entry.
@@ -188,6 +193,8 @@ impl Agent {
                 invited_to: Default::default(),
                 removed: false,
                 key: None,
+                key_counter: 0,
+                key_packages: VecDeque::new(),
             }),
         }
     }

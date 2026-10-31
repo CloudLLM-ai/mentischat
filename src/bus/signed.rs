@@ -42,6 +42,9 @@ pub(super) enum SendGate<'a> {
         key: &'a PublicKey,
         /// The counter that was signed.
         counter: u64,
+        /// The epoch the body commits from when it is an MLS Commit
+        /// message (see [`crate::signed::mls_commit_epoch`]).
+        commit_epoch: Option<u64>,
     },
 }
 
@@ -57,6 +60,11 @@ pub(super) struct SignedState {
     invitations: HashMap<String, PublicKey>,
     /// Highest counter each key has signed in this room.
     watermarks: HashMap<PublicKey, u64>,
+    /// How many Commit messages the room has accepted: the epoch a member's
+    /// next Commit must name. Starts at 0.
+    epoch: u64,
+    /// MLS Welcomes waiting for invitees, by folded name.
+    welcomes: HashMap<String, Vec<u8>>,
 }
 
 impl SignedState {
@@ -67,30 +75,32 @@ impl SignedState {
             pins: HashMap::from([(name.to_string(), owner)]),
             invitations: HashMap::new(),
             watermarks: HashMap::from([(owner, counter)]),
+            epoch: 0,
+            welcomes: HashMap::new(),
         }
     }
 
-    /// Accept `counter` from `key` if it is above the key's watermark.
-    fn bump(&mut self, room: &Room, key: PublicKey, counter: u64) -> Result<(), MailErr> {
-        let known = self.watermarks.len();
-        let last = match self.watermarks.get(&key) {
-            Some(&last) => last,
-            None if known >= MAX_WATERMARKS => {
-                return Err(MailErr::RoomFull {
-                    room: room.name.to_string(),
-                    members: self.pins.len() as i64,
-                })
-            }
-            None => 0,
-        };
-        // A key's first counter may be anything, including 0; every later one
-        // must be strictly above it.
-        if self.watermarks.contains_key(&key) && counter <= last {
-            return Err(MailErr::StaleCounter {
+    /// Whether `counter` from `key` is above the key's watermark (the first
+    /// counter a key uses may be anything, including 0), and the room has
+    /// space to remember a new key.
+    fn check(&self, room: &Room, key: PublicKey, counter: u64) -> Result<(), MailErr> {
+        match self.watermarks.get(&key) {
+            Some(&last) if counter <= last => Err(MailErr::StaleCounter {
                 room: room.name.to_string(),
                 last,
-            });
+            }),
+            Some(_) => Ok(()),
+            None if self.watermarks.len() >= MAX_WATERMARKS => Err(MailErr::RoomFull {
+                room: room.name.to_string(),
+                members: self.pins.len() as i64,
+            }),
+            None => Ok(()),
         }
+    }
+
+    /// [`check`](Self::check), then record `counter` as the key's watermark.
+    fn bump(&mut self, room: &Room, key: PublicKey, counter: u64) -> Result<(), MailErr> {
+        self.check(room, key, counter)?;
         self.watermarks.insert(key, counter);
         Ok(())
     }
@@ -118,24 +128,56 @@ impl RoomState {
 
     /// Check a send against the room's mode, under the room's lock and after
     /// membership: a plain send needs an unsigned room; a signed send needs
-    /// the sender's pinned key and a fresh counter, which it consumes.
+    /// the sender's pinned key, a fresh counter and, for an MLS Commit, the
+    /// room's current epoch. Changes nothing: [`record_send`](Self::record_send)
+    /// applies it once the message is certain to be stored.
     pub(super) fn admit_send(
-        &mut self,
+        &self,
         room: &Room,
         sender: &Agent,
-        gate: SendGate<'_>,
+        gate: &SendGate<'_>,
     ) -> Result<(), MailErr> {
         match gate {
             SendGate::Unsigned => self.refuse_unsigned(room, sender),
-            SendGate::Signed { key, counter } => {
+            SendGate::Signed {
+                key,
+                counter,
+                commit_epoch,
+            } => {
                 let name = Key::fold(&sender.name);
-                let signed = self.signed.as_mut().ok_or_else(|| MailErr::RoomNotFound {
+                let signed = self.signed.as_ref().ok_or_else(|| MailErr::RoomNotFound {
                     room: room.name.to_string(),
                 })?;
-                if signed.pins.get(name.as_str()) != Some(key) {
+                if signed.pins.get(name.as_str()) != Some(*key) {
                     return Err(MailErr::InvalidSignature);
                 }
-                signed.bump(room, *key, counter)
+                signed.check(room, **key, *counter)?;
+                match commit_epoch {
+                    Some(epoch) if *epoch != signed.epoch => Err(MailErr::StaleEpoch {
+                        room: room.name.to_string(),
+                        epoch: signed.epoch,
+                    }),
+                    _ => Ok(()),
+                }
+            }
+        }
+    }
+
+    /// Apply a send that [`admit_send`](Self::admit_send) admitted and that
+    /// has been stored: consume the counter, advance the epoch on a Commit.
+    pub(super) fn record_send(&mut self, gate: &SendGate<'_>) {
+        if let (
+            SendGate::Signed {
+                key,
+                counter,
+                commit_epoch,
+            },
+            Some(signed),
+        ) = (gate, self.signed.as_mut())
+        {
+            signed.watermarks.insert(**key, *counter);
+            if commit_epoch.is_some() {
+                signed.epoch += 1;
             }
         }
     }
@@ -175,6 +217,7 @@ impl RoomState {
     pub(super) fn drop_invitation(&mut self, folded: &str) {
         if let Some(signed) = self.signed.as_mut() {
             signed.invitations.remove(folded);
+            signed.welcomes.remove(folded);
         }
     }
 }
@@ -207,8 +250,35 @@ pub struct SignedRoomInfo {
     pub room: String,
     /// The owner's key while the owner is a member; only it may remove.
     pub owner: Option<String>,
+    /// How many MLS Commits the room has accepted: the epoch the next one
+    /// must name.
+    pub epoch: u64,
     /// Members sorted by name, each with its pinned key.
     pub members: Vec<SignedMember>,
+    /// Names invited and not yet joined, sorted: a client pruning departed
+    /// members must not mistake an invitee for one.
+    pub invited: Vec<String>,
+}
+
+/// Most KeyPackages the daemon keeps for one agent; publishing more drops the
+/// oldest.
+pub const MAX_KEY_PACKAGES: usize = 16;
+/// Largest serialized KeyPackage the daemon stores (a real one is a few
+/// hundred bytes).
+pub const MAX_KEY_PACKAGE_BYTES: usize = 1024;
+/// Largest MLS Welcome the daemon stores for one invitee.
+pub const MAX_WELCOME_BYTES: usize = 64 * 1024;
+/// Most Welcome bytes one room holds at a time, over all its invitees.
+const MAX_ROOM_WELCOME_BYTES: usize = 1024 * 1024;
+
+/// The KeyPackages an agent has on offer, after a publish.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyPackageStock {
+    /// The agent.
+    pub agent: String,
+    /// How many are available now.
+    pub available: usize,
 }
 
 /// A signed operation as the REST layer parsed it.
@@ -348,21 +418,116 @@ impl Bus {
                     .signed_remove(&agent, room, key, counter, &target)
                     .map(SignedOutcome::Room)
             }
+            SignedOp::Welcome { target, welcome } => {
+                let target = AgentName::parse(&target)?;
+                state
+                    .signed_store_welcome(&agent, room, key, counter, &target, welcome)
+                    .map(SignedOutcome::Room)
+            }
             SignedOp::Send { body } => {
                 validate_body(&body)?;
                 let envelope = Envelope::encode(counter, &key, &req.signature, &body);
                 let json_len = super::log::json_len(&envelope);
+                let commit_epoch = crate::signed::mls_commit_epoch(&body);
                 let msg = state.send_room(
                     &agent,
                     room,
                     envelope.into_boxed_str(),
                     json_len,
                     self.now_ms(),
-                    SendGate::Signed { key: &key, counter },
+                    SendGate::Signed {
+                        key: &key,
+                        counter,
+                        commit_epoch,
+                    },
                 )?;
                 Ok(SignedOutcome::Sent(SendReceipt::from(&*msg)))
             }
         }
+    }
+
+    /// Offer `packages` (serialized MLS KeyPackages, opaque here) for others
+    /// to add `agent` with. `signature` signs
+    /// [`key_packages_payload`](crate::signed::key_packages_payload) under the
+    /// agent's bound key, with a `counter` above its previous publish. The
+    /// directory keeps at most [`MAX_KEY_PACKAGES`], dropping the oldest.
+    ///
+    /// # Errors
+    ///
+    /// `unregistered`; `key_required`; `invalid_signature`; `stale_counter`
+    /// (carrying the agent's own previous counter); `invalid_body` for an
+    /// empty publish, more than [`MAX_KEY_PACKAGES`] packages, or one over
+    /// [`MAX_KEY_PACKAGE_BYTES`]; `shutting_down`.
+    pub async fn publish_key_packages(
+        &self,
+        agent: &AgentName,
+        counter: u64,
+        packages: Vec<Vec<u8>>,
+        signature: &Signature,
+    ) -> Result<KeyPackageStock, MailErr> {
+        if packages.is_empty()
+            || packages.len() > MAX_KEY_PACKAGES
+            || packages
+                .iter()
+                .any(|p| p.is_empty() || p.len() > MAX_KEY_PACKAGE_BYTES)
+        {
+            return Err(MailErr::InvalidBody);
+        }
+        let (_, found) = self.active(agent)?;
+        let key = found.inner.lock().key.ok_or_else(|| MailErr::KeyRequired {
+            agent: found.name.to_string(),
+        })?;
+        let payload = crate::signed::key_packages_payload(agent.as_str(), counter, &packages);
+        key.verify(&payload, signature)
+            .map_err(|_| MailErr::InvalidSignature)?;
+        let mut st = found.inner.lock();
+        if counter <= st.key_counter {
+            return Err(MailErr::StaleCounter {
+                room: String::new(),
+                last: st.key_counter,
+            });
+        }
+        st.key_counter = counter;
+        st.key_packages.extend(packages);
+        while st.key_packages.len() > MAX_KEY_PACKAGES {
+            st.key_packages.pop_front();
+        }
+        Ok(KeyPackageStock {
+            agent: found.name.to_string(),
+            available: st.key_packages.len(),
+        })
+    }
+
+    /// Hand out one of `agent`'s KeyPackages, oldest first, and forget it:
+    /// each is used for one add. Anyone may ask; a KeyPackage is public.
+    ///
+    /// # Errors
+    ///
+    /// `unregistered`; `no_key_package` when the agent has none left;
+    /// `shutting_down`.
+    pub async fn take_key_package(&self, agent: &AgentName) -> Result<Vec<u8>, MailErr> {
+        let state = self.open()?;
+        let found = state.agent(agent.as_str(), Key::fold(agent.as_str()).as_str())?;
+        let taken = found.inner.lock().key_packages.pop_front();
+        taken.ok_or_else(|| MailErr::NoKeyPackage {
+            agent: found.name.to_string(),
+        })
+    }
+
+    /// The MLS Welcome waiting for `agent` in signed room `room`, if its
+    /// inviter left one. Only an invited agent may read it; everyone else
+    /// gets `room_not_found`. The Welcome stays until the agent joins.
+    ///
+    /// # Errors
+    ///
+    /// `unregistered`; `room_not_found`; `shutting_down`.
+    pub async fn signed_welcome(
+        &self,
+        agent: &AgentName,
+        room: &RoomName,
+    ) -> Result<Option<Vec<u8>>, MailErr> {
+        let (state, agent) = self.active(agent)?;
+        state.signed_welcome(&agent, room)
     }
 
     /// The members of signed room `room` with their pinned keys, for a
@@ -479,6 +644,7 @@ impl State {
                 let signed = st.signed.as_mut().ok_or_else(|| not_a_signed_room(room))?;
                 signed.bump(&found, key, counter)?;
                 signed.invitations.remove(name.as_str());
+                signed.welcomes.remove(name.as_str());
                 signed.pins.insert(name.as_str().to_string(), key);
                 st.invited.remove(name.as_str());
                 st.members.insert(name.as_str().to_string(), member);
@@ -561,6 +727,60 @@ impl State {
         Ok(info)
     }
 
+    fn signed_store_welcome(
+        &self,
+        agent: &Arc<Agent>,
+        room: &RoomName,
+        key: PublicKey,
+        counter: u64,
+        target: &AgentName,
+        welcome: Vec<u8>,
+    ) -> Result<RoomInfo, MailErr> {
+        if welcome.is_empty() || welcome.len() > MAX_WELCOME_BYTES {
+            return Err(MailErr::InvalidBody);
+        }
+        let found = self.signed_room(room)?;
+        let target_key = Key::fold(target.as_str());
+        let mut st = found.inner.lock();
+        st.require_signed_member(&found, agent, room, key)?;
+        let signed = st.signed.as_mut().ok_or_else(|| not_a_signed_room(room))?;
+        if !signed.invitations.contains_key(target_key.as_str()) {
+            return Err(MailErr::NotAMember {
+                agent: target.to_string(),
+                room: found.name.to_string(),
+            });
+        }
+        let held: usize = signed
+            .welcomes
+            .iter()
+            .filter(|(name, _)| name.as_str() != target_key.as_str())
+            .map(|(_, w)| w.len())
+            .sum();
+        if held + welcome.len() > MAX_ROOM_WELCOME_BYTES {
+            return Err(MailErr::InvalidBody);
+        }
+        signed.bump(&found, key, counter)?;
+        signed
+            .welcomes
+            .insert(target_key.as_str().to_string(), welcome);
+        Ok(st.info(&found))
+    }
+
+    fn signed_welcome(&self, agent: &Agent, room: &RoomName) -> Result<Option<Vec<u8>>, MailErr> {
+        let found = self.signed_room(room)?;
+        let st = found.inner.lock();
+        let name = Key::fold(&agent.name);
+        let signed = st
+            .signed
+            .as_ref()
+            .filter(|_| !st.retired)
+            .ok_or_else(|| not_a_signed_room(room))?;
+        if !signed.invitations.contains_key(name.as_str()) {
+            return Err(not_a_signed_room(room));
+        }
+        Ok(signed.welcomes.get(name.as_str()).cloned())
+    }
+
     fn signed_room_info(&self, agent: &Agent, room: &RoomName) -> Result<SignedRoomInfo, MailErr> {
         let found = self.signed_room(room)?;
         let st = found.inner.lock();
@@ -585,10 +805,14 @@ impl State {
                 .to_ascii_lowercase()
                 .cmp(&b.agent.to_ascii_lowercase())
         });
+        let mut invited: Vec<String> = signed.invitations.keys().cloned().collect();
+        invited.sort_unstable();
         Ok(SignedRoomInfo {
             room: found.name.to_string(),
             owner: signed.owner.map(|k| k.to_hex()),
+            epoch: signed.epoch,
             members,
+            invited,
         })
     }
 }

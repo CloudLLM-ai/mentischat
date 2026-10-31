@@ -62,7 +62,10 @@ pub use model::{
     MAX_LIMITED_PAGE_BYTES, MAX_OVERVIEW_AGENTS, MAX_PAGE, MAX_ROOMS_PER_AGENT, MAX_ROOM_MEMBERS,
     MAX_STREAM_BYTES, MAX_STREAM_IN_FLIGHT,
 };
-pub use signed::{KeyBinding, SignedMember, SignedOutcome, SignedRequest, SignedRoomInfo};
+pub use signed::{
+    KeyBinding, KeyPackageStock, SignedMember, SignedOutcome, SignedRequest, SignedRoomInfo,
+    MAX_KEY_PACKAGES, MAX_KEY_PACKAGE_BYTES, MAX_WELCOME_BYTES,
+};
 pub use snapshot::{remove_snapshot, SnapshotError};
 pub use stream::{Push, StreamSession};
 

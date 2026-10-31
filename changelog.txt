@@ -1,5 +1,9 @@
 UNRELEASED
 
+  - test(interop): tests/interop_vectors.rs pins a fixed seed, its public key,
+    the suggested key id and one signature per mentischat domain tag, reproduced
+    with OpenSSL, for MentisDB to assert the same key semantics against.
+
   - feat(security): clients detect a rolled-back secure room. Before each sync
     the client compares the daemon's epoch and the counter the daemon accepted
     from it with the highest it has seen (persisted), and a lower answer or an

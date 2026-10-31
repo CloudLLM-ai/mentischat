@@ -152,12 +152,26 @@ pub fn describe_key(identity: &Identity) -> String {
     let hex = key.to_hex();
     let bytes: Vec<String> = key.as_bytes().iter().map(u8::to_string).collect();
     format!(
-        "agent: {}\npublic key (hex): {hex}\nmentisdb key_id: {}-{}\nmentisdb public_key_bytes: [{}]\n",
+        "agent: {}\npublic key (hex): {hex}\nmentisdb key_id: {}\nmentisdb public_key_bytes: [{}]\n",
         identity.agent(),
-        identity.agent(),
-        yyyymm(),
+        suggested_key_id(identity.agent(), &yyyymm()),
         bytes.join(",")
     )
+}
+
+/// The MentisDB `key_id` this client suggests for `agent` in the month `yyyymm`:
+/// `<agent>-<yyyymm>`, the convention MentisDB documents, so the same key carries
+/// the same label in both systems.
+///
+/// # Examples
+///
+/// ```
+/// use mentischat::client::cli::suggested_key_id;
+///
+/// assert_eq!(suggested_key_id("alice", "202610"), "alice-202610");
+/// ```
+pub fn suggested_key_id(agent: &str, yyyymm: &str) -> String {
+    format!("{agent}-{yyyymm}")
 }
 
 /// The current UTC year and month as `yyyymm`.

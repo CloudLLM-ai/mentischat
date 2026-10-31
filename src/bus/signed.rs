@@ -19,6 +19,7 @@ use std::sync::Arc;
 use serde::Serialize;
 
 use super::rooms::{not_in_room, Room, RoomState};
+use super::signed_persist::OpRec;
 use super::state::{Agent, Key, State};
 use super::{
     validate_body, validate_description, Bus, LeaveOutcome, MailErr, RoomInfo, SendReceipt,
@@ -29,7 +30,7 @@ use crate::signed::{register_key_payload, Envelope, PublicKey, Signature, Signed
 
 /// Most distinct keys a signed room remembers a counter for: the live members
 /// and invitations plus the departed, so a rejoin cannot replay old counters.
-const MAX_WATERMARKS: usize = 4 * MAX_ROOM_MEMBERS;
+pub(super) const MAX_WATERMARKS: usize = 4 * MAX_ROOM_MEMBERS;
 
 /// What a send must prove to enter a room.
 pub(super) enum SendGate<'a> {
@@ -45,6 +46,8 @@ pub(super) enum SendGate<'a> {
         /// The epoch the body commits from when it is an MLS Commit
         /// message (see [`crate::signed::mls_commit_epoch`]).
         commit_epoch: Option<u64>,
+        /// The journal record of a Commit (`Some` exactly when `commit_epoch` is).
+        entry: Option<Box<OpRec>>,
     },
 }
 
@@ -53,30 +56,46 @@ pub(super) enum SendGate<'a> {
 pub(super) struct SignedState {
     /// The founder's key while the founder is a member; only the owner may
     /// remove others.
-    owner: Option<PublicKey>,
+    pub(super) owner: Option<PublicKey>,
     /// The key pinned for each member, by folded name.
-    pins: HashMap<String, PublicKey>,
+    pub(super) pins: HashMap<String, PublicKey>,
     /// The key each pending invitation pinned, by folded name.
-    invitations: HashMap<String, PublicKey>,
+    pub(super) invitations: HashMap<String, PublicKey>,
     /// Highest counter each key has signed in this room.
-    watermarks: HashMap<PublicKey, u64>,
+    pub(super) watermarks: HashMap<PublicKey, u64>,
     /// How many Commit messages the room has accepted: the epoch a member's
     /// next Commit must name. Starts at 0.
-    epoch: u64,
+    pub(super) epoch: u64,
     /// MLS Welcomes waiting for invitees, by folded name.
-    welcomes: HashMap<String, Vec<u8>>,
+    pub(super) welcomes: HashMap<String, Vec<u8>>,
+    /// The signed operations that built the room, in order, for the snapshot.
+    pub(super) journal: Vec<OpRec>,
+    /// Set when the journal outgrew its cap: the room is not saved.
+    pub(super) overflow: bool,
 }
 
 impl SignedState {
     /// A room founded by `owner` (folded name `name`) at `counter`.
-    fn founded(name: &str, owner: PublicKey, counter: u64) -> Self {
+    fn founded(name: &str, owner: PublicKey, counter: u64, entry: &OpRec) -> Self {
+        let mut state = Self::empty();
+        state.owner = Some(owner);
+        state.pins.insert(name.to_string(), owner);
+        state.watermarks.insert(owner, counter);
+        state.record(entry);
+        state
+    }
+
+    /// A room with nothing in it, the starting point of a replay.
+    pub(super) fn empty() -> Self {
         Self {
-            owner: Some(owner),
-            pins: HashMap::from([(name.to_string(), owner)]),
+            owner: None,
+            pins: HashMap::new(),
             invitations: HashMap::new(),
-            watermarks: HashMap::from([(owner, counter)]),
+            watermarks: HashMap::new(),
             epoch: 0,
             welcomes: HashMap::new(),
+            journal: Vec::new(),
+            overflow: false,
         }
     }
 
@@ -143,6 +162,7 @@ impl RoomState {
                 key,
                 counter,
                 commit_epoch,
+                ..
             } => {
                 let name = Key::fold(&sender.name);
                 let signed = self.signed.as_ref().ok_or_else(|| MailErr::RoomNotFound {
@@ -171,6 +191,7 @@ impl RoomState {
                 key,
                 counter,
                 commit_epoch,
+                entry,
             },
             Some(signed),
         ) = (gate, self.signed.as_mut())
@@ -178,6 +199,9 @@ impl RoomState {
             signed.watermarks.insert(**key, *counter);
             if commit_epoch.is_some() {
                 signed.epoch += 1;
+                if let Some(entry) = entry {
+                    signed.record(entry);
+                }
             }
         }
     }
@@ -351,6 +375,7 @@ impl Bus {
             }),
             _ => {
                 st.key = Some(key);
+                st.key_proof = Some(*signature);
                 Ok(KeyBinding {
                     agent: found.name.to_string(),
                     public_key: key.to_hex(),
@@ -395,12 +420,26 @@ impl Bus {
         key.verify(&payload, &req.signature)
             .map_err(|_| MailErr::InvalidSignature)?;
         let (room, counter) = (&req.room, req.counter);
+        // The journal record, built for every operation but a plain message
+        // (only Commits among sends are journaled), so ordinary sends copy nothing.
+        let entry = match &req.op {
+            SignedOp::Send { body } => crate::signed::mls_commit_epoch(body)
+                .map(|_| OpRec::new(req.agent.as_str(), &key, counter, &req.signature, &req.op)),
+            op => Some(OpRec::new(
+                req.agent.as_str(),
+                &key,
+                counter,
+                &req.signature,
+                op,
+            )),
+        };
+        let need = || entry.as_ref().ok_or(MailErr::InvalidBody);
         match req.op {
             SignedOp::Create { description } => {
                 let description =
                     Some(validate_description(description)?).filter(|d| !d.is_empty());
                 state
-                    .signed_create(&agent, room, key, counter, description)
+                    .signed_create(&agent, room, key, counter, description, need()?)
                     .map(SignedOutcome::Room)
             }
             SignedOp::Invite {
@@ -418,28 +457,33 @@ impl Bus {
                     Some(bound) if bound != invitee_key => Err(MailErr::KeyConflict {
                         agent: invitee.name.to_string(),
                     }),
-                    Some(_) => {
-                        state.signed_invite(&agent, room, key, counter, &invitee, invitee_key)
-                    }
+                    Some(_) => state.signed_invite(
+                        &agent,
+                        room,
+                        key,
+                        counter,
+                        (&invitee, invitee_key),
+                        need()?,
+                    ),
                 }
                 .map(SignedOutcome::Room)
             }
             SignedOp::Join => state
-                .signed_join(&agent, room, key, counter)
+                .signed_join(&agent, room, key, counter, need()?)
                 .map(SignedOutcome::Room),
             SignedOp::Leave => state
-                .signed_leave(&agent, room, key, counter)
+                .signed_leave(&agent, room, key, counter, need()?)
                 .map(SignedOutcome::Left),
             SignedOp::Remove { target } => {
                 let target = AgentName::parse(&target)?;
                 state
-                    .signed_remove(&agent, room, key, counter, &target)
+                    .signed_remove(&agent, room, key, counter, &target, need()?)
                     .map(SignedOutcome::Room)
             }
             SignedOp::Welcome { target, welcome } => {
                 let target = AgentName::parse(&target)?;
                 state
-                    .signed_store_welcome(&agent, room, key, counter, &target, welcome)
+                    .signed_store_welcome(&agent, room, key, counter, (&target, welcome), need()?)
                     .map(SignedOutcome::Room)
             }
             SignedOp::Send { body } => {
@@ -457,6 +501,7 @@ impl Bus {
                         key: &key,
                         counter,
                         commit_epoch,
+                        entry: entry.clone().map(Box::new),
                     },
                 )?;
                 Ok(SignedOutcome::Sent(SendReceipt::from(&*msg)))
@@ -629,8 +674,9 @@ impl State {
         key: PublicKey,
         counter: u64,
         description: Option<String>,
+        entry: &OpRec,
     ) -> Result<RoomInfo, MailErr> {
-        let signed = SignedState::founded(Key::fold(&agent.name).as_str(), key, counter);
+        let signed = SignedState::founded(Key::fold(&agent.name).as_str(), key, counter, entry);
         self.create_room_with(agent, room, true, description, Some(signed))
     }
 
@@ -646,8 +692,8 @@ impl State {
         room: &RoomName,
         key: PublicKey,
         counter: u64,
-        invitee: &Arc<Agent>,
-        invitee_key: PublicKey,
+        (invitee, invitee_key): (&Arc<Agent>, PublicKey),
+        entry: &OpRec,
     ) -> Result<RoomInfo, MailErr> {
         let found = self.signed_room(room)?;
         let mut st = found.inner.lock();
@@ -663,6 +709,7 @@ impl State {
             }
             let signed = st.signed.as_mut().ok_or_else(|| not_a_signed_room(room))?;
             signed.bump(&found, key, counter)?;
+            signed.record(entry);
             signed
                 .invitations
                 .insert(invitee_name.as_str().to_string(), invitee_key);
@@ -684,6 +731,7 @@ impl State {
         room: &RoomName,
         key: PublicKey,
         counter: u64,
+        entry: &OpRec,
     ) -> Result<RoomInfo, MailErr> {
         let found = self.signed_room(room)?;
         if agent.inner.lock().rooms.len() >= MAX_ROOMS_PER_AGENT {
@@ -711,6 +759,7 @@ impl State {
                 let signed = st.signed.as_mut().ok_or_else(|| not_a_signed_room(room))?;
                 signed.bump(&found, key, counter)?;
                 signed.welcomes.remove(name.as_str());
+                signed.forget_welcomes(name.as_str());
             } else {
                 let pinned = st
                     .signed
@@ -729,6 +778,8 @@ impl State {
                 }
                 let signed = st.signed.as_mut().ok_or_else(|| not_a_signed_room(room))?;
                 signed.bump(&found, key, counter)?;
+                signed.record(entry);
+                signed.forget_welcomes(name.as_str());
                 signed.invitations.remove(name.as_str());
                 signed.welcomes.remove(name.as_str());
                 signed.pins.insert(name.as_str().to_string(), key);
@@ -747,6 +798,7 @@ impl State {
         room: &RoomName,
         key: PublicKey,
         counter: u64,
+        entry: &OpRec,
     ) -> Result<LeaveOutcome, MailErr> {
         let found = self.signed_room(room)?;
         let name = Key::fold(&agent.name);
@@ -755,6 +807,7 @@ impl State {
             st.require_signed_member(&found, agent, room, key)?;
             let signed = st.signed.as_mut().ok_or_else(|| not_a_signed_room(room))?;
             signed.bump(&found, key, counter)?;
+            signed.record(entry);
             st.drop_pin(name.as_str());
             st.members.remove(name.as_str());
             st.members.is_empty()
@@ -776,6 +829,7 @@ impl State {
         key: PublicKey,
         counter: u64,
         target: &AgentName,
+        entry: &OpRec,
     ) -> Result<RoomInfo, MailErr> {
         let found = self.signed_room(room)?;
         let name = Key::fold(&agent.name);
@@ -801,6 +855,8 @@ impl State {
             }
             let signed = st.signed.as_mut().ok_or_else(|| not_a_signed_room(room))?;
             signed.bump(&found, key, counter)?;
+            signed.record(entry);
+            signed.forget_welcomes(target_key.as_str());
             st.drop_pin(target_key.as_str());
             st.drop_invitation(target_key.as_str());
             st.invited.remove(target_key.as_str());
@@ -819,8 +875,8 @@ impl State {
         room: &RoomName,
         key: PublicKey,
         counter: u64,
-        target: &AgentName,
-        welcome: Vec<u8>,
+        (target, welcome): (&AgentName, Vec<u8>),
+        entry: &OpRec,
     ) -> Result<RoomInfo, MailErr> {
         if welcome.is_empty() || welcome.len() > MAX_WELCOME_BYTES {
             return Err(MailErr::InvalidBody);
@@ -847,6 +903,8 @@ impl State {
             return Err(MailErr::InvalidBody);
         }
         signed.bump(&found, key, counter)?;
+        signed.forget_welcomes(target_key.as_str());
+        signed.record(entry);
         signed
             .welcomes
             .insert(target_key.as_str().to_string(), welcome);

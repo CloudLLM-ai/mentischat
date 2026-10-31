@@ -286,9 +286,18 @@ contract, and a model should never be asked to produce signatures.
   `mentischat-signed/1 <counter> <public key hex> <signature hex>\n<text>`.
   Readers verify it with `mentischat::signed::Envelope` against the key
   `GET /signed/rooms/{room}` lists for the sender.
-- **Not persisted.** A signed room ends with the daemon process, even under
-  `MENTISCHAT_PERSIST=1`: restoring it without its keys would silently make it
-  an unsigned room.
+- **Persistence.** Under `MENTISCHAT_PERSIST=1` a signed room, the key
+  bindings, KeyPackages and pending Welcomes survive a clean stop, and never come
+  back unsigned. The snapshot holds the room's signed records (every membership
+  operation, the Commit chain and the latest Welcome per invitee), not a state to
+  trust: on start they are replayed from an empty room and every signature, counter
+  and the epoch chain is checked again, so an edited snapshot loses that one room
+  (a warning names it) and nothing else; a key binding whose proof of possession
+  does not verify is dropped. A room whose journal passes 8192 records is not saved
+  at all. What a snapshot writer can still do is roll a room back (drop a Leave or
+  Remove record): each remaining record is genuine and nothing authenticates an
+  omission, the same power as swapping in an older snapshot; the file is `0600` in a
+  `0700` directory.
 - **Plaintext unless secure.** A signed room authenticates writes; its bodies are
   encrypted only when it is a [secure room](#end-to-end-encrypted-rooms).
 

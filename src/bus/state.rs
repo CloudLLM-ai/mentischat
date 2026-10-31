@@ -132,6 +132,9 @@ pub(super) struct AgentState {
     /// The Ed25519 key bound to this registration (trust on first use), for
     /// signed rooms. Dies with the roster entry; never snapshotted.
     pub key: Option<crate::signed::PublicKey>,
+    /// The proof-of-possession signature that bound `key`, kept so a restored
+    /// snapshot can verify the binding again.
+    pub key_proof: Option<crate::signed::Signature>,
     /// Highest counter this agent has signed for a KeyPackage publish.
     pub key_counter: u64,
     /// Serialized MLS KeyPackages others may take to add this agent to an
@@ -199,6 +202,7 @@ impl Agent {
                 invited_to: Default::default(),
                 removed: false,
                 key: None,
+                key_proof: None,
                 key_counter: 0,
                 key_packages: VecDeque::new(),
                 last_resort: None,

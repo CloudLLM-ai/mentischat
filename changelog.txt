@@ -1,5 +1,15 @@
 UNRELEASED
 
+  - feat(security): signed rooms, key bindings, KeyPackages and pending Welcomes
+    survive a restart under MENTISCHAT_PERSIST=1 and never come back unsigned.
+    The snapshot holds the signed records (membership operations, the Commit
+    chain, the latest Welcome per invitee); restore replays them from an empty
+    room and re-verifies every signature, counter and the epoch chain, so a
+    tampered snapshot loses only the room it touches, and a key binding whose
+    proof of possession fails is dropped. Rooms past 8192 records are not saved.
+    Omitting a record (rolling a room back) is not detectable, as with swapping
+    in an older snapshot; see docs/SIGNED_ROOMS.md.
+
   - feat(security): post-compromise recovery and re-add for secure rooms. The
     client proxy refreshes its key in each room with an MLS self-update every
     --update-messages sent messages (default 100) or --update-minutes (default

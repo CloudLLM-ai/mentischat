@@ -899,30 +899,6 @@ async fn a_tampered_request_fails_verification() {
     );
 }
 
-/// A signed room is not snapshotted: it ends with the process rather than
-/// coming back unsigned; plain rooms survive as before.
-#[tokio::test]
-async fn signed_rooms_are_not_persisted_but_plain_ones_are() {
-    let dir = tempfile::tempdir().unwrap();
-    let data = dir.path().join("persist");
-    let bus = Bus::new(&data).unwrap();
-    let (_alice, _bob) = alice_and_bob(&bus).await;
-    bus.create_room(&name("alice"), &room("plain"), true, None)
-        .await
-        .unwrap();
-    bus.close().await;
-
-    let bus = Bus::new(&data).unwrap();
-    let rooms = bus.list_rooms(&name("alice")).await.unwrap().rooms;
-    let names: Vec<&str> = rooms.iter().map(|r| r.room.as_str()).collect();
-    assert_eq!(names, ["plain"]);
-    let err = bus
-        .send_room(&name("alice"), &room("ops"), "x".into())
-        .await
-        .unwrap_err();
-    assert_eq!(code(err), "room_not_found");
-}
-
 /// Many signed senders at once: every message is delivered exactly once and
 /// every counter is consumed once (a racing duplicate loses).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -43,6 +43,7 @@ mod park;
 mod rooms;
 mod sharded;
 mod signed;
+mod signed_persist;
 mod snapshot;
 mod state;
 mod stream;

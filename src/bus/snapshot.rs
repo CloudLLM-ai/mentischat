@@ -19,12 +19,14 @@ use serde::{Deserialize, Serialize};
 use super::clock::Clock;
 use super::log::{json_len, Msg, Target};
 use super::rooms::{Member, Room, RoomState};
+use super::signed_persist::{replay, Replayed, SignedRec};
 use super::state::{convo_key, Agent, Hold, Key, State};
 use super::{
     Bus, Retention, MAX_PENDING_PER_AGENT, MAX_ROOMS, MAX_ROOMS_PER_AGENT, MAX_ROOM_MEMBERS,
     MAX_ROSTER, MAX_TOTAL_MESSAGES,
 };
 use crate::names::{AgentName, Provider, RoomName};
+use crate::signed::{hex_decode_vec, hex_encode, register_key_payload, PublicKey, Signature};
 
 /// File name of the snapshot inside the data directory.
 const SNAPSHOT_FILE: &str = "snapshot.json";
@@ -112,6 +114,9 @@ struct RoomRec {
     invited: Vec<String>,
     /// Retained messages, oldest first; `to` and `read_ms` are unused.
     messages: Vec<MsgRec>,
+    /// Present for a signed room: the signed records it is rebuilt from.
+    #[serde(default)]
+    signed: Option<SignedRec>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -128,6 +133,24 @@ struct AgentRec {
     description: Option<String>,
     registered_ms: u64,
     last_seen_ms: u64,
+    /// The Ed25519 key bound to the name, with its proof of possession; verified
+    /// again on restore. Absent from snapshots from before signed rooms.
+    #[serde(default)]
+    key: Option<KeyRec>,
+    #[serde(default)]
+    key_counter: u64,
+    /// Ordinary KeyPackages on offer, hex. Opaque; clients validate them on use.
+    #[serde(default)]
+    key_packages: Vec<String>,
+    #[serde(default)]
+    last_resort: Option<String>,
+}
+
+/// A bound key and the signature that proved its holder asked for the binding.
+#[derive(Debug, Serialize, Deserialize)]
+struct KeyRec {
+    public_key: String,
+    signature: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -217,6 +240,13 @@ pub(super) fn capture(state: &State) -> Snapshot {
                     description: st.description.clone(),
                     registered_ms: st.registered_ms,
                     last_seen_ms: st.last_seen_ms,
+                    key: st.key.zip(st.key_proof).map(|(k, p)| KeyRec {
+                        public_key: k.to_hex(),
+                        signature: p.to_hex(),
+                    }),
+                    key_counter: st.key_counter,
+                    key_packages: st.key_packages.iter().map(|p| hex_encode(p)).collect(),
+                    last_resort: st.last_resort.as_deref().map(hex_encode),
                 }
             })
             .collect(),
@@ -240,9 +270,15 @@ pub(super) fn capture(state: &State) -> Snapshot {
 
 fn room_rec(room: &Room) -> Option<RoomRec> {
     let st = room.inner.lock();
-    // A signed room is not saved: restoring it without its pinned keys would
-    // quietly turn it into an unsigned room, so it ends with the process.
-    (!st.retired && st.signed.is_none()).then(|| RoomRec {
+    // A signed room is saved as the signed records it is rebuilt from (and
+    // verified against) on restore; one whose journal outgrew its cap is not
+    // saved at all rather than saved incompletely.
+    let signed = match st.signed.as_ref() {
+        Some(state) => Some(state.to_rec()?),
+        None => None,
+    };
+    (!st.retired).then(|| RoomRec {
+        signed,
         name: room.name.to_string(),
         private: room.private,
         description: room.description.clone(),
@@ -398,6 +434,8 @@ fn restore_agents(state: &State, agents: Vec<AgentRec>) -> usize {
             skipped += 1;
             continue;
         }
+        let (key_rec, key_counter, packages, last_resort) =
+            (rec.key, rec.key_counter, rec.key_packages, rec.last_resort);
         let provider = rec.provider.map(|p| Provider::parse(&p));
         let description = rec.description.map(super::validate_description);
         skipped += usize::from(matches!(provider, Some(Err(_))));
@@ -413,7 +451,54 @@ fn restore_agents(state: &State, agents: Vec<AgentRec>) -> usize {
             rec.registered_ms,
             rec.last_seen_ms,
         );
+        skipped += restore_keys(&agent, key_rec, key_counter, packages, last_resort);
         state.add_agent(key, Arc::new(agent));
+    }
+    skipped
+}
+
+/// Restore an agent's bound key (only if its proof of possession verifies
+/// again), its KeyPackage counter and the KeyPackages on offer (those within
+/// the size and count caps). Returns how many entries were dropped.
+fn restore_keys(
+    agent: &Agent,
+    key: Option<KeyRec>,
+    key_counter: u64,
+    packages: Vec<String>,
+    last_resort: Option<String>,
+) -> usize {
+    let mut skipped = 0;
+    let mut st = agent.inner.lock();
+    if let Some(rec) = key {
+        let bound = rec.public_key.parse::<PublicKey>().ok().and_then(|k| {
+            let proof = rec.signature.parse::<Signature>().ok()?;
+            k.verify(&register_key_payload(&agent.name, &k), &proof)
+                .ok()
+                .map(|()| (k, proof))
+        });
+        match bound {
+            Some((k, proof)) => {
+                st.key = Some(k);
+                st.key_proof = Some(proof);
+                st.key_counter = key_counter;
+            }
+            None => skipped += 1,
+        }
+    }
+    let decode = |hex: &str| {
+        hex_decode_vec(hex)
+            .ok()
+            .filter(|p| !p.is_empty() && p.len() <= super::MAX_KEY_PACKAGE_BYTES)
+    };
+    if st.key.is_some() {
+        let all = packages.len();
+        st.key_packages = packages
+            .iter()
+            .filter_map(|p| decode(p))
+            .take(super::MAX_KEY_PACKAGES)
+            .collect();
+        skipped += usize::from(st.key_packages.len() < all);
+        st.last_resort = last_resort.as_deref().and_then(decode);
     }
     skipped
 }
@@ -510,6 +595,34 @@ fn restore_room(state: &State, ids: &mut HashSet<u64>, rec: RoomRec) -> usize {
     if state.rooms.get(&key).is_some() || state.rooms.len() >= MAX_ROOMS {
         return 1;
     }
+    // A signed room is rebuilt by replaying and re-verifying its signed
+    // records; one that does not verify is rejected whole, here, before it
+    // claims anything.
+    let replayed = match &rec.signed {
+        None => None,
+        Some(saved) => {
+            let retained: Vec<(&str, &str)> = rec
+                .messages
+                .iter()
+                .map(|m| (m.from.as_str(), m.body.as_str()))
+                .collect();
+            match replay(&key, saved, &retained) {
+                Ok(replayed) => Some(replayed),
+                Err(why) => {
+                    tracing::warn!(room = %rec.name, why, "a signed room failed verification and was dropped");
+                    return 1;
+                }
+            }
+        }
+    };
+    let saved_members = match &replayed {
+        Some(r) => rec
+            .members
+            .into_iter()
+            .filter(|m| r.state.pins.contains_key(&m.name.to_ascii_lowercase()))
+            .collect(),
+        None => rec.members,
+    };
     let name: Arc<str> = room_name.as_str().into();
     let RoomLog {
         log,
@@ -520,18 +633,26 @@ fn restore_room(state: &State, ids: &mut HashSet<u64>, rec: RoomRec) -> usize {
         log,
         ..RoomState::default()
     };
-    let joined = restore_members(state, &mut st, rec.members, &mut skipped);
+    let joined = restore_members(state, &mut st, saved_members, &mut skipped);
     if st.members.is_empty() {
         state.release_bytes(reserved);
         return skipped + 1;
     }
-    restore_invites(&mut st, rec.invited);
+    let signed = replayed.map(|r| seat_signed(state, &mut st, r));
+    if signed.is_none() {
+        restore_invites(&mut st, rec.invited);
+    }
     st.publish_oldest();
     let invited: Vec<String> = st.invited.iter().cloned().collect();
+    let private = rec.private || signed.is_some();
+    let description = match signed {
+        Some(description) => description,
+        None => rec.description,
+    };
     let room = Arc::new(Room {
         name,
-        private: rec.private,
-        description: rec.description,
+        private,
+        description,
         oldest: st.oldest.clone(),
         inner: parking_lot::Mutex::new(st),
     });
@@ -540,7 +661,7 @@ fn restore_room(state: &State, ids: &mut HashSet<u64>, rec: RoomRec) -> usize {
     }
     note_invitations(state, &key, &invited);
     if state.rooms.try_insert(&key, room).is_ok() {
-        if !rec.private {
+        if !private {
             state.public_names.write().insert(key);
         }
         skipped
@@ -548,6 +669,34 @@ fn restore_room(state: &State, ids: &mut HashSet<u64>, rec: RoomRec) -> usize {
         state.release_bytes(reserved);
         skipped + 1
     }
+}
+
+/// Install a replayed signed room's state in `st`, trimmed to what is really
+/// here: only members that were seated keep their pinned key (the rest left
+/// the roster, as `leave_all_rooms` would have had them leave), only invitees
+/// still on the roster keep their invitation and Welcome, and the owner is
+/// cleared if the owner is gone. Returns the room's description.
+fn seat_signed(state: &State, st: &mut RoomState, replayed: Replayed) -> Option<String> {
+    let Replayed {
+        state: mut signed,
+        description,
+    } = replayed;
+    signed.pins.retain(|name, _| st.members.contains_key(name));
+    if let Some(owner) = signed.owner {
+        if !signed.pins.values().any(|k| *k == owner) {
+            signed.owner = None;
+        }
+    }
+    signed
+        .invitations
+        .retain(|name, _| state.roster.get(name).is_some() && !st.members.contains_key(name));
+    let (pins, invitations) = (&signed.pins, &signed.invitations);
+    signed
+        .welcomes
+        .retain(|name, _| pins.contains_key(name) || invitations.contains_key(name));
+    st.invited = signed.invitations.keys().cloned().collect();
+    st.signed = Some(signed);
+    description
 }
 
 /// A room's retained messages: the newest [`State::room_capacity`] of the

@@ -157,8 +157,9 @@ Rules, enforced by the daemon:
 - Signature checked **before** taking the room lock (verification is the slow
   part), counter and membership checked **under** it, so check-then-append is
   atomic.
-- A signed room is not written to snapshots: after a persisted restart it is
-  gone rather than silently downgraded to an unsigned room.
+- With `MENTISCHAT_PERSIST=1` a signed room is saved as its signed records and
+  rebuilt by replaying and re-verifying them (see Persistence below); it can
+  never come back as an unsigned room.
 
 Envelope, the stored and delivered `body` of a signed send:
 
@@ -285,6 +286,45 @@ Chosen: `openmls` 0.8.3 with `openmls_rust_crypto` 0.5, `openmls_basic_credentia
 declares none and builds and passes on 1.88 (`make msrv`). The numbers are in
 the changelog entry and the README.
 
+## Persistence
+
+Under `MENTISCHAT_PERSIST=1` the daemon writes a snapshot on a clean stop and
+reads it on the next start. For signed rooms the snapshot holds **the signed
+records, not the state they produce**:
+
+- per room, a **journal** of the signed operations in order (`create`, `invite`,
+  `join`, `leave`, `remove`, `welcome`, and the `send`s that are Commits), each
+  with the signer, key, counter and signature; and the counter watermarks;
+- per agent, the bound key with its proof-of-possession signature, the KeyPackage
+  counter, the KeyPackages and the last-resort package.
+
+Restore replays each journal from an empty room through the rules the live daemon
+applies and verifies every signature again. A record that does not verify, a
+counter that does not rise, an invite by a non-member, a join without a matching
+invitation, a remove by a non-owner, a Commit that does not name the next epoch
+(the epoch is rebuilt by counting Commits from 0), a first record that is not
+`create`, or a retained message whose envelope fails or was signed by a key the
+journal never saw, rejects **that room** and logs why, the way the existing
+restore treats a hostile snapshot. Members come only from the verified journal
+(a name added to the file's member list is ignored), only those still on the
+roster are seated, and a room restores as a signed room or not at all. Watermarks
+come back as the larger of the saved ones and what the verified records and
+retained messages show, so lowering a number in the file cannot reopen a counter
+the records already closed. KeyPackages are opaque to the daemon and clients
+validate them on use. A key binding whose proof does not verify is dropped.
+
+Compaction: a Welcome that was replaced, consumed or revoked leaves the journal,
+so it holds at most one per invitee; a room whose journal passes 8192 records is
+not saved at all (it ends with the process) rather than saved in part.
+
+Residual risk: nothing authenticates an **omission**. Someone who can rewrite the
+snapshot can drop a `leave` or `remove` record (resurrecting a member) or
+truncate the tail (rolling the room back); every remaining record is genuine and
+the chain still verifies, exactly as if an older snapshot had been put back.
+Reordering or repeating records cannot forge a state (a repeat spends a counter
+twice; a swap either breaks the chain or commutes to the same room). The snapshot
+is `0600` in a `0700` directory and is deleted after it is read.
+
 ## Key refresh and recovery
 
 **Self-update.** `Client::self_update` Commits an empty update: the member's leaf
@@ -315,9 +355,10 @@ cannot be answered; any member can run the re-add by hand.
 - One key per name; no device multiplicity. A name's key is bound trust on
   first use: the first process to bind a name wins until that registration
   leaves the roster.
-- Signed rooms, key bindings and the KeyPackage directory are in memory only; a
-  daemon restart ends them. Client state survives, but the groups are then
-  orphaned and must be recreated.
+- Signed rooms, key bindings and the KeyPackage directory survive a clean stop only
+  with `MENTISCHAT_PERSIST=1`, and a crash loses them (as it loses everything the
+  daemon holds); the client's own state survives either way, and a group whose room
+  is gone must be recreated.
 - A removed or departed member keeps what it already decrypted; MLS protects
   what comes after.
 - A member's own message is not echoed back by the daemon; the client logs it

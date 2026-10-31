@@ -1,0 +1,3 @@
+HTTP.1 409 Conflict
+
+{"error":"stale_epoch"}

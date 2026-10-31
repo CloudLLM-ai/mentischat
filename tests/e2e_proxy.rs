@@ -1,0 +1,422 @@
+//! The stdio MCP proxy end to end: two harnesses, each behind its own proxy,
+//! talking through a real daemon. The "harness" side here only ever sends and
+//! receives MCP JSON text, as a model would.
+#![cfg(feature = "e2e")]
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use mentischat::bus::Bus;
+use mentischat::client::cli::{describe_key, parse, Command};
+use mentischat::client::{proxy, Client, Daemon, Identity};
+use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+/// One MCP stdio session against a proxy running on a duplex pipe.
+struct Harness {
+    writer: tokio::io::DuplexStream,
+    reader: BufReader<tokio::io::DuplexStream>,
+    next_id: u64,
+}
+
+impl Harness {
+    fn spawn(client: Client, daemon: Daemon) -> Self {
+        let (to_proxy, proxy_in) = tokio::io::duplex(1 << 20);
+        let (proxy_out, from_proxy) = tokio::io::duplex(1 << 20);
+        tokio::spawn(proxy::serve(
+            client,
+            daemon,
+            BufReader::new(proxy_in),
+            proxy_out,
+        ));
+        Self {
+            writer: to_proxy,
+            reader: BufReader::new(from_proxy),
+            next_id: 1,
+        }
+    }
+
+    async fn rpc(&mut self, method: &str, params: Value) -> Value {
+        self.next_id += 1;
+        let line =
+            json!({ "jsonrpc": "2.0", "id": self.next_id, "method": method, "params": params });
+        self.writer
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .unwrap();
+        let mut reply = String::new();
+        self.reader.read_line(&mut reply).await.unwrap();
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["id"], self.next_id);
+        reply
+    }
+
+    /// A tool call: `(is_error, parsed JSON text)`.
+    async fn tool(&mut self, name: &str, args: Value) -> (bool, Value) {
+        let reply = self
+            .rpc("tools/call", json!({ "name": name, "arguments": args }))
+            .await;
+        let result = &reply["result"];
+        let text = result["content"][0]["text"].as_str().expect("text content");
+        (
+            result["isError"] == true,
+            serde_json::from_str(text).unwrap_or(Value::Null),
+        )
+    }
+}
+
+struct World {
+    _dir: tempfile::TempDir,
+    daemon: Daemon,
+    clients: std::path::PathBuf,
+}
+
+async fn world() -> World {
+    let dir = tempfile::tempdir().unwrap();
+    let bus = Arc::new(Bus::new(&dir.path().join("daemon")).unwrap());
+    let app = mentischat::build_router(bus);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .ok();
+    });
+    World {
+        clients: dir.path().join("clients"),
+        daemon: Daemon::new(addr),
+        _dir: dir,
+    }
+}
+
+impl World {
+    fn harness(&self, agent: &str) -> Harness {
+        let id = Identity::open(&self.clients, agent).unwrap();
+        Harness::spawn(Client::open(id, self.daemon).unwrap(), self.daemon)
+    }
+}
+
+fn names(v: &Value) -> Vec<&str> {
+    v.as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m.as_str().unwrap())
+        .collect()
+}
+
+/// The proxy is an MCP server: it initializes, lists the daemon's eleven tools
+/// unchanged except that `create_room` gains `secure`, and answers ping.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_proxy_lists_the_daemons_tools_plus_secure() {
+    let w = world().await;
+    let mut h = w.harness("alice");
+    let init = h
+        .rpc(
+            "initialize",
+            json!({ "protocolVersion": "2025-06-18", "capabilities": {} }),
+        )
+        .await;
+    assert_eq!(init["result"]["serverInfo"]["name"], "mentischat-client");
+    assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
+    let list = h.rpc("tools/list", json!({})).await;
+    let tools = list["result"]["tools"].as_array().unwrap();
+    let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(tool_names.len(), 11);
+    assert!(tool_names.contains(&"send_message") && tool_names.contains(&"create_room"));
+    let create = tools.iter().find(|t| t["name"] == "create_room").unwrap();
+    assert_eq!(
+        create["inputSchema"]["properties"]["secure"]["type"],
+        "boolean"
+    );
+    let register = tools.iter().find(|t| t["name"] == "register").unwrap();
+    assert!(register["inputSchema"]["properties"]
+        .get("secure")
+        .is_none());
+    assert_eq!(h.rpc("ping", json!({})).await["result"], json!({}));
+    assert_eq!(h.rpc("nonsense", json!({})).await["error"]["code"], -32601);
+}
+
+/// Two harnesses hold a secure conversation through the proxies using only the
+/// ordinary tool names, and see plain text throughout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_harnesses_converse_in_a_secure_room_with_the_usual_tools() {
+    let w = world().await;
+    let (mut alice, mut bob) = (w.harness("alice"), w.harness("bob"));
+    for (h, name) in [(&mut alice, "alice"), (&mut bob, "bob")] {
+        let (err, body) = h.tool("register", json!({ "agent": name })).await;
+        assert!(!err, "{body}");
+        assert_eq!(body["secure"], true, "{body}");
+    }
+    let (err, room) = alice
+        .tool(
+            "create_room",
+            json!({ "agent": "alice", "room": "den", "secure": true }),
+        )
+        .await;
+    assert!(!err, "{room}");
+    assert_eq!(
+        (room["secure"].as_bool(), room["private"].as_bool()),
+        (Some(true), Some(true))
+    );
+
+    let (err, room) = alice
+        .tool(
+            "invite",
+            json!({ "agent": "alice", "room": "den", "invitee": "bob" }),
+        )
+        .await;
+    assert!(!err, "{room}");
+    let (err, room) = bob
+        .tool("join_room", json!({ "agent": "bob", "room": "den" }))
+        .await;
+    assert!(!err, "{room}");
+    assert_eq!(names(&room["members"]).len(), 2);
+
+    let (err, receipt) = alice
+        .tool(
+            "send_message",
+            json!({ "from": "alice", "room": "den", "body": "No reply needed: the vault code is 1234" }),
+        )
+        .await;
+    assert!(!err, "{receipt}");
+    assert_eq!(receipt["room"], "den");
+
+    let (err, page) = bob
+        .tool("check_inbox", json!({ "agent": "bob", "wait_ms": 0 }))
+        .await;
+    assert!(!err, "{page}");
+    let messages = page["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 1, "{page}");
+    assert_eq!(
+        messages[0]["body"],
+        "No reply needed: the vault code is 1234"
+    );
+    assert_eq!(
+        (messages[0]["from"].as_str(), messages[0]["room"].as_str()),
+        (Some("alice"), Some("den"))
+    );
+
+    // Seen once; history still shows it; the other direction works too.
+    let (_, again) = bob.tool("check_inbox", json!({ "agent": "bob" })).await;
+    assert!(again["messages"].as_array().unwrap().is_empty(), "{again}");
+    let (_, hist) = bob
+        .tool("history", json!({ "agent": "bob", "room": "den" }))
+        .await;
+    assert_eq!(
+        hist["messages"][0]["body"],
+        "No reply needed: the vault code is 1234"
+    );
+    bob.tool(
+        "send_message",
+        json!({ "from": "bob", "room": "den", "body": "Reply when you can: noted" }),
+    )
+    .await;
+    let (_, page) = alice.tool("check_inbox", json!({ "agent": "alice" })).await;
+    assert_eq!(page["messages"][0]["body"], "Reply when you can: noted");
+}
+
+/// Ordinary rooms and direct mail pass through the proxy exactly as they do
+/// without it, alongside a secure room.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plain_rooms_and_direct_mail_pass_straight_through() {
+    let w = world().await;
+    let (mut alice, mut bob) = (w.harness("alice"), w.harness("bob"));
+    alice.tool("register", json!({ "agent": "alice" })).await;
+    bob.tool("register", json!({ "agent": "bob" })).await;
+    let (err, room) = alice
+        .tool("create_room", json!({ "agent": "alice", "room": "lobby" }))
+        .await;
+    assert!(!err, "{room}");
+    assert!(
+        room.get("secure").is_none(),
+        "a plain room is not marked: {room}"
+    );
+    bob.tool("join_room", json!({ "agent": "bob", "room": "lobby" }))
+        .await;
+    alice
+        .tool(
+            "send_message",
+            json!({ "from": "alice", "room": "lobby", "body": "hello lobby" }),
+        )
+        .await;
+    alice
+        .tool(
+            "send_message",
+            json!({ "from": "alice", "to": "bob", "body": "hello bob" }),
+        )
+        .await;
+    let (_, page) = bob.tool("check_inbox", json!({ "agent": "bob" })).await;
+    let bodies: Vec<&str> = page["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["body"].as_str().unwrap())
+        .collect();
+    assert_eq!(bodies, ["hello lobby", "hello bob"]);
+
+    // A secure room next to them leaves them alone.
+    alice
+        .tool(
+            "create_room",
+            json!({ "agent": "alice", "room": "vault", "secure": true }),
+        )
+        .await;
+    alice
+        .tool(
+            "send_message",
+            json!({ "from": "alice", "to": "bob", "body": "still direct" }),
+        )
+        .await;
+    let (_, page) = bob.tool("check_inbox", json!({ "agent": "bob" })).await;
+    assert_eq!(page["messages"][0]["body"], "still direct");
+}
+
+/// The harness never receives anything that looks like key material or
+/// ciphertext, even when it asks for everything the proxy will give.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nothing_the_harness_sees_contains_keys_or_ciphertext() {
+    let w = world().await;
+    let (mut alice, mut bob) = (w.harness("alice"), w.harness("bob"));
+    alice.tool("register", json!({ "agent": "alice" })).await;
+    bob.tool("register", json!({ "agent": "bob" })).await;
+    alice
+        .tool(
+            "create_room",
+            json!({ "agent": "alice", "room": "den", "secure": true }),
+        )
+        .await;
+    alice
+        .tool(
+            "invite",
+            json!({ "agent": "alice", "room": "den", "invitee": "bob" }),
+        )
+        .await;
+    bob.tool("join_room", json!({ "agent": "bob", "room": "den" }))
+        .await;
+    alice
+        .tool(
+            "send_message",
+            json!({ "from": "alice", "room": "den", "body": "plain words only" }),
+        )
+        .await;
+
+    let seed = std::fs::read_to_string(w.clients.join("alice/identity.key")).unwrap();
+    let mut seen = Vec::new();
+    for (h, name) in [(&mut alice, "alice"), (&mut bob, "bob")] {
+        for (tool, args) in [
+            ("check_inbox", json!({ "agent": name })),
+            ("history", json!({ "agent": name, "room": "den" })),
+            ("list_rooms", json!({ "agent": name })),
+            ("list_agents", json!({})),
+        ] {
+            seen.push(h.tool(tool, args).await.1.to_string());
+        }
+    }
+    let all = seen.join("\n");
+    assert!(all.contains("plain words only"));
+    assert!(
+        !all.contains(seed.trim()),
+        "the private seed reached the harness"
+    );
+    assert!(!all.contains("mls/1"), "ciphertext reached the harness");
+    assert!(
+        !all.contains("mentischat-signed"),
+        "an envelope reached the harness"
+    );
+}
+
+/// A failing secure call comes back as an `isError` result with the daemon's
+/// code, so the model can react.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn secure_failures_are_error_results_with_codes() {
+    let w = world().await;
+    let (mut alice, mut bob) = (w.harness("alice"), w.harness("bob"));
+    alice.tool("register", json!({ "agent": "alice" })).await;
+    bob.tool("register", json!({ "agent": "bob" })).await;
+    alice
+        .tool(
+            "create_room",
+            json!({ "agent": "alice", "room": "den", "secure": true }),
+        )
+        .await;
+    let (err, body) = alice
+        .tool(
+            "create_room",
+            json!({ "agent": "alice", "room": "den", "secure": true }),
+        )
+        .await;
+    assert!(err);
+    assert_eq!(body["error"], "room_exists");
+    // Bob was never invited: a plain join answers like any private room.
+    let (err, body) = bob
+        .tool("join_room", json!({ "agent": "bob", "room": "den" }))
+        .await;
+    assert!(err);
+    assert_eq!(body["error"], "room_not_found");
+    // Inviting someone who never registered fails with the roster error.
+    let (err, body) = alice
+        .tool(
+            "invite",
+            json!({ "agent": "alice", "room": "den", "invitee": "ghost" }),
+        )
+        .await;
+    assert!(err);
+    assert_eq!(body["error"], "unregistered");
+}
+
+/// The command line: subcommands, flags, loopback-only addresses, and the key
+/// description in MentisDB's shape.
+#[test]
+fn the_command_line_parses_and_describes_keys() {
+    let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        parse(&args(&[
+            "run",
+            "--agent",
+            "Vega",
+            "--addr",
+            "127.0.0.1:1234"
+        ])),
+        Ok(Command::Run {
+            agent: "Vega".into(),
+            addr: "127.0.0.1:1234".parse().unwrap()
+        })
+    );
+    assert_eq!(
+        parse(&args(&["key", "init", "--agent", "Vega"])),
+        Ok(Command::KeyInit {
+            agent: "Vega".into()
+        })
+    );
+    for bad in [
+        args(&[]),
+        args(&["run"]),
+        args(&["run", "--agent"]),
+        args(&["run", "--agent", "bad name"]),
+        args(&["run", "--agent", "a", "--addr", "8.8.8.8:80"]),
+        args(&["run", "--agent", "a", "--addr", "nope"]),
+        args(&["run", "--agent", "a", "--wat", "x"]),
+        args(&["key", "--agent", "a"]),
+        args(&["key", "zap", "--agent", "a"]),
+        args(&["fly", "--agent", "a"]),
+    ] {
+        assert!(parse(&bad).is_err(), "{bad:?}");
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let id = Identity::open(dir.path(), "Vega").unwrap();
+    let text = describe_key(&id);
+    let hex = id.public().to_hex();
+    assert!(text.contains(&hex));
+    assert!(text.contains(&format!("mentischat-{}", &hex[..8])));
+    let array: Vec<String> = id.public().as_bytes().iter().map(u8::to_string).collect();
+    assert!(text.contains(&format!("[{}]", array.join(","))));
+    assert!(!text.contains(
+        std::fs::read_to_string(id.dir().join("identity.key"))
+            .unwrap()
+            .trim()
+    ));
+}

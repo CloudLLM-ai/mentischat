@@ -62,3 +62,10 @@ path = "fuzz_targets/signed_wire.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "client_wire"
+path = "fuzz_targets/client_wire.rs"
+test = false
+doc = false
+bench = false

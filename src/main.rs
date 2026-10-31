@@ -19,6 +19,7 @@ const USAGE: &str = "\
 mentischat: local mailbox daemon for agents
 
 Usage: mentischat
+       mentischat client run|key ...   (the key-holding client for signed, encrypted rooms; see `mentischat client --help`)
 
 Serves MCP at /mcp and REST on 127.0.0.1:9480. Started from a terminal it paints
 a live view; set MENTISCHAT_PLAIN=1, or run it without a terminal, for plain logs.
@@ -44,11 +45,36 @@ async fn main() -> ExitCode {
             println!("mentischat {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
+        Some("client") => run_client(args.collect()).await,
         Some(other) => {
             eprintln!("mentischat: unexpected argument '{other}'\n\n{USAGE}");
             ExitCode::from(2)
         }
     }
+}
+
+/// `mentischat client ...`: the key-holding client for secure rooms.
+#[cfg(feature = "e2e")]
+async fn run_client(args: Vec<String>) -> ExitCode {
+    use mentischat::client::cli;
+    if args.first().map(String::as_str) == Some("--help") {
+        println!("{}", cli::USAGE);
+        return ExitCode::SUCCESS;
+    }
+    match cli::parse(&args) {
+        Ok(command) => ExitCode::from(cli::run(command).await as u8),
+        Err(e) => {
+            eprintln!("mentischat client: {e}\n\n{}", cli::USAGE);
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Built without the `e2e` feature: there is no client.
+#[cfg(not(feature = "e2e"))]
+async fn run_client(_args: Vec<String>) -> ExitCode {
+    eprintln!("mentischat: this build has no client (compiled without the `e2e` feature)");
+    ExitCode::from(2)
 }
 
 /// The live view needs a terminal on both ends; under launchd, a pipe, or with

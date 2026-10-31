@@ -25,6 +25,8 @@
 compile_error!("mentischat targets Unix (macOS and Linux) only");
 
 pub mod bus;
+#[cfg(feature = "e2e")]
+pub mod client;
 pub mod errors;
 pub mod instructions;
 pub mod names;

@@ -30,6 +30,7 @@ use parking_lot::Mutex;
 
 use super::log::{Msg, Target};
 use super::park::Signal;
+use super::signed::{SendGate, SignedState};
 use super::state::{page_from_newest, Agent, Key, State};
 use super::{
     MailErr, RoomEntry, RoomInfo, MAX_BATCH, MAX_ROOMS, MAX_ROOMS_PER_AGENT, MAX_ROOM_MEMBERS,
@@ -69,6 +70,8 @@ pub(super) struct RoomState {
     /// Set when the room was removed from the room map; whoever finds it
     /// treats the room as gone.
     pub retired: bool,
+    /// What a signed room adds; `None` for every ordinary room.
+    pub signed: Option<SignedState>,
 }
 
 /// A room.
@@ -95,6 +98,7 @@ impl Default for RoomState {
             invited: HashSet::new(),
             oldest: Arc::new(AtomicU64::new(NO_MESSAGE)),
             retired: false,
+            signed: None,
         }
     }
 }
@@ -111,12 +115,12 @@ impl RoomState {
         self.log.back().map_or(0, |m| m.id)
     }
 
-    fn member(&self, agent: &Agent) -> Option<&Member> {
+    pub(super) fn member(&self, agent: &Agent) -> Option<&Member> {
         self.members.get(Key::fold(&agent.name).as_str())
     }
 
     /// A new member at the head of the log.
-    fn member_for(&self, agent: &Agent) -> Member {
+    pub(super) fn member_for(&self, agent: &Agent) -> Member {
         Member {
             name: agent.name.clone(),
             signal: agent.signal.clone(),
@@ -162,7 +166,7 @@ impl RoomState {
     }
 
     /// The room as it goes on the wire.
-    fn info(&self, room: &Room) -> RoomInfo {
+    pub(super) fn info(&self, room: &Room) -> RoomInfo {
         let mut names: Vec<(&String, &Member)> = self.members.iter().collect();
         names.sort_unstable_by(|a, b| a.0.cmp(b.0));
         RoomInfo {
@@ -178,7 +182,7 @@ impl RoomState {
 /// `room_not_found` unless the agent was invited, so asking about a name
 /// cannot tell a private room from none; `create_room`'s `room_exists` can
 /// still reveal that a name is taken.
-fn not_in_room(room: &Room, st: &RoomState, agent: &Agent, asked: &RoomName) -> MailErr {
+pub(super) fn not_in_room(room: &Room, st: &RoomState, agent: &Agent, asked: &RoomName) -> MailErr {
     let invited = st.invited.contains(Key::fold(&agent.name).as_str());
     if st.retired || (room.private && !invited) {
         MailErr::RoomNotFound {
@@ -268,7 +272,7 @@ impl Room {
 
 impl State {
     /// A room under `key`, treating a retired one as absent.
-    fn live_room(&self, room: &RoomName) -> Result<Arc<Room>, MailErr> {
+    pub(super) fn live_room(&self, room: &RoomName) -> Result<Arc<Room>, MailErr> {
         self.rooms
             .get(&room.folded())
             .ok_or_else(|| MailErr::RoomNotFound {
@@ -284,6 +288,19 @@ impl State {
         private: bool,
         description: Option<String>,
     ) -> Result<RoomInfo, MailErr> {
+        self.create_room_with(agent, room, private, description, None)
+    }
+
+    /// [`create_room`](Self::create_room), optionally as a signed room whose
+    /// first member and owner is described by `signed`.
+    pub(super) fn create_room_with(
+        &self,
+        agent: &Arc<Agent>,
+        room: &RoomName,
+        private: bool,
+        description: Option<String>,
+        signed: Option<SignedState>,
+    ) -> Result<RoomInfo, MailErr> {
         if self.rooms.len() >= MAX_ROOMS {
             return Err(MailErr::RoomsFull {
                 rooms: self.rooms.len() as i64,
@@ -295,7 +312,10 @@ impl State {
                 rooms: MAX_ROOMS_PER_AGENT as i64,
             });
         }
-        let state = RoomState::default();
+        let state = RoomState {
+            signed,
+            ..RoomState::default()
+        };
         let made = Arc::new(Room {
             name: room.as_str().into(),
             private,
@@ -351,6 +371,7 @@ impl State {
                     room: room.to_string(),
                 });
             }
+            st.refuse_unsigned(&found, agent)?;
             if !st.members.contains_key(key.as_str()) {
                 if st.members.len() >= MAX_ROOM_MEMBERS {
                     return Err(MailErr::RoomFull {
@@ -393,6 +414,7 @@ impl State {
         if st.retired || st.member(agent).is_none() {
             return Err(not_in_room(&found, &st, agent, room));
         }
+        st.refuse_unsigned(&found, agent)?;
         let invitee_key = Key::fold(&invitee.name);
         if !st.members.contains_key(invitee_key.as_str())
             && !st.invited.contains(invitee_key.as_str())
@@ -430,6 +452,7 @@ impl State {
             if st.retired || st.member(agent).is_none() {
                 return Err(not_in_room(&found, &st, agent, room));
             }
+            st.refuse_unsigned(&found, agent)?;
             st.members.remove(Key::fold(&agent.name).as_str());
             st.members.is_empty()
         };
@@ -447,6 +470,7 @@ impl State {
         for room in rooms {
             let emptied = {
                 let mut st = room.inner.lock();
+                st.drop_pin(key.as_str());
                 st.members.remove(key.as_str()).is_some() && st.members.is_empty()
             };
             if emptied {
@@ -492,6 +516,7 @@ impl State {
                 let mut st = room.inner.lock();
                 for name in &gone {
                     st.invited.remove(name);
+                    st.drop_invitation(name);
                 }
             }
         }
@@ -500,7 +525,7 @@ impl State {
     /// Delete `room` if it has no members: retire it, give its bytes back and
     /// take it out of the maps. Looks at this room only, so deleting rooms
     /// costs the same however many exist.
-    fn reap_room(&self, room: &Arc<Room>) {
+    pub(super) fn reap_room(&self, room: &Arc<Room>) {
         {
             let mut st = room.inner.lock();
             if !st.members.is_empty() || st.retired {
@@ -516,7 +541,7 @@ impl State {
 
     /// Note on the agent that it is in `room`, so a pull knows where to look.
     /// An agent that left the roster meanwhile is taken out again.
-    fn remember_room(&self, agent: &Arc<Agent>, room: &Arc<Room>) {
+    pub(super) fn remember_room(&self, agent: &Arc<Agent>, room: &Arc<Room>) {
         let gone = {
             let mut st = agent.inner.lock();
             if st.removed {
@@ -580,6 +605,7 @@ impl State {
         body: Box<str>,
         body_json_len: usize,
         now_ms: u64,
+        gate: SendGate<'_>,
     ) -> Result<Arc<Msg>, MailErr> {
         let found = self.live_room(room)?;
         let msg = {
@@ -587,6 +613,7 @@ impl State {
             if st.retired || st.member(sender).is_none() {
                 return Err(not_in_room(&found, &st, sender, room));
             }
+            st.admit_send(&found, sender, gate)?;
             self.make_room(&mut st, body.len() + super::MESSAGE_OVERHEAD_BYTES)?;
             // Under the room's lock, so the log stays sorted by id.
             let id = self.next_id.0.fetch_add(1, Relaxed);

@@ -240,7 +240,9 @@ pub(super) fn capture(state: &State) -> Snapshot {
 
 fn room_rec(room: &Room) -> Option<RoomRec> {
     let st = room.inner.lock();
-    (!st.retired).then(|| RoomRec {
+    // A signed room is not saved: restoring it without its pinned keys would
+    // quietly turn it into an unsigned room, so it ends with the process.
+    (!st.retired && st.signed.is_none()).then(|| RoomRec {
         name: room.name.to_string(),
         private: room.private,
         description: room.description.clone(),

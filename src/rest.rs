@@ -13,7 +13,7 @@ use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
@@ -33,6 +33,7 @@ pub fn router(bus: Ctx) -> Router {
     Router::new()
         .route("/agents", post(register).get(list))
         .route("/agents/{agent}", delete(deregister_one))
+        .route("/agents/{agent}/key", put(put_key).get(get_key))
         .route("/messages", post(send_msg))
         // A batch may carry many messages, so it alone gets a larger body
         // limit than the 1 MiB the rest of the daemon allows.
@@ -49,6 +50,8 @@ pub fn router(bus: Ctx) -> Router {
         .route("/rooms/{room}/members", post(join_room))
         .route("/rooms/{room}/members/{agent}", delete(leave_room))
         .route("/rooms/{room}/invitations", post(invite))
+        .route("/signed/ops", post(signed_op))
+        .route("/signed/rooms/{room}", get(signed_room))
         .route("/ws", get(crate::ws::upgrade))
         .route("/health", get(health))
         .fallback(not_found)
@@ -268,6 +271,48 @@ async fn leave_room(
     })?;
     Ok(Json(
         crate::tools::leave_room(&bus, &json!({ "agent": agent, "room": room })).await?,
+    ))
+}
+
+/// `PUT /agents/{agent}/key` `{ "public_key", "signature" }` — bind an
+/// Ed25519 key to the roster name (see `docs/SIGNED_ROOMS.md`).
+async fn put_key(
+    State(bus): State<Ctx>,
+    path: Result<Path<String>, PathRejection>,
+    body: Result<Json<Value>, JsonRejection>,
+) -> Reply {
+    let agent = path_agent(path)?;
+    Ok(Json(
+        crate::signed_api::register_key(&bus, &agent, &json_body(body)?).await?,
+    ))
+}
+
+/// `GET /agents/{agent}/key` — the bound key, `publicKey` null when none.
+async fn get_key(State(bus): State<Ctx>, path: Result<Path<String>, PathRejection>) -> Reply {
+    Ok(Json(
+        crate::signed_api::get_key(&bus, &path_agent(path)?).await?,
+    ))
+}
+
+/// `POST /signed/ops` — one signed room operation (create, invite, join,
+/// leave, remove, send).
+async fn signed_op(State(bus): State<Ctx>, body: Result<Json<Value>, JsonRejection>) -> Reply {
+    Ok(Json(
+        crate::signed_api::signed_op(&bus, &json_body(body)?).await?,
+    ))
+}
+
+/// `GET /signed/rooms/{room}?agent=` — a signed room's members and their keys.
+async fn signed_room(
+    State(bus): State<Ctx>,
+    path: Result<Path<String>, PathRejection>,
+    query: Result<Query<HashMap<String, String>>, QueryRejection>,
+) -> Reply {
+    let room = path_room(path)?;
+    let Query(q) = query.map_err(|_| MailboxError::InvalidBody)?;
+    let agent = q.get("agent").map_or("", String::as_str);
+    Ok(Json(
+        crate::signed_api::signed_room(&bus, &room, agent).await?,
     ))
 }
 

@@ -42,6 +42,7 @@ mod model;
 mod park;
 mod rooms;
 mod sharded;
+mod signed;
 mod snapshot;
 mod state;
 mod stream;
@@ -61,6 +62,7 @@ pub use model::{
     MAX_LIMITED_PAGE_BYTES, MAX_OVERVIEW_AGENTS, MAX_PAGE, MAX_ROOMS_PER_AGENT, MAX_ROOM_MEMBERS,
     MAX_STREAM_BYTES, MAX_STREAM_IN_FLIGHT,
 };
+pub use signed::{KeyBinding, SignedMember, SignedOutcome, SignedRequest, SignedRoomInfo};
 pub use snapshot::{remove_snapshot, SnapshotError};
 pub use stream::{Push, StreamSession};
 
@@ -682,6 +684,7 @@ impl Bus {
             body.into_boxed_str(),
             body_json_len,
             self.now_ms(),
+            signed::SendGate::Unsigned,
         )?;
         Ok(SendReceipt::from(&*msg))
     }

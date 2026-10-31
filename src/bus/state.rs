@@ -129,6 +129,9 @@ pub(super) struct AgentState {
     /// Set once the agent has left the roster. A send that looked the agent
     /// up before that sees it here and fails `unregistered`.
     pub removed: bool,
+    /// The Ed25519 key bound to this registration (trust on first use), for
+    /// signed rooms. Dies with the roster entry; never snapshotted.
+    pub key: Option<crate::signed::PublicKey>,
 }
 
 /// A roster entry.
@@ -184,6 +187,7 @@ impl Agent {
                 stream_epoch: 0,
                 invited_to: Default::default(),
                 removed: false,
+                key: None,
             }),
         }
     }

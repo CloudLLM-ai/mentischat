@@ -127,6 +127,36 @@ pub enum MailboxError {
         /// How many members it holds.
         members: i64,
     },
+    /// The room is signed: a plain `send_message`, `join_room`, `invite`,
+    /// `leave_room` is refused. Use a signed operation.
+    SignatureRequired {
+        /// The signed room.
+        room: String,
+    },
+    /// A signed operation whose signature does not verify under the key the
+    /// signer is bound to, or a field of it that does not parse.
+    InvalidSignature,
+    /// A public key that is not 64 hex digits of a valid Ed25519 point.
+    InvalidKey,
+    /// The agent has no public key registered, so it cannot act in or be
+    /// invited to a signed room.
+    KeyRequired {
+        /// The agent without a key.
+        agent: String,
+    },
+    /// The name is already bound to a different public key.
+    KeyConflict {
+        /// The agent whose key differs.
+        agent: String,
+    },
+    /// A signed operation's counter is not above the highest this key has
+    /// used in the room (a replay, or a client that lost its place).
+    StaleCounter {
+        /// The signed room.
+        room: String,
+        /// The highest counter this key has used there; sign a higher one.
+        last: u64,
+    },
     /// REST path that is not a known route.
     NotFound,
     /// Known REST path, HTTP method it does not serve.
@@ -158,6 +188,12 @@ impl MailboxError {
             Self::RoomsFull { .. } => "rooms_full",
             Self::TooManyRooms { .. } => "too_many_rooms",
             Self::RoomFull { .. } => "room_full",
+            Self::SignatureRequired { .. } => "signature_required",
+            Self::InvalidSignature => "invalid_signature",
+            Self::InvalidKey => "invalid_key",
+            Self::KeyRequired { .. } => "key_required",
+            Self::KeyConflict { .. } => "key_conflict",
+            Self::StaleCounter { .. } => "stale_counter",
             Self::NotFound => "not_found",
             Self::MethodNotAllowed => "method_not_allowed",
             Self::ShuttingDown => "shutting_down",
@@ -174,7 +210,9 @@ impl MailboxError {
             | Self::InvalidWait
             | Self::InvalidDescription
             | Self::InvalidCursor
+            | Self::InvalidKey
             | Self::InvalidLimit => StatusCode::BAD_REQUEST,
+            Self::SignatureRequired { .. } | Self::InvalidSignature => StatusCode::UNAUTHORIZED,
             Self::Unregistered { .. } | Self::RoomNotFound { .. } | Self::NotFound => {
                 StatusCode::NOT_FOUND
             }
@@ -187,6 +225,9 @@ impl MailboxError {
             | Self::RoomsFull { .. }
             | Self::TooManyRooms { .. }
             | Self::RoomFull { .. }
+            | Self::KeyRequired { .. }
+            | Self::KeyConflict { .. }
+            | Self::StaleCounter { .. }
             | Self::NameTaken { .. } => StatusCode::CONFLICT,
             Self::StorageFull { .. } => StatusCode::INSUFFICIENT_STORAGE,
             Self::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
@@ -201,6 +242,8 @@ impl MailboxError {
             | Self::InvalidWait
             | Self::InvalidDescription
             | Self::InvalidCursor
+            | Self::InvalidSignature
+            | Self::InvalidKey
             | Self::InvalidLimit => json!({ "error": self.code() }),
             Self::NameTaken {
                 agent,
@@ -232,7 +275,14 @@ impl MailboxError {
             Self::TooManyWaiters { agent, waiting } => {
                 json!({ "error": self.code(), "agent": agent, "waiting": waiting })
             }
+            Self::KeyRequired { agent } | Self::KeyConflict { agent } => {
+                json!({ "error": self.code(), "agent": agent })
+            }
+            Self::StaleCounter { room, last } => {
+                json!({ "error": self.code(), "room": room, "last": last })
+            }
             Self::InvalidRoom { room }
+            | Self::SignatureRequired { room }
             | Self::RoomNotFound { room }
             | Self::RoomExists { room } => json!({ "error": self.code(), "room": room }),
             Self::NotAMember { agent, room } => {

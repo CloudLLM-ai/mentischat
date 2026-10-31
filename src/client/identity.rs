@@ -74,7 +74,7 @@ impl Identity {
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let seed = fresh_seed()?;
-                write_private(&path, hex_encode(&seed).as_bytes())?;
+                write_private(&path, format!("{}\n", hex_encode(&seed)).as_bytes())?;
                 seed
             }
             Err(e) => return Err(ClientError::Storage(format!("{}: {e}", path.display()))),

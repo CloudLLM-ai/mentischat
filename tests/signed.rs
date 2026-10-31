@@ -193,6 +193,44 @@ fn payloads_differ_in_every_signed_field() {
     );
 }
 
+/// Every operation has its own domain tag, ASCII, NUL-terminated, in the
+/// `mentischat/` namespace and never MentisDB's, and payloads start with it.
+#[test]
+fn payloads_start_with_a_per_operation_domain_tag() {
+    use mentischat::signed::domain_tag;
+    let send = SignedOp::Send { body: "x".into() }.payload("r", "a", 1);
+    assert!(send.starts_with(b"mentischat/send/v1\0"));
+    assert!(SignedOp::Join
+        .payload("r", "a", 1)
+        .starts_with(b"mentischat/join/v1\0"));
+    let key = Keypair::from_seed([4; 32]).public();
+    assert!(register_key_payload("a", &key).starts_with(b"mentischat/register-key/v1\0"));
+    let tags: Vec<String> = [
+        OpKind::RegisterKey,
+        OpKind::Create,
+        OpKind::Invite,
+        OpKind::Join,
+        OpKind::Leave,
+        OpKind::Remove,
+        OpKind::Send,
+        OpKind::Welcome,
+        OpKind::PublishKeyPackages,
+    ]
+    .into_iter()
+    .map(domain_tag)
+    .collect();
+    for t in &tags {
+        assert!(
+            t.is_ascii() && t.ends_with("/v1\0") && t.starts_with("mentischat/"),
+            "{t:?}"
+        );
+    }
+    let mut unique = tags.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), tags.len());
+}
+
 /// Names compare without case, so payloads fold them; bodies do not fold.
 #[test]
 fn payloads_fold_names_but_not_bodies() {

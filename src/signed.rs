@@ -28,7 +28,7 @@ use ed25519_dalek::{Signature as DalekSignature, Signer, SigningKey, VerifyingKe
 /// Domain separation tag every mentischat signature starts with, so a
 /// signature made for another protocol that shares the key (MentisDB signs
 /// raw content) is never valid here.
-const DOMAIN: &[u8] = b"mentischat/v1\0";
+const DOMAIN_PREFIX: &str = "mentischat/";
 
 /// First token of a signed-room message body.
 pub const ENVELOPE_TAG: &str = "mentischat-signed/1";
@@ -510,12 +510,29 @@ pub fn send_payload(room: &str, signer: &str, counter: u64, body: &str) -> Vec<u
     out
 }
 
+/// The ASCII domain tag a payload of `kind` starts with, ending in NUL:
+/// `mentischat/<op>/v1\0` with `_` written `-` (`mentischat/send/v1\0`,
+/// `mentischat/key-packages/v1\0`). One tag per operation, so a signature for
+/// one operation can never be read as another, and none is valid in MentisDB,
+/// whose tags are `mentisdb/...`.
+///
+/// # Examples
+///
+/// ```
+/// use mentischat::signed::{domain_tag, OpKind};
+///
+/// assert_eq!(domain_tag(OpKind::Send), "mentischat/send/v1\0");
+/// assert_eq!(domain_tag(OpKind::RegisterKey), "mentischat/register-key/v1\0");
+/// ```
+pub fn domain_tag(kind: OpKind) -> String {
+    format!("{DOMAIN_PREFIX}{}/v1\0", kind.as_str().replace('_', "-"))
+}
+
 /// The common prefix of every payload; `extra` is the capacity to reserve
 /// for what the caller appends.
 fn header(kind: OpKind, room: &str, signer: &str, counter: u64, extra: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(DOMAIN.len() + 64 + room.len() + signer.len() + extra);
-    out.extend_from_slice(DOMAIN);
-    put(&mut out, kind.as_str().as_bytes());
+    let mut out = Vec::with_capacity(48 + 64 + room.len() + signer.len() + extra);
+    out.extend_from_slice(domain_tag(kind).as_bytes());
     put(&mut out, room.to_ascii_lowercase().as_bytes());
     put(&mut out, signer.to_ascii_lowercase().as_bytes());
     out.extend_from_slice(&counter.to_be_bytes());

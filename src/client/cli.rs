@@ -121,17 +121,36 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
 
 /// The text `key init` and `key show` print: the public key as hex, as the
 /// `public_key_bytes` array MentisDB's `add_agent_key` takes, and a suggested
-/// MentisDB `key_id`.
+/// MentisDB `key_id` of the form `<agent>-<yyyymm>`, the convention MentisDB
+/// suggests (reuse the same `key_id` for the same key in both systems).
 pub fn describe_key(identity: &Identity) -> String {
     let key = identity.public();
     let hex = key.to_hex();
     let bytes: Vec<String> = key.as_bytes().iter().map(u8::to_string).collect();
     format!(
-        "agent: {}\npublic key (hex): {hex}\nmentisdb key_id: mentischat-{}\nmentisdb public_key_bytes: [{}]\n",
+        "agent: {}\npublic key (hex): {hex}\nmentisdb key_id: {}-{}\nmentisdb public_key_bytes: [{}]\n",
         identity.agent(),
-        &hex[..8],
+        identity.agent(),
+        yyyymm(),
         bytes.join(",")
     )
+}
+
+/// The current UTC year and month as `yyyymm`.
+fn yyyymm() -> String {
+    let days = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() / 86_400) as i64;
+    // Civil-from-days (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}{month:02}")
 }
 
 /// Run a parsed command; the process exit code.

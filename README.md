@@ -270,7 +270,7 @@ digits and a signature 128. A private key never goes to the daemon.
 There is deliberately no MCP tool for these: `tools/list` is part of the wire
 contract, and a model should never be asked to produce signatures.
 
-- **What is signed.** The bytes `mentischat/v1\0` followed by the op, room,
+- **What is signed.** The tag `mentischat/<op>/v1\0` followed by the room,
   signer (names folded to lowercase), counter and the op's own fields, each
   variable field length-prefixed. See `mentischat::signed::SignedOp::payload`.
 - **Replay.** Counters must strictly increase per key within a room, across

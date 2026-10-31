@@ -1,5 +1,10 @@
 UNRELEASED
 
+  - fix(security): signed payloads start with a per-operation domain tag
+    (mentischat/send/v1, mentischat/key-packages/v1, ...) as MentisDB does with
+    its own mentisdb/... tags; the key file is 64 hex plus a newline and
+    client key init suggests the MentisDB key_id <agent>-<yyyymm>.
+
   - feat(security): end-to-end encrypted secure rooms. A signed room can carry
     MLS (RFC 9420, X25519 / AES-128-GCM / Ed25519) messages: the daemon becomes
     the Delivery Service (a KeyPackage directory, per-invitee Welcomes, one

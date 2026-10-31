@@ -78,7 +78,7 @@ Algorithm: Ed25519 (`ed25519-dalek`), the same scheme as MentisDB
   suggested `key_id` of `mentischat-<first 8 hex>`). No conversion is needed.
 - Cross-protocol replay: MentisDB signs raw content with no domain
   separation. mentischat signs a payload that begins with
-  `mentischat/v1\0` followed by length-prefixed fields, so a mentischat
+  `mentischat/<op>/v1\0` (one tag per operation, `_` written `-`) followed by length-prefixed fields, so a mentischat
   signature is a signature over bytes MentisDB would only see as a skill whose
   content starts with that tag. Conversely a MentisDB signature never verifies
   as a mentischat payload. MentisDB should adopt a domain tag too; until then
@@ -125,8 +125,9 @@ through the client proxy, not by calling these directly.
   "signature": "<128 hex>" }
 ```
 
-Signed payload: `b"mentischat/v1\0"` then each of these fields as a 4-byte
-big-endian length followed by the bytes: the op name, the room name, the
+Signed payload: the ASCII tag `mentischat/<op>/v1\0` (for example
+`mentischat/send/v1\0`; `_` is written `-`) then each of these fields as a 4-byte
+big-endian length followed by the bytes: the room name, the
 signer name (both ASCII-lowercased, since names compare without case), the
 counter as 8-byte big-endian, then the op fields in order: `create`
 description (empty if absent), `invite` invitee name then the invitee's 32-byte

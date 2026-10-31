@@ -408,10 +408,25 @@ fn the_command_line_parses_and_describes_keys() {
 
     let dir = tempfile::tempdir().unwrap();
     let id = Identity::open(dir.path(), "Vega").unwrap();
+    let id_dir = id.dir().to_path_buf();
     let text = describe_key(&id);
     let hex = id.public().to_hex();
     assert!(text.contains(&hex));
-    assert!(text.contains(&format!("mentischat-{}", &hex[..8])));
+    let suggested = text
+        .lines()
+        .find(|l| l.starts_with("mentisdb key_id: "))
+        .unwrap();
+    let key_id = suggested.trim_start_matches("mentisdb key_id: ");
+    let (agent, month) = key_id.rsplit_once('-').unwrap();
+    assert_eq!(agent, "Vega");
+    assert!(
+        month.len() == 6 && month.bytes().all(|b| b.is_ascii_digit()) && month.starts_with("20")
+    );
+    let file = std::fs::read_to_string(id_file_path(&id_dir)).unwrap();
+    assert!(
+        file.ends_with('\n') && file.trim().len() == 64,
+        "seed file is 64 hex plus newline"
+    );
     let array: Vec<String> = id.public().as_bytes().iter().map(u8::to_string).collect();
     assert!(text.contains(&format!("[{}]", array.join(","))));
     assert!(!text.contains(
@@ -419,4 +434,8 @@ fn the_command_line_parses_and_describes_keys() {
             .unwrap()
             .trim()
     ));
+}
+
+fn id_file_path(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("identity.key")
 }

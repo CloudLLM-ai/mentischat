@@ -365,6 +365,10 @@ impl State {
         let found = self.live_room(room)?;
         let key = Key::fold(&agent.name);
         let info = {
+            // Agent before room, per the lock order: a pull holds the agent
+            // while it locks the agent's rooms, so taking the agent under the
+            // room's lock could deadlock against it (tests/lock_order.rs).
+            let agent_st = agent.inner.lock();
             let mut st = found.inner.lock();
             if st.retired {
                 return Err(MailErr::RoomNotFound {
@@ -379,7 +383,7 @@ impl State {
                         members: st.members.len() as i64,
                     });
                 }
-                if agent.inner.lock().rooms.len() >= MAX_ROOMS_PER_AGENT {
+                if agent_st.rooms.len() >= MAX_ROOMS_PER_AGENT {
                     return Err(MailErr::TooManyRooms {
                         agent: agent.name.to_string(),
                         rooms: MAX_ROOMS_PER_AGENT as i64,

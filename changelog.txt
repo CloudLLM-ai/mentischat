@@ -5,6 +5,13 @@ UNRELEASED
     its own mentisdb/... tags; the key file is 64 hex plus a newline and
     client key init suggests the MentisDB key_id <agent>-<yyyymm>.
 
+  - fix(rooms): join_room locked the room and then the joining agent, the
+    reverse of the documented lock order, while a pull holds its agent and
+    locks the agent's rooms. Two agents joining each other's rooms while both
+    pulled could deadlock the daemon. join_room now takes the agent first;
+    tests/lock_order.rs races the four operations (it deadlocked every run
+    before the fix).
+
   - feat(security): end-to-end encrypted secure rooms. A signed room can carry
     MLS (RFC 9420, X25519 / AES-128-GCM / Ed25519) messages: the daemon becomes
     the Delivery Service (a KeyPackage directory, per-invitee Welcomes, one

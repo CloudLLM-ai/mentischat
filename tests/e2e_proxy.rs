@@ -71,6 +71,7 @@ impl Harness {
 }
 
 struct World {
+    bus: Arc<Bus>,
     _dir: tempfile::TempDir,
     daemon: Daemon,
     clients: std::path::PathBuf,
@@ -87,7 +88,7 @@ async fn world_with_capacity(capacity: usize) -> World {
             .unwrap()
             .with_room_capacity(capacity),
     );
-    let app = mentischat::build_router(bus);
+    let app = mentischat::build_router(bus.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -99,6 +100,7 @@ async fn world_with_capacity(capacity: usize) -> World {
         .ok();
     });
     World {
+        bus,
         clients: dir.path().join("clients"),
         daemon: Daemon::new(addr),
         _dir: dir,
@@ -111,8 +113,18 @@ impl World {
     }
 
     fn harness_with(&self, agent: &str, policy: mentischat::client::UpdatePolicy) -> Harness {
+        self.harness_on(agent, self.daemon, policy)
+    }
+
+    /// A proxy for `agent` talking to `daemon` (not necessarily this world's).
+    fn harness_on(
+        &self,
+        agent: &str,
+        daemon: Daemon,
+        policy: mentischat::client::UpdatePolicy,
+    ) -> Harness {
         let id = Identity::open(&self.clients, agent).unwrap();
-        Harness::spawn_with(Client::open(id, self.daemon).unwrap(), self.daemon, policy)
+        Harness::spawn_with(Client::open(id, daemon).unwrap(), daemon, policy)
     }
 }
 
@@ -596,4 +608,71 @@ async fn the_proxy_refreshes_its_key_by_policy_and_peers_keep_reading() {
         .await
         .unwrap();
     assert_eq!(info["epoch"], 4, "{info}");
+}
+
+/// A daemon restored from an older snapshot makes the proxy put a warning in
+/// check_inbox and stop serving the room, instead of quietly carrying on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rolled_back_daemon_shows_as_a_warning_in_check_inbox() {
+    use mentischat::client::UpdatePolicy;
+    let w = world().await;
+    let (mut alice, mut bob) = (w.harness("alice"), w.harness("bob"));
+    alice.tool("register", json!({ "agent": "alice" })).await;
+    bob.tool("register", json!({ "agent": "bob" })).await;
+    alice
+        .tool(
+            "create_room",
+            json!({ "agent": "alice", "room": "den", "secure": true }),
+        )
+        .await;
+    alice
+        .tool(
+            "invite",
+            json!({ "agent": "alice", "room": "den", "invitee": "bob" }),
+        )
+        .await;
+    bob.tool("join_room", json!({ "agent": "bob", "room": "den" }))
+        .await;
+    // An honest look: no warning.
+    let (_, page) = bob.tool("check_inbox", json!({ "agent": "bob" })).await;
+    assert!(page.get("warnings").is_none(), "{page}");
+    let old = w.bus.snapshot_bytes();
+    bob.tool(
+        "send_message",
+        json!({ "from": "bob", "room": "den", "body": "will be rolled away" }),
+    )
+    .await;
+    let older = Arc::new(Bus::from_snapshot_bytes(&old).unwrap());
+    let app = mentischat::build_router(older);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .ok();
+    });
+    let mut bob = w.harness_on("bob", Daemon::new(addr), UpdatePolicy::default());
+    let (err, page) = bob.tool("check_inbox", json!({ "agent": "bob" })).await;
+    assert!(!err, "{page}");
+    let warnings = page["warnings"].as_array().expect("a warning is shown");
+    assert!(
+        warnings[0].as_str().unwrap().contains("rolled back"),
+        "{page}"
+    );
+    assert!(page["messages"].as_array().unwrap().is_empty());
+    // The room stays blocked: sending a secure message fails with the reason.
+    let (err, body) = bob
+        .tool(
+            "send_message",
+            json!({ "from": "bob", "room": "den", "body": "x" }),
+        )
+        .await;
+    assert!(err);
+    assert!(
+        body["message"].as_str().unwrap().contains("rolled back"),
+        "{body}"
+    );
 }

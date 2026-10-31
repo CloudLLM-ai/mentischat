@@ -69,9 +69,10 @@ impl IntoResponse for MailboxError {
 type Reply = Result<Json<Value>, MailboxError>;
 
 /// Serialise a pull result with `Cache-Control: no-store` — it mutates live
-/// state and must never be cached.
+/// state and must never be cached. Written straight from the page type (no
+/// `Value` tree); its fields are declared in sorted key order.
 fn no_store_response(value: impl serde::Serialize) -> Response {
-    let mut resp = Json(crate::tools::to_wire(value)).into_response();
+    let mut resp = Json(value).into_response();
     resp.headers_mut().insert(
         header::CACHE_CONTROL,
         header::HeaderValue::from_static("no-store"),

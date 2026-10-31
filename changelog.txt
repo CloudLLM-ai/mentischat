@@ -107,6 +107,11 @@ UNRELEASED
     concurrent pairs went from about 0.5M/s total to 1.3-1.6M/s. The tools,
     routes, caps and error codes are unchanged.
 
+  - perf(rest): GET /inboxes and history pages are written straight from
+    their types instead of through a serde_json Value tree, ~30-40% faster per
+    page of 8. Keys stay sorted on the wire: the page fields are declared in
+    key order, and tests/wire_order.rs pins it.
+
   - feat(rooms): rooms for work among more than two agents. Five tools and
     routes: create_room (POST /rooms; optional private and description),
     join_room (POST /rooms/{room}/members), invite (POST

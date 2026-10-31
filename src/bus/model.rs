@@ -94,28 +94,31 @@ pub struct Registration {
 }
 
 /// A delivered or queued mail message (wire shape).
+///
+/// Fields are declared in the alphabetical order of their JSON keys: REST
+/// serializes pages straight from this type, and the wire keeps keys sorted.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Message {
-    /// Unique id: the decimal delivery number, increasing across the life of
-    /// the daemon (and across a persisted restart). `history`'s `next` cursor
-    /// is the same number.
-    pub id: String,
-    /// Sender roster name.
-    pub from: String,
-    /// Recipient roster name. Empty (and left out of the JSON) for a room
-    /// message, which carries `room` instead.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub to: String,
-    /// The room a room message was sent to; absent from direct mail.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub room: Option<String>,
     /// Body exactly as stored (never trimmed).
     pub body: String,
     /// UTC RFC 3339 creation timestamp.
     pub created_at: String,
+    /// Sender roster name.
+    pub from: String,
+    /// Unique id: the decimal delivery number, increasing across the life of
+    /// the daemon (and across a persisted restart). `history`'s `next` cursor
+    /// is the same number.
+    pub id: String,
     /// UTC RFC 3339 time the recipient read it; `None` while unread.
     pub read_at: Option<String>,
+    /// The room a room message was sent to; absent from direct mail.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub room: Option<String>,
+    /// Recipient roster name. Empty (and left out of the JSON) for a room
+    /// message, which carries `room` instead.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub to: String,
 }
 
 /// Send receipt handed back to the sender.
@@ -241,7 +244,8 @@ pub struct DiscardOutcome {
     pub discarded: i64,
 }
 
-/// One `check_inbox` result page.
+/// One `check_inbox` result page. Fields stay in JSON-key order (see
+/// [`Message`]).
 #[derive(Debug, Serialize)]
 pub struct InboxPage {
     /// Pulled name.
@@ -263,7 +267,7 @@ fn is_zero(n: &u64) -> bool {
 }
 
 /// One `history` result page: the newest messages older than the cursor,
-/// oldest first.
+/// oldest first. Fields stay in JSON-key order (see [`Message`]).
 #[derive(Debug, Serialize)]
 pub struct HistoryPage {
     /// The agent whose history this is.

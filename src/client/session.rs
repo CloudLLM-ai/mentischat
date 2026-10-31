@@ -262,14 +262,31 @@ impl Client {
                     .map_err(mls("serialize key package"))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let last_resort = KeyPackage::builder()
+            .mark_as_last_resort()
+            .leaf_node_capabilities(Capabilities::new(
+                None,
+                None,
+                Some(&[ExtensionType::LastResort]),
+                None,
+                None,
+            ))
+            .build(SUITE, &self.provider, &self.signer, self.credential.clone())
+            .map_err(mls("last-resort key package"))?
+            .key_package()
+            .tls_serialize_detached()
+            .map_err(mls("serialize key package"))?;
         let counter = self.next_counter();
-        let sig =
-            self.identity
-                .keypair()
-                .sign(&key_packages_payload(self.agent(), counter, &packages));
+        let sig = self.identity.keypair().sign(&key_packages_payload(
+            self.agent(),
+            counter,
+            &packages,
+            Some(&last_resort),
+        ));
         let body = json!({
             "counter": counter,
             "key_packages": packages.iter().map(|p| hex_encode(p)).collect::<Vec<_>>(),
+            "last_resort": hex_encode(&last_resort),
             "signature": sig.to_hex(),
         });
         let path = format!("/agents/{}/keypackages", self.agent());
@@ -480,7 +497,8 @@ impl Client {
         expected: &PublicKey,
     ) -> Result<KeyPackage, ClientError> {
         let path = format!("/agents/{}/keypackages/take", query_escape(agent));
-        let v = self.daemon.call("POST", &path, None).await?;
+        let body = json!({ "requester": self.agent() });
+        let v = self.daemon.call("POST", &path, Some(&body)).await?;
         let bytes = v
             .get("keyPackage")
             .and_then(Value::as_str)

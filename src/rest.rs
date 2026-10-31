@@ -310,13 +310,15 @@ async fn put_key_packages(
     ))
 }
 
-/// `POST /agents/{agent}/keypackages/take` — one KeyPackage, used up.
+/// `POST /agents/{agent}/keypackages/take` `{ "requester" }` — one KeyPackage;
+/// an ordinary one is used up, the last-resort one is not. Rate limited.
 async fn take_key_package(
     State(bus): State<Ctx>,
     path: Result<Path<String>, PathRejection>,
+    body: Result<Json<Value>, JsonRejection>,
 ) -> Reply {
     Ok(Json(
-        crate::signed_api::take_key_package(&bus, &path_agent(path)?).await?,
+        crate::signed_api::take_key_package(&bus, &path_agent(path)?, &json_body(body)?).await?,
     ))
 }
 

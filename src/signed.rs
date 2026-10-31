@@ -458,14 +458,39 @@ pub fn register_key_payload(signer: &str, key: &PublicKey) -> Vec<u8> {
 }
 
 /// The bytes signed to publish `packages` (opaque serialized MLS KeyPackages)
-/// for `signer`. The counter is the signer's own, strictly increasing across
-/// its publishes; the room is empty.
-pub fn key_packages_payload(signer: &str, counter: u64, packages: &[Vec<u8>]) -> Vec<u8> {
+/// and optionally a `last_resort` KeyPackage (RFC 9420 section 16.8) for
+/// `signer`. The counter is the signer's own, strictly increasing across its
+/// publishes; the room is empty. After the package list comes a flag byte, 0,
+/// or 1 followed by the length-prefixed last-resort package.
+///
+/// # Examples
+///
+/// ```
+/// use mentischat::signed::key_packages_payload;
+///
+/// let plain = key_packages_payload("a", 1, &[vec![1]], None);
+/// let with = key_packages_payload("a", 1, &[vec![1]], Some(&[9]));
+/// assert_ne!(plain, with);
+/// assert!(plain.starts_with(b"mentischat/key-packages/v1\0"));
+/// ```
+pub fn key_packages_payload(
+    signer: &str,
+    counter: u64,
+    packages: &[Vec<u8>],
+    last_resort: Option<&[u8]>,
+) -> Vec<u8> {
     let extra = packages.iter().map(|p| p.len() + 4).sum::<usize>() + 4;
     let mut out = header(OpKind::PublishKeyPackages, "", signer, counter, extra);
     out.extend_from_slice(&(packages.len() as u32).to_be_bytes());
     for package in packages {
         put(&mut out, package);
+    }
+    match last_resort {
+        None => out.push(0),
+        Some(package) => {
+            out.push(1);
+            put(&mut out, package);
+        }
     }
     out
 }

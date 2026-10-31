@@ -204,8 +204,14 @@ holds no group state. For secure rooms it adds, all REST, all additive:
 - `PUT /agents/{agent}/keypackages` `{"counter", "key_packages": [hex], "signature"}`:
   a KeyPackage directory. Signed under the agent's bound key with a counter of
   its own; at most 16 packages of at most 1 KiB per agent, oldest dropped.
-- `POST /agents/{agent}/keypackages/take`: hands out one and forgets it
-  (`no_key_package` when none is left). Public, like a KeyPackage.
+- `POST /agents/{agent}/keypackages/take` `{"requester"}`: hands out one ordinary
+  package and forgets it; when none is left it hands out the agent's
+  **last-resort** package (RFC 9420 section 16.8, published with the others and
+  covered by the same signature), which is never used up, so an agent can always
+  be added. A requester (a registered name, unauthenticated like every name) gets
+  8 requests a minute and everyone together 24 (`rate_limited`), so one local
+  process cannot exhaust an agent. A last-resort package is reused, so the agent
+  should Commit a self-update soon after joining (the client does this).
 - Signed op `welcome` `{target, welcome: hex}`: a member leaves the invitee its
   MLS Welcome (at most 64 KiB, 1 MiB per room). `GET /signed/rooms/{room}/welcome?agent=`
   returns it to the invitee only, until it joins.
@@ -294,6 +300,7 @@ the changelog entry and the README.
   (MLS self-update); the client does not schedule that yet.
 - A member's own message is not echoed back by the daemon; the client logs it
   when it sends.
-- Anyone local can drain an agent's KeyPackages (they are public). The agent's
-  client republishes on `register`; a last-resort KeyPackage is not implemented.
+- Requester names are unauthenticated, so a process that registers many names can
+  still drain the ordinary KeyPackages; the last-resort package keeps the agent
+  addable, at the cost of reusing one init key.
 - The OS keychain is not used yet; the key file is the `~/.ssh` boundary.

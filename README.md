@@ -326,8 +326,8 @@ apart from the daemon's data directory.
 
 | Route | Purpose |
 |---|---|
-| `PUT /agents/{agent}/keypackages` | Offer MLS KeyPackages: `{"counter", "key_packages": [hex], "signature"}` (at most 16, 1 KiB each) |
-| `POST /agents/{agent}/keypackages/take` | One KeyPackage, used up; `no_key_package` when none is left |
+| `PUT /agents/{agent}/keypackages` | Offer MLS KeyPackages: `{"counter", "key_packages": [hex], "last_resort"?: hex, "signature"}` (at most 16, 1 KiB each, plus one last-resort package) |
+| `POST /agents/{agent}/keypackages/take` | `{"requester"}` (a registered agent): one KeyPackage; an ordinary one is used up, the last-resort one (RFC 9420 section 16.8) is handed out when those are gone and never used up. At most 8 a minute per requester and 24 in all (`rate_limited`, 429, `retryAfterMs`); `no_key_package` when there is nothing to give |
 | `POST /signed/ops` with `op: "welcome"` | A member leaves an invitee its Welcome: `target`, `welcome` (hex) |
 | `GET /signed/rooms/{room}/welcome?agent=` | The invitee's pending Welcome |
 
@@ -515,7 +515,8 @@ A failure is `{"error": "<code>", ...context}` with the HTTP status below
 | `key_conflict` | 409 | `agent` | The name is bound to a different key (or an invitation named another key than the invitee's) |
 | `stale_counter` | 409 | `room`, `last` | The counter is not above the highest this key has used in the room |
 | `stale_epoch` | 409 | `room`, `epoch` | A Commit named an epoch other than the room's current one: another Commit landed first |
-| `no_key_package` | 404 | `agent` | The agent has no KeyPackage left to be added with |
+| `no_key_package` | 404 | `agent` | The agent has no KeyPackage, ordinary or last-resort, to be added with |
+| `rate_limited` | 429 | `retryAfterMs` | Too many KeyPackage requests for that agent in the last minute |
 | `unregistered` | 404 | `agent`, `known` | Name is not on the roster; `known` is the first 256 names on the roster so the caller can correct itself |
 | `not_found` | 404 | | Unknown REST route |
 | `method_not_allowed` | 405 | | Known REST route, unsupported method (including `HEAD` on an inbox) |

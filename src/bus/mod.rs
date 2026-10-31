@@ -63,8 +63,9 @@ pub use model::{
     MAX_STREAM_BYTES, MAX_STREAM_IN_FLIGHT,
 };
 pub use signed::{
-    KeyBinding, KeyPackageStock, SignedMember, SignedOutcome, SignedRequest, SignedRoomInfo,
-    MAX_KEY_PACKAGES, MAX_KEY_PACKAGE_BYTES, MAX_WELCOME_BYTES,
+    KeyBinding, KeyPackageOffer, KeyPackageStock, SignedMember, SignedOutcome, SignedRequest,
+    SignedRoomInfo, MAX_KEY_PACKAGES, MAX_KEY_PACKAGE_BYTES, MAX_WELCOME_BYTES, TAKES_PER_MINUTE,
+    TAKES_PER_REQUESTER,
 };
 pub use snapshot::{remove_snapshot, SnapshotError};
 pub use stream::{Push, StreamSession};

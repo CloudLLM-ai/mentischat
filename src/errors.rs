@@ -170,6 +170,12 @@ pub enum MailboxError {
         /// The agent that has none.
         agent: String,
     },
+    /// Too many KeyPackage requests for an agent: from this requester, or from
+    /// everyone together, within the last minute.
+    RateLimited {
+        /// Milliseconds until a request can succeed.
+        retry_after_ms: u64,
+    },
     /// REST path that is not a known route.
     NotFound,
     /// Known REST path, HTTP method it does not serve.
@@ -209,6 +215,7 @@ impl MailboxError {
             Self::StaleCounter { .. } => "stale_counter",
             Self::StaleEpoch { .. } => "stale_epoch",
             Self::NoKeyPackage { .. } => "no_key_package",
+            Self::RateLimited { .. } => "rate_limited",
             Self::NotFound => "not_found",
             Self::MethodNotAllowed => "method_not_allowed",
             Self::ShuttingDown => "shutting_down",
@@ -248,6 +255,7 @@ impl MailboxError {
             | Self::NameTaken { .. } => StatusCode::CONFLICT,
             Self::StorageFull { .. } => StatusCode::INSUFFICIENT_STORAGE,
             Self::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
+            Self::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
         }
     }
 
@@ -294,6 +302,9 @@ impl MailboxError {
             }
             Self::KeyRequired { agent } | Self::KeyConflict { agent } => {
                 json!({ "error": self.code(), "agent": agent })
+            }
+            Self::RateLimited { retry_after_ms } => {
+                json!({ "error": self.code(), "retryAfterMs": retry_after_ms })
             }
             Self::NoKeyPackage { agent } => json!({ "error": self.code(), "agent": agent }),
             Self::StaleEpoch { room, epoch } => {

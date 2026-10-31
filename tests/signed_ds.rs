@@ -63,8 +63,8 @@ impl Actor {
     ) -> Result<usize, MailboxError> {
         let sig = self
             .keys
-            .sign(&key_packages_payload(self.name, counter, &packages));
-        bus.publish_key_packages(&name(self.name), counter, packages, &sig)
+            .sign(&key_packages_payload(self.name, counter, &packages, None));
+        bus.publish_key_packages(&name(self.name), counter, packages, None, &sig)
             .await
             .map(|s| s.available)
     }
@@ -91,6 +91,16 @@ async fn den_with_invited_bob(bus: &Bus) -> (Actor, Actor) {
 async fn epoch(bus: &Bus) -> u64 {
     let info = bus.signed_room_info(&name("alice"), &room("den")).await;
     info.unwrap().epoch
+}
+
+/// A KeyPackage request by the registered agent `req` (registered on first use).
+async fn take(
+    bus: &Bus,
+    agent: &mentischat::names::AgentName,
+) -> Result<mentischat::bus::KeyPackageOffer, MailboxError> {
+    let req = name("req");
+    let _ = bus.register(&req).await;
+    bus.take_key_package(agent, &req).await
 }
 
 fn code(e: MailboxError) -> &'static str {
@@ -140,14 +150,11 @@ async fn key_packages_are_handed_out_once_oldest_first() {
     assert_eq!(alice.publish(&bus, 2, vec![vec![3]]).await.unwrap(), 3);
     let a = name("alice");
     for want in [vec![1], vec![2], vec![3]] {
-        assert_eq!(bus.take_key_package(&a).await.unwrap(), want);
+        assert_eq!(take(&bus, &a).await.unwrap().package, want);
     }
+    assert_eq!(code(take(&bus, &a).await.unwrap_err()), "no_key_package");
     assert_eq!(
-        code(bus.take_key_package(&a).await.unwrap_err()),
-        "no_key_package"
-    );
-    assert_eq!(
-        code(bus.take_key_package(&name("ghost")).await.unwrap_err()),
+        code(take(&bus, &name("ghost")).await.unwrap_err()),
         "unregistered"
     );
 }
@@ -207,7 +214,7 @@ async fn the_key_package_directory_keeps_the_newest() {
     let available = alice.publish(&bus, 2, vec![vec![200]]).await.unwrap();
     assert_eq!(available, MAX_KEY_PACKAGES);
     assert_eq!(
-        bus.take_key_package(&name("alice")).await.unwrap(),
+        take(&bus, &name("alice")).await.unwrap().package,
         vec![1],
         "0 was dropped"
     );
@@ -444,4 +451,139 @@ async fn racing_commits_for_one_epoch_land_once() {
         .filter(|m| Envelope::parse(&m.body).is_ok_and(|e| mls_commit_epoch(e.body).is_some()))
         .count();
     assert_eq!(commits, 1);
+}
+
+/// Publish `packages` and a last-resort package for `alice`.
+async fn publish_with_last_resort(bus: &Bus, alice: &Actor, counter: u64, last: &[u8]) {
+    let packages = vec![vec![1u8], vec![2u8]];
+    let sig = alice.keys.sign(&key_packages_payload(
+        alice.name,
+        counter,
+        &packages,
+        Some(last),
+    ));
+    let stock = bus
+        .publish_key_packages(
+            &name(alice.name),
+            counter,
+            packages,
+            Some(last.to_vec()),
+            &sig,
+        )
+        .await
+        .unwrap();
+    assert_eq!((stock.available, stock.last_resort), (2, true));
+}
+
+/// Once the ordinary packages are gone the last-resort one is handed out, and
+/// it is never used up.
+#[tokio::test]
+async fn the_last_resort_package_outlasts_the_ordinary_ones() {
+    let (_d, bus) = fresh_bus("lastresort");
+    let alice = Actor::new("alice", 1);
+    alice.enroll(&bus).await;
+    publish_with_last_resort(&bus, &alice, 1, &[9, 9]).await;
+    let a = name("alice");
+    for want in [vec![1], vec![2]] {
+        let offer = take(&bus, &a).await.unwrap();
+        assert_eq!((offer.package, offer.last_resort), (want, false));
+    }
+    for _ in 0..3 {
+        let offer = take(&bus, &a).await.unwrap();
+        assert_eq!((offer.package, offer.last_resort), (vec![9, 9], true));
+    }
+}
+
+/// The last-resort package is signed for: swapping or adding one invalidates
+/// the signature, and a bad one is rejected whole.
+#[tokio::test]
+async fn the_last_resort_package_is_covered_by_the_signature() {
+    let (_d, bus) = fresh_bus("lastresortsig");
+    let alice = Actor::new("alice", 1);
+    alice.enroll(&bus).await;
+    let packages = vec![vec![1u8]];
+    let sig = alice
+        .keys
+        .sign(&key_packages_payload("alice", 1, &packages, Some(&[1])));
+    let err = bus
+        .publish_key_packages(&name("alice"), 1, packages.clone(), Some(vec![2]), &sig)
+        .await
+        .unwrap_err();
+    assert_eq!(code(err), "invalid_signature");
+    let err = bus
+        .publish_key_packages(&name("alice"), 1, packages.clone(), None, &sig)
+        .await
+        .unwrap_err();
+    assert_eq!(code(err), "invalid_signature");
+    let big = vec![0u8; MAX_KEY_PACKAGE_BYTES + 1];
+    let sig = alice
+        .keys
+        .sign(&key_packages_payload("alice", 2, &[], Some(&big)));
+    let err = bus
+        .publish_key_packages(&name("alice"), 2, vec![], Some(big), &sig)
+        .await
+        .unwrap_err();
+    assert_eq!(code(err), "invalid_body");
+    // A publish of only a last-resort package is fine.
+    let sig = alice
+        .keys
+        .sign(&key_packages_payload("alice", 3, &[], Some(&[5])));
+    bus.publish_key_packages(&name("alice"), 3, vec![], Some(vec![5]), &sig)
+        .await
+        .unwrap();
+}
+
+/// One requester cannot take more than its share per minute, the target keeps
+/// serving others, and the window slides on the bus clock.
+#[tokio::test]
+async fn one_requester_cannot_drain_an_agent() {
+    use mentischat::bus::{TAKES_PER_MINUTE, TAKES_PER_REQUESTER};
+    let (_d, bus, clock) =
+        common::bus_with_clock("ratelimit", mentischat::bus::Retention::default());
+    let alice = Actor::new("alice", 1);
+    alice.enroll(&bus).await;
+    publish_with_last_resort(&bus, &alice, 1, &[9]).await;
+    register(&bus, &["mallory", "bob", "carol", "dave"]).await;
+    let a = name("alice");
+    for _ in 0..TAKES_PER_REQUESTER {
+        bus.take_key_package(&a, &name("mallory")).await.unwrap();
+    }
+    let err = bus
+        .take_key_package(&a, &name("mallory"))
+        .await
+        .unwrap_err();
+    let MailboxError::RateLimited { retry_after_ms } = err else {
+        panic!("expected rate_limited, got {err:?}");
+    };
+    assert!((1..=60_000).contains(&retry_after_ms));
+    // Others are still served.
+    bus.take_key_package(&a, &name("bob")).await.unwrap();
+    // Together they cannot exceed the overall cap either.
+    let mut served = TAKES_PER_REQUESTER + 1;
+    for who in ["bob", "carol", "dave", "req1", "req2", "req3"] {
+        let _ = bus.register(&name(who)).await;
+        for _ in 0..TAKES_PER_REQUESTER {
+            if bus.take_key_package(&a, &name(who)).await.is_ok() {
+                served += 1;
+            }
+        }
+    }
+    assert_eq!(served, TAKES_PER_MINUTE);
+    // A minute later the window is empty again.
+    clock.advance(std::time::Duration::from_secs(61));
+    bus.take_key_package(&a, &name("mallory")).await.unwrap();
+}
+
+/// A request needs a registered requester.
+#[tokio::test]
+async fn a_key_package_request_needs_a_registered_requester() {
+    let (_d, bus) = fresh_bus("requester");
+    let alice = Actor::new("alice", 1);
+    alice.enroll(&bus).await;
+    publish_with_last_resort(&bus, &alice, 1, &[9]).await;
+    let err = bus
+        .take_key_package(&name("alice"), &name("ghost"))
+        .await
+        .unwrap_err();
+    assert_eq!(code(err), "unregistered");
 }

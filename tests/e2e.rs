@@ -343,23 +343,71 @@ async fn a_late_member_reads_from_its_epoch_on() {
     assert_eq!(dave.history("den").len(), 1);
 }
 
-/// Adding someone who has no KeyPackage left fails clearly and changes nothing.
+/// An agent whose ordinary KeyPackages were all taken can still be added, by
+/// its last-resort package, into more than one room; and one process cannot
+/// drain it faster than the rate limit lets it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn adding_an_agent_without_key_packages_fails() {
+async fn a_drained_agent_is_still_added_by_its_last_resort_package() {
+    let h = harness().await;
+    let mut alice = h.client("alice").await;
+    let mut bob = h.client("bob").await;
+    let mut carol = h.client("carol").await;
+    let _mallory = h.client("mallory").await;
+    let take = |who: &'static str| {
+        let daemon = h.daemon;
+        async move {
+            daemon
+                .call(
+                    "POST",
+                    "/agents/bob/keypackages/take",
+                    Some(&serde_json::json!({ "requester": who })),
+                )
+                .await
+        }
+    };
+    let mut drained = 0;
+    let limited = loop {
+        match take("mallory").await {
+            Ok(v) if v["lastResort"] == false => drained += 1,
+            Ok(_) => panic!("took the last resort before the rate limit"),
+            Err(e) => break e,
+        }
+    };
+    assert_eq!(limited.daemon_code(), Some("rate_limited"));
+    assert_eq!(drained, mentischat::bus::TAKES_PER_REQUESTER);
+    // Another requester drains the rest of the ordinary packages.
+    for _ in 0..(mentischat::client::session::KEY_PACKAGE_STOCK - drained) {
+        take("alice").await.unwrap();
+    }
+    assert_eq!(take("alice").await.unwrap()["lastResort"], true);
+
+    alice.create_room("one", "").await.unwrap();
+    alice.add_member("one", "bob").await.unwrap();
+    bob.join_room("one").await.unwrap();
+    carol.create_room("two", "").await.unwrap();
+    carol.add_member("two", "bob").await.unwrap();
+    bob.join_room("two").await.unwrap();
+
+    alice.send("one", "first room").await.unwrap();
+    carol.send("two", "second room").await.unwrap();
+    assert_eq!(inbox(&mut bob, "one").await, ["alice: first room"]);
+    assert_eq!(inbox(&mut bob, "two").await, ["carol: second room"]);
+}
+
+/// Adding an agent that never published anything fails clearly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adding_an_agent_with_no_key_packages_at_all_fails() {
     let h = harness().await;
     let mut alice = h.client("alice").await;
     alice.create_room("den", "").await.unwrap();
-    let mut bob = h.client("bob").await;
-    for _ in 0..mentischat::client::session::KEY_PACKAGE_STOCK {
-        h.daemon
-            .call("POST", "/agents/bob/keypackages/take", None)
-            .await
-            .unwrap();
-    }
-    let err = alice.add_member("den", "bob").await.unwrap_err();
-    assert_eq!(err.daemon_code(), Some("no_key_package"), "{err}");
-    bob.publish_key_packages(2).await.unwrap();
-    alice.add_member("den", "bob").await.unwrap();
+    let bare = h.open("bare");
+    bare.register(false).await.unwrap();
+    let err = alice.add_member("den", "bare").await.unwrap_err();
+    assert!(
+        matches!(err.daemon_code(), Some("key_required" | "no_key_package"))
+            || err.to_string().contains("no key"),
+        "{err}"
+    );
 }
 
 /// Key files are private and a loosened one is refused.

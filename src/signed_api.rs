@@ -122,7 +122,7 @@ pub async fn signed_op(bus: &Bus, params: &Value) -> Result<Value, MailboxError>
     Ok(to_wire(bus.signed_op(request).await?))
 }
 
-/// `PUT /agents/{agent}/keypackages` `{ "counter", "key_packages": [hex], "signature" }`:
+/// `PUT /agents/{agent}/keypackages` `{ "counter", "key_packages": [hex], "last_resort"?: hex, "signature" }`:
 /// offer MLS KeyPackages (opaque bytes) for others to add the agent with.
 ///
 /// # Errors
@@ -150,24 +150,41 @@ pub async fn publish_key_packages(
                 .ok_or(MailboxError::InvalidBody)
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let last_resort = match params.get("last_resort") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_str()
+                .and_then(|s| hex_decode_vec(s).ok())
+                .ok_or(MailboxError::InvalidBody)?,
+        ),
+    };
     let stock = bus
-        .publish_key_packages(&agent, counter, packages, &signature(params)?)
+        .publish_key_packages(&agent, counter, packages, last_resort, &signature(params)?)
         .await?;
     Ok(to_wire(stock))
 }
 
-/// `POST /agents/{agent}/keypackages/take`: one of the agent's KeyPackages,
-/// `{ "agent", "keyPackage": hex }`; it is not offered again.
+/// `POST /agents/{agent}/keypackages/take` `{ "requester" }`: one of the
+/// agent's KeyPackages, `{ "agent", "keyPackage": hex, "lastResort": bool }`.
+/// An ordinary package is not offered again; the last-resort one is.
 ///
 /// # Errors
 ///
-/// `invalid_name`, `unregistered`, `no_key_package`, `shutting_down`.
-pub async fn take_key_package(bus: &Bus, agent: &str) -> Result<Value, MailboxError> {
+/// `invalid_name`, `invalid_body` (no `requester`), `unregistered`,
+/// `rate_limited`, `no_key_package`, `shutting_down`.
+pub async fn take_key_package(
+    bus: &Bus,
+    agent: &str,
+    params: &Value,
+) -> Result<Value, MailboxError> {
     let agent = AgentName::parse(agent)?;
-    let package = bus.take_key_package(&agent).await?;
-    Ok(
-        serde_json::json!({ "agent": agent.as_str(), "keyPackage": crate::signed::hex_encode(&package) }),
-    )
+    let requester = AgentName::parse(text(params, "requester")?)?;
+    let offer = bus.take_key_package(&agent, &requester).await?;
+    Ok(serde_json::json!({
+        "agent": agent.as_str(),
+        "keyPackage": crate::signed::hex_encode(&offer.package),
+        "lastResort": offer.last_resort,
+    }))
 }
 
 /// `GET /signed/rooms/{room}/welcome?agent=`: the MLS Welcome waiting for an

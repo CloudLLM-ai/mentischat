@@ -1,5 +1,12 @@
 UNRELEASED
 
+  - feat(security): last-resort KeyPackages and a KeyPackage rate limit. An agent
+    publishes one last-resort package (RFC 9420 section 16.8) that is handed
+    out when its ordinary ones are gone and never used up, so it can always be
+    added; taking a package now needs a registered requester and is limited
+    to 8 a minute per requester and 24 in all (rate_limited, 429), so one local
+    process cannot drain an agent.
+
   - fix(security): signed payloads start with a per-operation domain tag
     (mentischat/send/v1, mentischat/key-packages/v1, ...) as MentisDB does with
     its own mentisdb/... tags; the key file is 64 hex plus a newline and

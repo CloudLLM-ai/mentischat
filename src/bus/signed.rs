@@ -271,14 +271,32 @@ pub const MAX_WELCOME_BYTES: usize = 64 * 1024;
 /// Most Welcome bytes one room holds at a time, over all its invitees.
 const MAX_ROOM_WELCOME_BYTES: usize = 1024 * 1024;
 
+/// Width of the KeyPackage request rate-limit window.
+const TAKE_WINDOW_MS: u64 = 60_000;
+/// Most KeyPackages one requester may take from one agent per minute.
+pub const TAKES_PER_REQUESTER: usize = 8;
+/// Most KeyPackages anyone together may take from one agent per minute.
+pub const TAKES_PER_MINUTE: usize = 24;
+
+/// A KeyPackage handed out for an add.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyPackageOffer {
+    /// The serialized KeyPackage.
+    pub package: Vec<u8>,
+    /// True when it is the agent's last-resort package, which stays on offer.
+    pub last_resort: bool,
+}
+
 /// The KeyPackages an agent has on offer, after a publish.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KeyPackageStock {
     /// The agent.
     pub agent: String,
-    /// How many are available now.
+    /// How many ordinary packages are available now.
     pub available: usize,
+    /// Whether a last-resort package is on offer.
+    pub last_resort: bool,
 }
 
 /// A signed operation as the REST layer parsed it.
@@ -446,11 +464,14 @@ impl Bus {
         }
     }
 
-    /// Offer `packages` (serialized MLS KeyPackages, opaque here) for others
+    /// Offer `packages` (serialized MLS KeyPackages, opaque here) and
+    /// optionally a `last_resort` KeyPackage (RFC 9420 section 16.8) for others
     /// to add `agent` with. `signature` signs
     /// [`key_packages_payload`](crate::signed::key_packages_payload) under the
     /// agent's bound key, with a `counter` above its previous publish. The
-    /// directory keeps at most [`MAX_KEY_PACKAGES`], dropping the oldest.
+    /// directory keeps at most [`MAX_KEY_PACKAGES`] ordinary packages, dropping
+    /// the oldest, and one last-resort package, replaced by each publish that
+    /// carries one.
     ///
     /// # Errors
     ///
@@ -463,13 +484,14 @@ impl Bus {
         agent: &AgentName,
         counter: u64,
         packages: Vec<Vec<u8>>,
+        last_resort: Option<Vec<u8>>,
         signature: &Signature,
     ) -> Result<KeyPackageStock, MailErr> {
-        if packages.is_empty()
+        let sized = |p: &Vec<u8>| p.is_empty() || p.len() > MAX_KEY_PACKAGE_BYTES;
+        if (packages.is_empty() && last_resort.is_none())
             || packages.len() > MAX_KEY_PACKAGES
-            || packages
-                .iter()
-                .any(|p| p.is_empty() || p.len() > MAX_KEY_PACKAGE_BYTES)
+            || packages.iter().any(sized)
+            || last_resort.as_ref().is_some_and(sized)
         {
             return Err(MailErr::InvalidBody);
         }
@@ -477,7 +499,12 @@ impl Bus {
         let key = found.inner.lock().key.ok_or_else(|| MailErr::KeyRequired {
             agent: found.name.to_string(),
         })?;
-        let payload = crate::signed::key_packages_payload(agent.as_str(), counter, &packages);
+        let payload = crate::signed::key_packages_payload(
+            agent.as_str(),
+            counter,
+            &packages,
+            last_resort.as_deref(),
+        );
         key.verify(&payload, signature)
             .map_err(|_| MailErr::InvalidSignature)?;
         let mut st = found.inner.lock();
@@ -492,25 +519,72 @@ impl Bus {
         while st.key_packages.len() > MAX_KEY_PACKAGES {
             st.key_packages.pop_front();
         }
+        if last_resort.is_some() {
+            st.last_resort = last_resort;
+        }
         Ok(KeyPackageStock {
             agent: found.name.to_string(),
             available: st.key_packages.len(),
+            last_resort: st.last_resort.is_some(),
         })
     }
 
-    /// Hand out one of `agent`'s KeyPackages, oldest first, and forget it:
-    /// each is used for one add. Anyone may ask; a KeyPackage is public.
+    /// Hand `requester` one of `agent`'s KeyPackages: the oldest ordinary one,
+    /// which is then forgotten, or, once those are gone, the agent's
+    /// last-resort package, which is never used up. Anyone registered may ask;
+    /// a KeyPackage is public. Requests are rate limited so one local process
+    /// cannot drain an agent: at most [`TAKES_PER_REQUESTER`] a minute from
+    /// one requester and [`TAKES_PER_MINUTE`] from everyone together.
     ///
     /// # Errors
     ///
-    /// `unregistered`; `no_key_package` when the agent has none left;
-    /// `shutting_down`.
-    pub async fn take_key_package(&self, agent: &AgentName) -> Result<Vec<u8>, MailErr> {
+    /// `unregistered` (for `agent` or `requester`); `rate_limited`;
+    /// `no_key_package` when the agent has neither ordinary nor last-resort
+    /// packages; `shutting_down`.
+    pub async fn take_key_package(
+        &self,
+        agent: &AgentName,
+        requester: &AgentName,
+    ) -> Result<KeyPackageOffer, MailErr> {
         let state = self.open()?;
         let found = state.agent(agent.as_str(), Key::fold(agent.as_str()).as_str())?;
-        let taken = found.inner.lock().key_packages.pop_front();
-        taken.ok_or_else(|| MailErr::NoKeyPackage {
-            agent: found.name.to_string(),
+        state.agent(requester.as_str(), Key::fold(requester.as_str()).as_str())?;
+        let now = self.now_ms();
+        let who = requester.folded();
+        let mut st = found.inner.lock();
+        while st
+            .package_takes
+            .front()
+            .is_some_and(|(at, _)| now.saturating_sub(*at) >= TAKE_WINDOW_MS)
+        {
+            st.package_takes.pop_front();
+        }
+        let mine = st.package_takes.iter().filter(|(_, w)| *w == who).count();
+        if mine >= TAKES_PER_REQUESTER || st.package_takes.len() >= TAKES_PER_MINUTE {
+            let oldest = st
+                .package_takes
+                .iter()
+                .find(|(_, w)| mine < TAKES_PER_REQUESTER || *w == who);
+            let at = oldest.map_or(now, |(at, _)| *at);
+            return Err(MailErr::RateLimited {
+                retry_after_ms: (at + TAKE_WINDOW_MS).saturating_sub(now).max(1),
+            });
+        }
+        let (package, last_resort) = match st.key_packages.pop_front() {
+            Some(p) => (p, false),
+            None => match st.last_resort.clone() {
+                Some(p) => (p, true),
+                None => {
+                    return Err(MailErr::NoKeyPackage {
+                        agent: found.name.to_string(),
+                    })
+                }
+            },
+        };
+        st.package_takes.push_back((now, who));
+        Ok(KeyPackageOffer {
+            package,
+            last_resort,
         })
     }
 

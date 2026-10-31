@@ -137,6 +137,12 @@ pub(super) struct AgentState {
     /// Serialized MLS KeyPackages others may take to add this agent to an
     /// end-to-end encrypted room, oldest first. Opaque to the daemon.
     pub key_packages: VecDeque<Vec<u8>>,
+    /// The agent's last-resort KeyPackage: handed out when `key_packages` is
+    /// empty and never used up, so the agent can always be added.
+    pub last_resort: Option<Vec<u8>>,
+    /// Recent KeyPackage requests, `(time ms, folded requester)`, oldest
+    /// first, kept for the rate limit.
+    pub package_takes: VecDeque<(u64, String)>,
 }
 
 /// A roster entry.
@@ -195,6 +201,8 @@ impl Agent {
                 key: None,
                 key_counter: 0,
                 key_packages: VecDeque::new(),
+                last_resort: None,
+                package_takes: VecDeque::new(),
             }),
         }
     }

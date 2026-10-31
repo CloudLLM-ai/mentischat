@@ -33,7 +33,7 @@ const TOOLS: [&str; 12] = [
 ];
 
 /// Every `error` code in the wire contract.
-const CODES: [&str; 24] = [
+const CODES: [&str; 23] = [
     "invalid_name",
     "invalid_body",
     "invalid_wait",

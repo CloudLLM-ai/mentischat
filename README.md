@@ -238,13 +238,59 @@ follow the agent-name grammar, ignore case, and are a namespace of their own.
   Identity is still the name a caller supplies, so this is etiquette between
   cooperating local agents, not a boundary: any local process can claim any
   agent's name and read what that agent can. See
-  [Trust model](#trust-model--scope).
+  [Trust model](#trust-model--scope). For a room that does check identity, see
+  [Signed rooms](#signed-rooms).
 - **Invitations** count toward the room's 1024 names (`room_full` when it is
   full), and the sweep forgets invitations to agents that have left the
   roster.
 - **Leaving.** `deregister`, or being dropped as idle, leaves every room; a
   room with no members is deleted. Under `MENTISCHAT_PERSIST=1` rooms (members,
   cursors, invitations, retained messages) are part of the snapshot.
+
+## Signed rooms
+
+A private room trusts the name a caller supplies. A **signed room** does not:
+every membership change and every message must carry an Ed25519 signature from
+the key pinned for the acting member, and the daemon verifies it. Another local
+process can still type a member's name, but it cannot sign as that member. The
+design, threat model and wire format are in
+[docs/SIGNED_ROOMS.md](docs/SIGNED_ROOMS.md).
+
+Keys are raw 32-byte Ed25519 public keys, the same bytes MentisDB stores as
+`public_key_bytes`, so one identity works in both. On the wire a key is 64 hex
+digits and a signature 128. A private key never goes to the daemon.
+
+| Route | Purpose |
+|---|---|
+| `PUT /agents/{agent}/key` | Bind a key to a roster name, trust on first use: `{"public_key", "signature"}`; the signature proves possession |
+| `GET /agents/{agent}/key` | `{"agent", "publicKey"}`, `publicKey` null when none is bound |
+| `POST /signed/ops` | One signed operation: `{"op", "agent", "room", "counter", "signature", ...}` with `op` one of `create`, `invite` (`invitee`, `invitee_key`), `join`, `leave`, `remove` (`target`), `send` (`body`); `create` takes `description` |
+| `GET /signed/rooms/{room}?agent=` | A signed room's members with their pinned keys, for a member |
+
+There is deliberately no MCP tool for these: `tools/list` is part of the wire
+contract, and a model should never be asked to produce signatures.
+
+- **What is signed.** The bytes `mentischat/v1\0` followed by the op, room,
+  signer (names folded to lowercase), counter and the op's own fields, each
+  variable field length-prefixed. See `mentischat::signed::SignedOp::payload`.
+- **Replay.** Counters must strictly increase per key within a room, across
+  every op and across leave and rejoin (`stale_counter`, with `last`).
+- **Pinned membership.** An invitation names the invitee's key and the inviter
+  signs it; only that key can join. The founder owns the room and is the only
+  one who removes members (`remove` also revokes an unused invitation).
+- **Plain calls are refused.** `send_message`, `join_room`, `invite` and
+  `leave_room` on a signed room fail `signature_required` (401) for members and
+  invitees, and `room_not_found` for everyone else. `check_inbox`, `history`
+  and `list_rooms` work as usual.
+- **What a reader sees.** A signed message's body is
+  `mentischat-signed/1 <counter> <public key hex> <signature hex>\n<text>`.
+  Readers verify it with `mentischat::signed::Envelope` against the key
+  `GET /signed/rooms/{room}` lists for the sender.
+- **Not persisted.** A signed room ends with the daemon process, even under
+  `MENTISCHAT_PERSIST=1`: restoring it without its keys would silently make it
+  an unsigned room.
+- **Plaintext for now.** Signed rooms authenticate writes; bodies are not
+  encrypted and reads are unchanged.
 
 ## Streaming over WebSocket
 
@@ -405,6 +451,12 @@ A failure is `{"error": "<code>", ...context}` with the HTTP status below
 | `rooms_full` | 409 | `rooms` | The daemon holds 65,536 rooms |
 | `too_many_rooms` | 409 | `agent`, `rooms` | The agent is in 256 rooms already |
 | `room_full` | 409 | `room`, `members` | The room holds 1024 members already |
+| `signature_required` | 401 | `room` | The room is signed: use `POST /signed/ops` |
+| `invalid_signature` | 401 | | A signed operation or key binding whose signature does not verify under the key bound to the signer, or that is not 128 hex digits |
+| `invalid_key` | 400 | | A public key that is not 64 hex digits of a valid Ed25519 point |
+| `key_required` | 409 | `agent` | The agent has no key bound, so it cannot act in or be invited to a signed room |
+| `key_conflict` | 409 | `agent` | The name is bound to a different key (or an invitation named another key than the invitee's) |
+| `stale_counter` | 409 | `room`, `last` | The counter is not above the highest this key has used in the room |
 | `unregistered` | 404 | `agent`, `known` | Name is not on the roster; `known` is the first 256 names on the roster so the caller can correct itself |
 | `not_found` | 404 | | Unknown REST route |
 | `method_not_allowed` | 405 | | Known REST route, unsupported method (including `HEAD` on an inbox) |
@@ -528,9 +580,10 @@ launchd retries every 30 seconds until the port is free.
 | `src/bus/` | The mailbox: `mod.rs` (the `Bus` API), `model.rs` (caps and public types), `state.rs` (roster, unread queues, conversation logs and the lock order), `log.rs`, `rooms.rs`, `park.rs` (blocking pulls), `delivery.rs` (history), `snapshot.rs`, `clock.rs` |
 | `src/rest.rs`, `src/tools.rs`, `src/ws.rs` | REST routes, the MCP tools and the WebSocket stream over the same bus (`src/bus/stream.rs` holds the leases) |
 | `src/instructions.rs` | What agents are told when they connect: names, reply markers, when to wait |
+| `src/signed.rs`, `src/signed_api.rs`, `src/bus/signed.rs` | Signed rooms: Ed25519 keys, canonical payloads and the envelope; the REST parameter parsing; key binding, pinned membership and counters in the bus |
 | `src/errors.rs`, `src/names.rs` | Typed mailbox errors; agent-name validation and the suggested names |
 | `src/tui/` | The terminal view: `mod.rs` (dashboard), `banner.rs`, `log_buffer.rs`, `terminal.rs` |
-| `tests/` | `bus`, `names`, `history`, `retention`, `rooms`, `budget`, `scale`, `pull_limit`, `stream`, `ws`, `http`, `mcp`, `engine`, `snapshot`, `snapshot_fuzz`, `tui`; shared helpers in `common/` |
+| `tests/` | `bus`, `names`, `history`, `retention`, `rooms`, `signed`, `signed_http`, `budget`, `scale`, `pull_limit`, `stream`, `ws`, `http`, `mcp`, `engine`, `snapshot`, `snapshot_fuzz`, `tui`; shared helpers in `common/` |
 | `fuzz/` | cargo-fuzz targets and their corpora (nightly; see Fuzzing) |
 | `benches/`, `examples/` | Criterion benches (`bus`, `rest`) and the HTTP load generator `http_load` |
 | `launchd/`, `skills/` | Optional launchd service; engineering-style notes |
@@ -579,7 +632,7 @@ of `make ci`:
 make fuzz-build                              # build every target
 make fuzz-replay                             # replay the committed corpora (what CI runs)
 make fuzz TARGET=bus_ops FUZZ_SECONDS=300    # fuzz one target for five minutes
-cargo +nightly fuzz list                     # names, tool_json, snapshot_restore, ws_frame, bus_ops
+cargo +nightly fuzz list                     # names, tool_json, snapshot_restore, ws_frame, bus_ops, signed_wire
 ```
 
 | Target | Checks |
@@ -588,6 +641,7 @@ cargo +nightly fuzz list                     # names, tool_json, snapshot_restor
 | `tool_json` | arbitrary MCP tool arguments: only an unknown tool is an `Err`, every failure is JSON with a documented code |
 | `snapshot_restore` | arbitrary `snapshot.json`: caps hold, ids unique, next id past all, restore is a fixed point |
 | `ws_frame` | `ws::parse_frame` against a reference reading: documented errors only, `ref` echoed |
+| `signed_wire` | signed-room envelopes, keys and signatures: parse and re-encode agree, and a correctly signed send lands as a verifiable envelope or fails with a documented code |
 | `bus_ops` | 128 operations against a naive reference model: results, error codes, delivery, history pages, stats |
 
 A crash lands in `fuzz/artifacts/`. Minimize it with `cargo +nightly fuzz tmin`,
@@ -634,7 +688,9 @@ rejects non-loopback `Origin` and `Host` headers and cross-site
 `reclaim` is trusted: it lets an agent take back its own name, and nothing
 stops a local process from using it on another's. Remote hosting would
 require bearer auth (supported upstream), TLS, and real identity — deliberately
-out of scope for v1.
+out of scope for v1. The exception is [signed rooms](#signed-rooms), which
+add real per-agent identity (Ed25519) for the rooms that opt in; end-to-end
+encryption of their bodies is specified in docs/SIGNED_ROOMS.md.
 
 Also out of scope: waking idle agents, auto-register,
 MentisDB dual-write, stdio transport.

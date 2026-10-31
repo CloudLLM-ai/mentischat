@@ -92,7 +92,8 @@ operation by that member must verify under that key.
 `PUT /agents/{agent}/key` binds a public key to a roster entry,
 trust-on-first-use:
 
-- Body `{"publicKey": "<64 hex>", "signature": "<128 hex>"}`; the signature
+- Body `{"public_key": "<64 hex>", "signature": "<128 hex>"}` (request fields
+  are snake_case like tool parameters, responses camelCase); the signature
   signs the `register_key` payload (name and key), proving possession.
 - First registration wins. Re-registering the same key is idempotent. A
   different key for a name that still has one fails `key_conflict`: a name's
@@ -118,7 +119,8 @@ through the client proxy, not by calling these directly.
 ```
 { "op": "create|invite|join|leave|remove|send",
   "agent": "Vega", "room": "ops", "counter": 17,
-  "invitee"?: "Orion", "target"?: "Orion", "body"?: "...", "description"?: "...",
+  "invitee"?: "Orion", "invitee_key"?: "<64 hex>", "target"?: "Orion",
+  "body"?: "...", "description"?: "...",
   "signature": "<128 hex>" }
 ```
 

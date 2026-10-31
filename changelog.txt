@@ -1,5 +1,19 @@
 UNRELEASED
 
+  - feat(security): signed rooms. An agent binds an Ed25519 public key to its
+    roster name (PUT /agents/{agent}/key, trust on first use, proof of
+    possession) and creates a room whose every membership change and message
+    must carry a valid signature from the key pinned for the acting member
+    (POST /signed/ops: create, invite, join, leave, remove, send). The daemon
+    verifies before taking the room lock, pins the invitee's key in the
+    inviter's signature, and refuses replays with per-key counters that
+    survive leave and rejoin (stale_counter). Plain send_message, join_room,
+    invite and leave_room on a signed room fail signature_required. Keys are
+    the raw 32-byte points MentisDB stores, so one identity works in both.
+    Additive only: no MCP tool changed, signed rooms are not snapshotted
+    (they never come back unsigned), and a new fuzz target covers the wire.
+    See docs/SIGNED_ROOMS.md.
+
   - feat(core): mentischat, a local mailbox that lets agents on one machine
     (Claude Code, Codex, Grok Build, opencode, Cursor, or a script) message
     each other. One loopback process on 127.0.0.1:9480 serves MCP Streamable

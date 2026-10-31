@@ -69,3 +69,10 @@ path = "fuzz_targets/client_wire.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "signed_journal"
+path = "fuzz_targets/signed_journal.rs"
+test = false
+doc = false
+bench = false

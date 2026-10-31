@@ -347,6 +347,13 @@ self-update (an empty Commit) every `--update-messages` sent messages (default
 time), and once right after it joins, so a key stolen from its files stops
 working after the next update (post-compromise security).
 
+**Rollback.** A daemon put back to an older snapshot is noticed by the clients that
+used the room: before each sync the client compares the daemon's epoch and the
+counter it has accepted from the client with what the client has seen, and a lower
+answer (`RolledBack`) stops the room, with a `warnings` entry in `check_inbox`,
+until `Client::accept_rollback`. Omissions that keep both numbers intact are not
+detectable; see docs/SIGNED_ROOMS.md.
+
 **Falling behind.** A room keeps its last 1024 messages. A client away long
 enough to miss a Commit past that cannot catch up and reports `Behind`; it must
 be added again. The proxy does this by itself: on its next `check_inbox` it
@@ -719,7 +726,7 @@ of `make ci`:
 make fuzz-build                              # build every target
 make fuzz-replay                             # replay the committed corpora (what CI runs)
 make fuzz TARGET=bus_ops FUZZ_SECONDS=300    # fuzz one target for five minutes
-cargo +nightly fuzz list                     # names, tool_json, snapshot_restore, ws_frame, bus_ops, signed_wire, client_wire
+cargo +nightly fuzz list                     # names, tool_json, snapshot_restore, ws_frame, bus_ops, signed_wire, signed_journal, client_wire
 ```
 
 | Target | Checks |
@@ -729,6 +736,7 @@ cargo +nightly fuzz list                     # names, tool_json, snapshot_restor
 | `snapshot_restore` | arbitrary `snapshot.json`: caps hold, ids unique, next id past all, restore is a fixed point |
 | `ws_frame` | `ws::parse_frame` against a reference reading: documented errors only, `ref` echoed |
 | `signed_wire` | signed-room envelopes, keys and signatures: parse and re-encode agree, and a correctly signed send lands as a verifiable envelope or fails with a documented code |
+| `signed_journal` | a signed room's journal and retained envelopes through `verify_signed_record`: deterministic; a valid record rejects any changed signature, repeated record or edited signed field; every prefix verifies and the epoch never exceeds the whole's. Seeded from real and tampered journals |
 | `client_wire` | the client's inputs: daemon HTTP replies (chunked included) parse to a status and JSON or a typed error, and a command line that parses names a valid agent and a loopback daemon |
 | `bus_ops` | 128 operations against a naive reference model: results, error codes, delivery, history pages, stats |
 

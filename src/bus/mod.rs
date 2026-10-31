@@ -68,6 +68,7 @@ pub use signed::{
     SignedRoomInfo, MAX_KEY_PACKAGES, MAX_KEY_PACKAGE_BYTES, MAX_WELCOME_BYTES, TAKES_PER_MINUTE,
     TAKES_PER_REQUESTER,
 };
+pub use signed_persist::{verify_signed_record, RecordSummary};
 pub use snapshot::{remove_snapshot, SnapshotError};
 pub use stream::{Push, StreamSession};
 

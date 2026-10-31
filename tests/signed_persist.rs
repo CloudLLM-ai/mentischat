@@ -672,3 +672,82 @@ async fn an_overlong_journal_is_not_saved() {
     let back = restart(&bus).await;
     assert!(den_gone(&back).await);
 }
+
+/// Writes the seeds of the `signed_journal` fuzz target (run by hand:
+/// `SEED_DIR=fuzz/corpus/signed_journal cargo test --test signed_persist
+/// write_journal_seeds -- --ignored`): a valid record with its retained
+/// messages, the same as the tamper tests produce, and each tampered variant.
+#[tokio::test]
+#[ignore = "writes fuzz seeds; run by hand"]
+async fn write_journal_seeds() {
+    let dir = std::path::PathBuf::from(std::env::var("SEED_DIR").expect("SEED_DIR"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (_d, bus) = common::fresh_bus("seeds");
+    // The fuzz target's room is `r`; sign for it.
+    let (alice, bob) = (Actor::new("alice", 1), Actor::new("bob", 2));
+    for a in [&alice, &bob] {
+        a.enroll(&bus).await;
+    }
+    let create = SignedOp::Create {
+        description: "d".into(),
+    };
+    alice.op(&bus, "r", 1, create).await.unwrap();
+    alice.op(&bus, "r", 2, alice.invite(&bob)).await.unwrap();
+    bob.op(&bus, "r", 1, SignedOp::Join).await.unwrap();
+    alice.say(&bus, "r", 3, "mls/1 commit 0 aa").await.unwrap();
+    bob.say(&bus, "r", 2, "plain words").await.unwrap();
+    let welcome = SignedOp::Welcome {
+        target: "bob".into(),
+        welcome: vec![1, 2, 3],
+    };
+    alice.op(&bus, "r", 4, welcome).await.unwrap();
+    bob.say(&bus, "r", 3, "mls/1 commit 1 bb").await.unwrap();
+    let snap = snapshot_value(&bus);
+    let rec = snap["rooms"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "r")
+        .unwrap();
+    let retained: Vec<Value> = rec["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| json!([m["from"], m["body"]]))
+        .collect();
+    let valid = json!({
+        "journal": rec["signed"]["journal"],
+        "watermarks": rec["signed"]["watermarks"],
+        "retained": retained,
+    });
+    let write = |name: &str, v: &Value| std::fs::write(dir.join(name), v.to_string()).unwrap();
+    write("valid", &valid);
+    let mut no_retained = valid.clone();
+    no_retained["retained"] = json!([]);
+    write("valid_no_retained", &no_retained);
+    let mut no_marks = valid.clone();
+    no_marks["watermarks"] = json!([]);
+    write("valid_no_watermarks", &no_marks);
+    let n = valid["journal"].as_array().unwrap().len();
+    for i in 0..n {
+        let mut bad = valid.clone();
+        let sig = bad["journal"][i]["signature"].as_str().unwrap().to_string();
+        bad["journal"][i]["signature"] = json!(format!("0{}", &sig[1..]));
+        write(&format!("bad_signature_{i}"), &bad);
+        let mut dup = valid.clone();
+        let r = dup["journal"][i].clone();
+        dup["journal"].as_array_mut().unwrap().insert(i, r);
+        write(&format!("repeated_{i}"), &dup);
+        if i + 1 < n {
+            let mut swapped = valid.clone();
+            swapped["journal"].as_array_mut().unwrap().swap(i, i + 1);
+            write(&format!("swapped_{i}"), &swapped);
+        }
+        let mut dropped = valid.clone();
+        dropped["journal"].as_array_mut().unwrap().remove(i);
+        write(&format!("dropped_{i}"), &dropped);
+    }
+    let mut forged = valid.clone();
+    forged["retained"][0][1] = json!("mentischat-signed/1 1 00 00\nx");
+    write("retained_malformed", &forged);
+}

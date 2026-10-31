@@ -373,3 +373,79 @@ fn merge_saved_watermarks(
     }
     Ok(())
 }
+
+/// What [`verify_signed_record`] rebuilt from a signed room's records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordSummary {
+    /// Folded names of the members the records leave in the room, sorted.
+    pub members: Vec<String>,
+    /// The owner's key (hex) while the owner is a member.
+    pub owner: Option<String>,
+    /// The epoch the Commit chain reaches.
+    pub epoch: u64,
+    /// Folded names invited and not yet joined, sorted.
+    pub invited: Vec<String>,
+    /// How many journal records were replayed.
+    pub records: usize,
+}
+
+/// The JSON [`verify_signed_record`] reads.
+#[derive(Deserialize)]
+struct RecordInput {
+    journal: Vec<OpRec>,
+    #[serde(default)]
+    watermarks: Vec<(String, u64)>,
+    /// The room's retained messages, `[sender, body]`.
+    #[serde(default)]
+    retained: Vec<(String, String)>,
+}
+
+/// Verify a signed room's saved records, as restore does, without a bus: the
+/// replay of a room's journal with every signature, counter and the Commit
+/// chain checked, and its retained envelopes verified.
+///
+/// `json` is `{"journal": [...], "watermarks": [[key hex, counter], ...],
+/// "retained": [[sender, body], ...]}`, the shape of a snapshot's `signed`
+/// section with the room's retained messages; the last two are optional. This
+/// is the entry point the fuzz target `signed_journal` drives: it parses
+/// untrusted bytes and must answer with a summary or a reason, never panic.
+///
+/// # Errors
+///
+/// A short reason when the JSON is not that shape, or a record does not verify
+/// or does not follow from those before it.
+///
+/// # Examples
+///
+/// ```
+/// use mentischat::bus::verify_signed_record;
+///
+/// // A room with no records has no members, so it cannot be restored.
+/// assert!(verify_signed_record("den", br#"{"journal":[]}"#).is_err());
+/// assert!(verify_signed_record("den", b"not json").is_err());
+/// ```
+pub fn verify_signed_record(room: &str, json: &[u8]) -> Result<RecordSummary, &'static str> {
+    let input: RecordInput = serde_json::from_slice(json).map_err(|_| "not a signed record")?;
+    let rec = SignedRec {
+        journal: input.journal,
+        watermarks: input.watermarks,
+    };
+    let retained: Vec<(&str, &str)> = input
+        .retained
+        .iter()
+        .map(|(f, b)| (f.as_str(), b.as_str()))
+        .collect();
+    let replayed = replay(&room.to_ascii_lowercase(), &rec, &retained)?;
+    let state = replayed.state;
+    let mut members: Vec<String> = state.pins.keys().cloned().collect();
+    members.sort_unstable();
+    let mut invited: Vec<String> = state.invitations.keys().cloned().collect();
+    invited.sort_unstable();
+    Ok(RecordSummary {
+        members,
+        owner: state.owner.map(|k| k.to_hex()),
+        epoch: state.epoch,
+        invited,
+        records: rec.journal.len(),
+    })
+}

@@ -116,6 +116,13 @@ pub struct Received {
 struct RoomLog {
     /// A Commit this client needs fell out of retention: it must be re-added.
     behind: bool,
+    /// The daemon showed an older room than this client had seen; the room is
+    /// not used until the user accepts it.
+    rolled_back: bool,
+    /// Highest MLS epoch this client has held in this room.
+    max_epoch: u64,
+    /// Highest counter the daemon accepted from this client in this room.
+    counter_floor: u64,
     /// A fresh self-update is due as soon as possible (just joined).
     update_due: bool,
     /// Messages this client has sent since its last self-update.
@@ -426,7 +433,14 @@ impl Client {
                     let last = body.get("last").and_then(Value::as_u64).unwrap_or(0);
                     self.last_counter = self.last_counter.max(last);
                 }
-                other => return other,
+                other => {
+                    if other.is_ok() {
+                        if let Some(log) = self.rooms.get_mut(&folded(room)) {
+                            log.counter_floor = log.counter_floor.max(counter);
+                        }
+                    }
+                    return other;
+                }
             }
         }
         Err(ClientError::Usage("counter retry exhausted".into()))
@@ -451,6 +465,9 @@ impl Client {
     }
 
     fn live_group(&self, room: &str) -> Result<MlsGroup, ClientError> {
+        if self.rooms.get(&folded(room)).is_some_and(|l| l.rolled_back) {
+            return Err(self.rolled_back_error(room, "flagged earlier"));
+        }
         let group = self.group(room)?;
         if group.is_active() {
             Ok(group)
@@ -766,7 +783,20 @@ impl Client {
             .map_err(mls("stage welcome"))?
             .into_group(&self.provider)
             .map_err(mls("join group"))?;
+        let joined_epoch = self.group(room)?.epoch().as_u64();
         let log = self.rooms.entry(folded(room)).or_default();
+        if joined_epoch < log.max_epoch {
+            // A Welcome older than a group this client already held: the daemon
+            // is serving a rolled-back room.
+            log.rolled_back = true;
+            let detail = format!(
+                "welcome is for epoch {joined_epoch}, this client held {}",
+                log.max_epoch
+            );
+            self.persist()?;
+            return Err(self.rolled_back_error(room, &detail));
+        }
+        log.max_epoch = joined_epoch;
         log.ended = false;
         log.behind = false;
         log.update_due = true;
@@ -980,6 +1010,11 @@ impl Client {
                 room: room.to_string(),
             });
         }
+        self.check_rollback(room).await?;
+        let log = self
+            .rooms
+            .get(&folded(room))
+            .ok_or_else(|| ClientError::Usage(format!("no secure room {room} on this client")))?;
         let mut pending = self.fetch_since(room, log.last_id).await?;
         pending.sort_by_key(|m| m.id);
         let mut decrypted = 0;
@@ -1001,6 +1036,87 @@ impl Client {
         }
         self.persist()?;
         Ok(decrypted)
+    }
+
+    /// Compare the daemon's account of the room with what this client has seen,
+    /// and stop using the room if the daemon's is older: its epoch is below the
+    /// group's (Commits this client already applied are gone), or it has
+    /// accepted fewer of this client's operations than this client got
+    /// accepted. A daemon restored from an older snapshot, or with a truncated
+    /// journal, shows exactly this. This cannot see an omission that leaves both
+    /// numbers intact, such as a dropped `leave` of someone else.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::RolledBack`] (and it keeps returning it until
+    /// [`accept_rollback`](Self::accept_rollback)), [`ClientError::Daemon`].
+    pub async fn check_rollback(&mut self, room: &str) -> Result<(), ClientError> {
+        let key = folded(room);
+        if self.rooms.get(&key).is_some_and(|l| l.rolled_back) {
+            return Err(self.rolled_back_error(room, "flagged earlier"));
+        }
+        let info = self.room_info(room).await?;
+        let group_epoch = self.group(room)?.epoch().as_u64();
+        let daemon_epoch = info["epoch"].as_u64().unwrap_or(0);
+        let theirs = info["yourCounter"].as_u64();
+        let log = self
+            .rooms
+            .get_mut(&key)
+            .ok_or_else(|| ClientError::Usage(format!("no secure room {room} on this client")))?;
+        log.max_epoch = log.max_epoch.max(group_epoch);
+        let detail = if daemon_epoch < log.max_epoch {
+            Some(format!(
+                "daemon is at epoch {daemon_epoch}, this client has held epoch {}",
+                log.max_epoch
+            ))
+        } else if log.counter_floor > 0 && theirs.is_none_or(|c| c < log.counter_floor) {
+            Some(format!(
+                "daemon has accepted up to counter {}, this client got {} accepted",
+                theirs.unwrap_or(0),
+                log.counter_floor
+            ))
+        } else {
+            None
+        };
+        if let Some(detail) = detail {
+            log.rolled_back = true;
+            self.persist()?;
+            return Err(self.rolled_back_error(room, &detail));
+        }
+        self.persist()
+    }
+
+    fn rolled_back_error(&self, room: &str, detail: &str) -> ClientError {
+        ClientError::RolledBack {
+            room: room.to_string(),
+            detail: detail.to_string(),
+        }
+    }
+
+    /// Resume using a room [`check_rollback`](Self::check_rollback) stopped,
+    /// after the user has decided the daemon's older state is acceptable (for
+    /// example they restored it on purpose). The client's own high-water marks
+    /// are reset to what the daemon now shows. If the client's group is ahead
+    /// of the daemon's room it can no longer follow it and is marked as having
+    /// fallen behind, to be re-added (see [`ClientError::Behind`]).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Usage`] for an unknown room, [`ClientError::Daemon`].
+    pub async fn accept_rollback(&mut self, room: &str) -> Result<(), ClientError> {
+        let info = self.room_info(room).await?;
+        let group_epoch = self.group(room)?.epoch().as_u64();
+        let log = self
+            .rooms
+            .get_mut(&folded(room))
+            .ok_or_else(|| ClientError::Usage(format!("no secure room {room} on this client")))?;
+        log.rolled_back = false;
+        log.max_epoch = info["epoch"].as_u64().unwrap_or(0);
+        // A group ahead of the daemon's room cannot commit or follow it any
+        // more: it needs a re-add, like a client that fell behind.
+        log.behind = group_epoch > log.max_epoch;
+        log.counter_floor = info["yourCounter"].as_u64().unwrap_or(0);
+        self.persist()
     }
 
     /// The room's retained messages with an id above `after`, from newest page

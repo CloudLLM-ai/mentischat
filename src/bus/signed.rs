@@ -282,6 +282,10 @@ pub struct SignedRoomInfo {
     /// Names invited and not yet joined, sorted: a client pruning departed
     /// members must not mistake an invitee for one.
     pub invited: Vec<String>,
+    /// The highest counter the daemon has accepted from the asking member's key
+    /// in this room. A client remembers the highest counter the daemon accepted
+    /// from it; a lower answer means the room was rolled back.
+    pub your_counter: Option<u64>,
 }
 
 /// Most KeyPackages the daemon keeps for one agent; publishing more drops the
@@ -960,6 +964,10 @@ impl State {
             epoch: signed.epoch,
             members,
             invited,
+            your_counter: signed
+                .pins
+                .get(Key::fold(&agent.name).as_str())
+                .and_then(|k| signed.watermarks.get(k).copied()),
         })
     }
 }

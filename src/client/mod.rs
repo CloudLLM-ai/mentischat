@@ -48,6 +48,17 @@ pub enum ClientError {
         /// The room this client fell behind in.
         room: String,
     },
+    /// The daemon's view of the room is older than what this client has already
+    /// seen: its epoch is below the group's, or it has accepted fewer of this
+    /// client's operations than the client got accepted. The daemon was restored
+    /// from an older snapshot or its journal was truncated. The client stops
+    /// using the room until [`Client::accept_rollback`].
+    RolledBack {
+        /// The room.
+        room: String,
+        /// What was wrong.
+        detail: String,
+    },
     /// An MLS operation failed (bad message, wrong epoch, invalid KeyPackage).
     Mls(String),
     /// Key or state files could not be read, written or parsed.
@@ -76,6 +87,12 @@ impl fmt::Display for ClientError {
                 f,
                 "this client missed commits in {room} and must be added to it again"
             ),
+            Self::RolledBack { room, detail } => {
+                write!(
+                    f,
+                    "secure room {room} was rolled back by the daemon: {detail}"
+                )
+            }
             Self::Mls(m) => write!(f, "mls: {m}"),
             Self::Storage(m) => write!(f, "storage: {m}"),
             Self::Usage(m) => f.write_str(m),

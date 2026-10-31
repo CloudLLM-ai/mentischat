@@ -634,3 +634,95 @@ async fn re_adding_a_stranger_is_refused() {
     let err = alice.readd_member("den", "eve").await.unwrap_err();
     assert!(err.to_string().contains("not a member"), "{err}");
 }
+
+/// Serve `snapshot` (an older daemon state restored from disk) on a new port.
+async fn restored_daemon(snapshot: &[u8]) -> Daemon {
+    let bus = Arc::new(Bus::from_snapshot_bytes(snapshot).unwrap());
+    let app = mentischat::build_router(bus);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .ok();
+    });
+    Daemon::new(addr)
+}
+
+/// A daemon put back to an older snapshot shows an older epoch than the group
+/// the client holds: the client notices, refuses the room, and resumes only
+/// when told to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rolled_back_epoch_is_detected_and_blocks_the_room() {
+    let h = harness().await;
+    let (mut alice, mut bob, _carol) = trio(&h).await;
+    alice.sync("den").await.unwrap();
+    let old = h.bus.snapshot_bytes();
+    alice.self_update("den").await.unwrap();
+    bob.sync("den").await.unwrap();
+    bob.self_update("den").await.unwrap();
+
+    let older = restored_daemon(&old).await;
+    let mut bob = Client::open(Identity::open(&h.clients, "bob").unwrap(), older).unwrap();
+    let err = bob.sync("den").await.unwrap_err();
+    assert!(
+        matches!(err, mentischat::client::ClientError::RolledBack { .. }),
+        "{err}"
+    );
+    // It stays blocked: no sync, no send, no add, until accepted.
+    assert!(matches!(
+        bob.send("den", "x").await.unwrap_err(),
+        mentischat::client::ClientError::RolledBack { .. }
+    ));
+    assert!(matches!(
+        bob.sync("den").await.unwrap_err(),
+        mentischat::client::ClientError::RolledBack { .. }
+    ));
+    // The flag survives a restart of the client.
+    let mut again = Client::open(Identity::open(&h.clients, "bob").unwrap(), older).unwrap();
+    assert!(again.sync("den").await.is_err());
+    again.accept_rollback("den").await.unwrap();
+    assert!(!matches!(
+        again.sync("den").await,
+        Err(mentischat::client::ClientError::RolledBack { .. })
+    ));
+}
+
+/// A rollback that keeps the epoch but loses operations the client got
+/// accepted is detected by the counter the daemon reports for the client.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rollback_that_loses_the_clients_own_operations_is_detected() {
+    let h = harness().await;
+    let (mut alice, mut bob, _carol) = trio(&h).await;
+    bob.sync("den").await.unwrap();
+    alice.sync("den").await.unwrap();
+    let old = h.bus.snapshot_bytes();
+    bob.send("den", "accepted, then rolled away").await.unwrap();
+    let older = restored_daemon(&old).await;
+    let mut bob = Client::open(Identity::open(&h.clients, "bob").unwrap(), older).unwrap();
+    let err = bob.sync("den").await.unwrap_err();
+    assert!(
+        matches!(&err, mentischat::client::ClientError::RolledBack { detail, .. } if detail.contains("counter")),
+        "{err}"
+    );
+}
+
+/// An honest daemon never trips the check, including across a restart that
+/// loses nothing and many commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_honest_restart_is_not_a_rollback() {
+    let h = harness().await;
+    let (mut alice, mut bob, _carol) = trio(&h).await;
+    for _ in 0..3 {
+        alice.self_update("den").await.unwrap();
+        bob.sync("den").await.unwrap();
+    }
+    bob.send("den", "hi").await.unwrap();
+    let same = restored_daemon(&h.bus.snapshot_bytes()).await;
+    let mut bob = Client::open(Identity::open(&h.clients, "bob").unwrap(), same).unwrap();
+    bob.sync("den").await.unwrap();
+    bob.send("den", "still fine").await.unwrap();
+}

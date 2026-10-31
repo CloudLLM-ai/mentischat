@@ -333,11 +333,30 @@ async fn join(client: &mut Client, daemon: Daemon, args: &Value) -> Value {
 /// Bring one secure room up to date: sync, recover if the client fell behind,
 /// prune departed members (owner), and refresh the key if the policy says so.
 /// A failure here must not hide the rest of the inbox, so it is only logged.
-async fn refresh_room(client: &mut Client, daemon: Daemon, policy: &UpdatePolicy, room: &str) {
+///
+/// Returns a warning for the harness when the daemon showed an older room than
+/// this client has already seen (see [`ClientError::RolledBack`]); the room is
+/// then not used until the user accepts it.
+async fn refresh_room(
+    client: &mut Client,
+    daemon: Daemon,
+    policy: &UpdatePolicy,
+    room: &str,
+) -> Option<String> {
     match client.sync(room).await {
         Ok(_) => {}
-        Err(ClientError::Behind { .. }) => return recover(client, daemon, room).await,
-        Err(e) => return tracing::warn!(room = %room, error = %e, "secure room sync failed"),
+        Err(ClientError::Behind { .. }) => {
+            recover(client, daemon, room).await;
+            return None;
+        }
+        Err(e @ ClientError::RolledBack { .. }) => {
+            tracing::warn!(room = %room, error = %e, "secure room rolled back");
+            return Some(e.to_string());
+        }
+        Err(e) => {
+            tracing::warn!(room = %room, error = %e, "secure room sync failed");
+            return None;
+        }
     }
     if let Err(e) = client.prune(room).await {
         tracing::warn!(room = %room, error = %e, "secure room prune failed");
@@ -345,6 +364,7 @@ async fn refresh_room(client: &mut Client, daemon: Daemon, policy: &UpdatePolicy
     if let Err(e) = client.maybe_self_update(room, policy).await {
         tracing::warn!(room = %room, error = %e, "self-update failed");
     }
+    None
 }
 
 /// A client that fell behind: join from a Welcome if the owner has left one,
@@ -421,8 +441,9 @@ async fn check_inbox(
         })
         .collect();
     let mut messages = answer_readd_requests(client, plain).await;
+    let mut warnings = Vec::new();
     for room in &secure {
-        refresh_room(client, daemon, policy, room).await;
+        warnings.extend(refresh_room(client, daemon, policy, room).await);
         match client.take_unread(room) {
             Ok(fresh) => messages.extend(fresh.iter().map(message_json)),
             Err(e) => tracing::warn!(room = %room, error = %e, "reading secure room failed"),
@@ -430,6 +451,9 @@ async fn check_inbox(
     }
     messages.sort_by_key(|m| m["id"].as_str().and_then(|s| s.parse::<u64>().ok()));
     page["messages"] = Value::Array(messages);
+    if !warnings.is_empty() {
+        page["warnings"] = json!(warnings);
+    }
     result = tool_result(&page, false);
     result
 }

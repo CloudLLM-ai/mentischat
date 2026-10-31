@@ -1,5 +1,12 @@
 UNRELEASED
 
+  - feat(security): clients detect a rolled-back secure room. Before each sync
+    the client compares the daemon's epoch and the counter the daemon accepted
+    from it with the highest it has seen (persisted), and a lower answer or an
+    older Welcome raises RolledBack, stops the room and shows a warning in
+    check_inbox until accept_rollback. New fuzz target signed_journal drives the
+    journal replay (verify_signed_record) with tamper invariants.
+
   - feat(security): signed rooms, key bindings, KeyPackages and pending Welcomes
     survive a restart under MENTISCHAT_PERSIST=1 and never come back unsigned.
     The snapshot holds the signed records (membership operations, the Commit

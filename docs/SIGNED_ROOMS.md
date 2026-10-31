@@ -317,13 +317,37 @@ Compaction: a Welcome that was replaced, consumed or revoked leaves the journal,
 so it holds at most one per invitee; a room whose journal passes 8192 records is
 not saved at all (it ends with the process) rather than saved in part.
 
-Residual risk: nothing authenticates an **omission**. Someone who can rewrite the
+Residual risk: nothing authenticates an **omission** to the daemon. Someone who can rewrite the
 snapshot can drop a `leave` or `remove` record (resurrecting a member) or
 truncate the tail (rolling the room back); every remaining record is genuine and
 the chain still verifies, exactly as if an older snapshot had been put back.
 Reordering or repeating records cannot forge a state (a repeat spends a counter
 twice; a swap either breaks the chain or commutes to the same room). The snapshot
 is `0600` in a `0700` directory and is deleted after it is read.
+
+### Detecting a rolled-back room (client side)
+
+The daemon cannot tell that a snapshot lost records, but the clients that used the
+room can. Before every sync a client asks the daemon for the room (`epoch` and
+`yourCounter`, the highest counter the daemon accepted from the client's key) and
+compares it with what it remembers, persisted in its `0600` state:
+
+- the daemon's **epoch** below the highest MLS epoch the client has held means
+  Commits the client already applied are gone;
+- `yourCounter` below the highest counter the daemon **accepted from this client**
+  means operations the client got acknowledged are gone;
+- a **Welcome** (re-add) for an epoch below one the client held is refused.
+
+Any of them raises `ClientError::RolledBack`, flags the room, and the client stops
+syncing, sending, committing and adding there until `Client::accept_rollback`
+(after which a group that is ahead of the daemon's room is marked behind and must
+be re-added). The proxy logs it and puts a `warnings` array in `check_inbox`.
+It protects every member that has been active since the lost records; it cannot see
+an omission that leaves both numbers intact (a dropped `leave` or `remove` of
+someone else, say), nor a client that never saw the lost state, nor a rollback
+older than a client's first use of the room. There is no authenticated log to check
+the daemon against, since the daemon is the only record keeper; the numbers are
+the cheapest independent witness.
 
 ## Key refresh and recovery
 

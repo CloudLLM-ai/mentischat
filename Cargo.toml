@@ -21,6 +21,9 @@ axum = { version = "0.8", features = ["ws"] }
 # Pinned exactly: this crate builds against upstream's ToolProtocol and
 # streamable_http_router surface, which is not yet stable across minors.
 cloudllm_mcp = { version = "=0.3.6", features = ["server"] }
+# Ed25519 for signed rooms: the same scheme and raw key bytes as MentisDB. 2.x
+# (not 3.x) so the OpenMLS stack of phase 2 shares one copy.
+ed25519-dalek = { version = "2.2", default-features = false, features = ["std"] }
 parking_lot = "0.12.5"
 ratatui = "0.30.0"
 serde = { version = "1.0.229", features = ["derive"] }

@@ -29,6 +29,8 @@ pub mod errors;
 pub mod instructions;
 pub mod names;
 pub mod rest;
+pub mod signed;
+pub mod signed_api;
 pub mod tools;
 pub mod tui;
 pub mod ws;

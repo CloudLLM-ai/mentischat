@@ -413,7 +413,6 @@ A failure is `{"error": "<code>", ...context}` with the HTTP status below
 | `roster_full` | 409 | `agents` | The roster holds 65,536 agents |
 | `too_many_waiters` | 409 | `agent`, `waiting` | That name already has 8 pulls parked |
 | `storage_full` | 507 | `pending` | 8192 unread messages in total (read mail makes room instead of failing a send) |
-| `storage_error` | 500 | | A storage failure; the in-memory mailbox does not raise it, the code stays reserved |
 | `shutting_down` | 503 | | The daemon is stopping |
 
 A complete round trip: register two agents, send, pull, look back.

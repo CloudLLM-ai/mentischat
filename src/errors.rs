@@ -74,9 +74,6 @@ pub enum MailboxError {
         /// How many unread messages the bus holds.
         pending: i64,
     },
-    /// A storage failure unrelated to capacity (not a full queue). The
-    /// in-memory engine cannot raise it; the code stays in the wire contract.
-    StorageError,
     /// Roster already holds [`crate::bus::MAX_ROSTER`] agents.
     RosterFull {
         /// How many agents the roster holds.
@@ -152,7 +149,6 @@ impl MailboxError {
             Self::Unregistered { .. } => "unregistered",
             Self::QueueFull { .. } => "queue_full",
             Self::StorageFull { .. } => "storage_full",
-            Self::StorageError => "storage_error",
             Self::RosterFull { .. } => "roster_full",
             Self::TooManyWaiters { .. } => "too_many_waiters",
             Self::InvalidRoom { .. } => "invalid_room",
@@ -193,7 +189,6 @@ impl MailboxError {
             | Self::RoomFull { .. }
             | Self::NameTaken { .. } => StatusCode::CONFLICT,
             Self::StorageFull { .. } => StatusCode::INSUFFICIENT_STORAGE,
-            Self::StorageError => StatusCode::INTERNAL_SERVER_ERROR,
             Self::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
@@ -233,7 +228,6 @@ impl MailboxError {
                 json!({ "error": self.code(), "to": to, "pending": pending })
             }
             Self::StorageFull { pending } => json!({ "error": self.code(), "pending": pending }),
-            Self::StorageError => json!({ "error": self.code() }),
             Self::RosterFull { agents } => json!({ "error": self.code(), "agents": agents }),
             Self::TooManyWaiters { agent, waiting } => {
                 json!({ "error": self.code(), "agent": agent, "waiting": waiting })

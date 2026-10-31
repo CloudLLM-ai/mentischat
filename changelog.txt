@@ -9,7 +9,7 @@ UNRELEASED
     Domain errors are
     isError: true content blocks carrying typed JSON codes; REST answers 200
     + JSON on success and the same codes with HTTP statuses (400/404/405/409/
-    500/503/507). Binding the port is the single-instance lock: a second
+    503/507). Binding the port is the single-instance lock: a second
     instance exits before it touches the data directory.
 
   - feat(security): loopback only, no auth. Non-loopback peers are refused at

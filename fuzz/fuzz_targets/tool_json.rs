@@ -44,7 +44,6 @@ const CODES: [&str; 24] = [
     "unregistered",
     "queue_full",
     "storage_full",
-    "storage_error",
     "roster_full",
     "too_many_waiters",
     "invalid_room",

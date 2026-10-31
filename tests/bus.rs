@@ -213,7 +213,7 @@ async fn immediate_delivery_beats_wait() {
     assert!(started.elapsed() < std::time::Duration::from_secs(1));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn parked_waiter_wakes_on_send() {
     let (_d, bus) = fresh_bus("wake");
     bus.register(&name("a")).await.unwrap();
@@ -249,7 +249,7 @@ async fn timeout_is_empty_success_and_mail_survives_it() {
     assert_eq!(page.messages.len(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn only_oldest_waiter_gets_the_batch() {
     let (_d, bus) = fresh_bus("two");
     bus.register(&name("a")).await.unwrap();
@@ -273,7 +273,7 @@ async fn only_oldest_waiter_gets_the_batch() {
     assert!(p2.messages.is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn ninth_waiter_fails_too_many_waiters() {
     let (_d, bus) = fresh_bus("waitercap");
     bus.register(&name("a")).await.unwrap();
@@ -305,7 +305,7 @@ async fn ninth_waiter_fails_too_many_waiters() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn deregister_rejects_parked_waiters_as_unregistered() {
     let (_d, bus) = fresh_bus("deregwait");
     bus.register(&name("b")).await.unwrap();
@@ -424,7 +424,7 @@ async fn concurrent_send_check_never_dups_or_drops() {
     assert_eq!(seen.len(), N, "all messages delivered");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn shutdown_rejects_waiters() {
     let (_d, bus) = fresh_bus("shutdown");
     bus.register(&name("b")).await.unwrap();
@@ -443,7 +443,7 @@ async fn shutdown_rejects_waiters() {
 // Canceled waiters must not consume wake signals
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn aborted_inbox_waiter_does_not_starve_the_next_one() {
     let (_d, bus) = fresh_bus("abortinbox");
     bus.register(&name("a")).await.unwrap();
@@ -455,14 +455,14 @@ async fn aborted_inbox_waiter_does_not_starve_the_next_one() {
     let first = tokio::spawn(async move { b.check_inbox(&name("b"), 30_000).await });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     first.abort();
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let _ = first.await; // the aborted task is gone before the send
 
     bus.send(&name("a"), &name("b"), "wake".into())
         .await
         .unwrap();
 
     // The next parked pull must be woken promptly, not after its full wait.
-    let started = std::time::Instant::now();
+    let started = tokio::time::Instant::now();
     let page = bus.check_inbox(&name("b"), 30_000).await.unwrap();
     assert_eq!(page.messages.len(), 1);
     assert!(
@@ -702,7 +702,7 @@ async fn list_agents_reports_queue_depth_without_delivering() {
     assert_eq!(page.messages.len(), 3, "listing did not consume anything");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn abandoned_blocking_pulls_do_not_fill_the_waiter_cap() {
     let (_d, bus) = fresh_bus("abandoned");
     bus.register(&name("a")).await.unwrap();
@@ -738,7 +738,7 @@ async fn abandoned_blocking_pulls_do_not_fill_the_waiter_cap() {
 
 // current_thread runtime: after `send` returns, the woken pull has not run
 // yet, so aborting it reproduces "woken, then the client went away".
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_cancelled_pull_hands_its_wake_to_the_next_waiter() {
     let (_d, bus) = fresh_bus("handoff");
     bus.register(&name("a")).await.unwrap();
@@ -756,7 +756,7 @@ async fn a_cancelled_pull_hands_its_wake_to_the_next_waiter() {
         .unwrap(); // wakes `first`, the oldest waiter
     first.abort();
 
-    let started = std::time::Instant::now();
+    let started = tokio::time::Instant::now();
     let page = tokio::time::timeout(std::time::Duration::from_secs(2), second)
         .await
         .expect("second waiter was woken, not left to its 10 s timeout")
@@ -766,14 +766,14 @@ async fn a_cancelled_pull_hands_its_wake_to_the_next_waiter() {
     assert!(started.elapsed() < std::time::Duration::from_secs(2));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_wake_with_nothing_left_keeps_waiting_until_the_deadline() {
     let (_d, bus) = fresh_bus("respark");
     bus.register(&name("a")).await.unwrap();
     bus.register(&name("b")).await.unwrap();
 
     let b = bus.clone();
-    let started = std::time::Instant::now();
+    let started = tokio::time::Instant::now();
     let parked = tokio::spawn(async move { b.check_inbox(&name("b"), 400).await });
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 

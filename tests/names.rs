@@ -82,7 +82,7 @@ async fn names_are_unique_without_regard_to_case() {
     assert_eq!(out.agent, "Vega");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_pull_parked_under_one_spelling_is_woken_by_mail_to_another() {
     let (_d, bus) = fresh_bus("case_wake");
     bus.register(&name("Vega")).await.unwrap();
@@ -91,7 +91,7 @@ async fn a_pull_parked_under_one_spelling_is_woken_by_mail_to_another() {
     let parked = tokio::spawn(async move { b.check_inbox(&name("vega"), 10_000).await });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let started = std::time::Instant::now();
+    let started = tokio::time::Instant::now();
     bus.send(&name("Orion"), &name("VEGA"), "wake".into())
         .await
         .unwrap();
@@ -355,7 +355,7 @@ async fn a_full_roster_refuses_a_reclaimed_held_name() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn too_many_waiters_names_the_roster_spelling() {
     let (_d, bus) = fresh_bus("waiters_case");
     bus.register(&name("Vega")).await.unwrap();

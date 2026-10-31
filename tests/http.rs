@@ -104,7 +104,7 @@ async fn inbox_get_sets_no_store() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn wait_ms_returns_when_mail_lands_mid_request() {
     let (_d, mut app) = app();
     register_two(&mut app).await;
@@ -131,7 +131,7 @@ async fn wait_ms_returns_when_mail_lands_mid_request() {
     assert_eq!(page["messages"][0]["id"], receipt["id"]);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn overlapping_waits_one_post_one_delivery() {
     let (_d, mut app) = app();
     register_two(&mut app).await;

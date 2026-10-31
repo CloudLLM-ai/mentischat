@@ -101,7 +101,7 @@ async fn a_snapshot_that_cannot_be_read_is_refused_and_kept() {
     assert!(Bus::new(&data).is_ok());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn close_fails_parked_pulls_with_shutting_down() {
     let dir = tempfile::tempdir().unwrap();
     let bus = std::sync::Arc::new(Bus::new(&dir.path().join("closing")).unwrap());

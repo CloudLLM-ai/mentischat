@@ -63,7 +63,7 @@ async fn idle_agents_drop_off_the_roster_with_their_unread_mail() {
     ));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_agent_with_a_parked_pull_is_never_dropped() {
     let (_d, bus) = bus_with("parked", idle_after(3600));
     bus.register(&name("a")).await.unwrap();

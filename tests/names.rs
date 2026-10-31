@@ -4,23 +4,12 @@
 mod common;
 
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use common::{bus_with, fresh_bus, name, reclaim};
+use common::{bus_with, bus_with_clock, fresh_bus, name, reclaim};
 use mentischat::bus::{rfc3339, Bus, Retention};
 use mentischat::errors::{MailboxError, TakenReason};
 use mentischat::names::{AgentName, SUGGESTED_NAMES, SUGGESTION_COUNT};
-
-fn holding(tag: &str, hold: Duration) -> (tempfile::TempDir, Arc<Bus>) {
-    bus_with(
-        tag,
-        Retention {
-            name_hold: hold,
-            ..Retention::default()
-        },
-    )
-}
 
 fn folded(names: &[String]) -> HashSet<String> {
     names.iter().map(|n| n.to_ascii_lowercase()).collect()
@@ -248,14 +237,20 @@ async fn a_stale_client_cannot_read_the_next_holders_mail_during_the_hold() {
 
 #[tokio::test]
 async fn a_hold_ends_after_the_name_hold() {
-    let (_d, bus) = holding("hold_ends", Duration::from_millis(150));
+    let (_d, bus, clock) = bus_with_clock(
+        "hold_ends",
+        Retention {
+            name_hold: Duration::from_millis(150),
+            ..Retention::default()
+        },
+    );
     bus.register(&name("Vega")).await.unwrap();
     bus.deregister(&name("Vega")).await.unwrap();
     assert!(matches!(
         bus.register(&name("Vega")).await,
         Err(MailboxError::NameTaken { .. })
     ));
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    clock.advance(Duration::from_millis(250));
     let out = bus.register(&name("vega")).await.unwrap();
     assert!(out.created);
     assert_eq!(out.agent, "vega", "a new holder picks its own spelling");

@@ -5,7 +5,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{fresh_bus, name, reclaim, stats};
+use common::{bus_with_clock, fresh_bus, name, reclaim, stats};
 use mentischat::bus::{Bus, HistoryPage, Retention};
 use mentischat::errors::MailboxError;
 
@@ -170,11 +170,11 @@ async fn history_needs_a_registered_name() {
 
 #[tokio::test]
 async fn history_counts_as_activity_and_changes_nothing_else() {
-    let (_d, bus) = fresh_bus("activity");
+    let (_d, bus, clock) = bus_with_clock("activity", Retention::default());
     register(&bus, &["a", "b"]).await;
     send(&bus, "b", "a", "unread").await;
     let before = bus.list_agents().await.unwrap().agents[0].last_seen.clone();
-    tokio::time::sleep(Duration::from_millis(5)).await;
+    clock.advance(Duration::from_millis(5));
 
     history(&bus, "a").await;
     let after = bus.list_agents().await.unwrap().agents[0].last_seen.clone();
@@ -184,12 +184,11 @@ async fn history_counts_as_activity_and_changes_nothing_else() {
 
 #[tokio::test]
 async fn a_reclaimed_name_keeps_its_sent_history_and_a_new_holder_sees_none() {
-    let dir = tempfile::tempdir().unwrap();
     let retention = Retention {
         name_hold: Duration::from_millis(150),
         ..Retention::default()
     };
-    let bus = Bus::with_retention(&dir.path().join("scoped"), retention).unwrap();
+    let (_dir, bus, clock) = bus_with_clock("scoped", retention);
     register(&bus, &["Vega", "Orion"]).await;
     send(&bus, "Vega", "Orion", "from the first Vega").await;
     bus.check_inbox(&name("Orion"), 0).await.unwrap();
@@ -203,7 +202,7 @@ async fn a_reclaimed_name_keeps_its_sent_history_and_a_new_holder_sees_none() {
     );
 
     bus.deregister(&name("Vega")).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    clock.advance(Duration::from_millis(250));
     bus.register(&name("Vega")).await.unwrap();
     assert!(
         history(&bus, "Vega").await.messages.is_empty(),

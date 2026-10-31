@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{bus_with, idle_after, later, name, reclaim, stats};
+use common::{bus_with, bus_with_clock, idle_after, later, name, reclaim, stats};
 use mentischat::bus::{Bus, Retention};
 use mentischat::errors::MailboxError;
 
@@ -320,12 +320,12 @@ fn retention_defaults_and_sweep_interval() {
 
 #[tokio::test]
 async fn sending_counts_as_activity_for_the_agent_ttl() {
-    let (_d, bus) = bus_with("sender_alive", idle_after(3600));
+    let (_d, bus, clock) = bus_with_clock("sender_alive", idle_after(3600));
     bus.register(&name("talker")).await.unwrap();
     bus.register(&name("listener")).await.unwrap();
     let before = bus.list_agents().await.unwrap().agents[1].last_seen.clone();
-    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    let sent_at = std::time::SystemTime::now();
+    clock.advance(std::time::Duration::from_millis(5));
+    let sent_at = std::time::UNIX_EPOCH + std::time::Duration::from_millis(clock.now_ms());
     bus.send(&name("talker"), &name("listener"), "hi".into())
         .await
         .unwrap();

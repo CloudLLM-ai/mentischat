@@ -7,8 +7,8 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{fresh_bus, name, reclaim, stats};
-use mentischat::bus::{Bus, Registration};
+use common::{bus_with_clock, fresh_bus, name, reclaim, stats};
+use mentischat::bus::{Bus, Registration, Retention};
 use mentischat::errors::MailboxError;
 use mentischat::names::AgentName;
 
@@ -661,11 +661,11 @@ async fn a_bad_description_registers_nothing() {
 
 #[tokio::test]
 async fn a_send_that_fails_stores_nothing() {
-    let (_d, bus) = fresh_bus("atomic_send");
+    let (_d, bus, clock) = bus_with_clock("atomic_send", Retention::default());
     bus.register(&name("a")).await.unwrap();
     bus.register(&name("b")).await.unwrap();
     let before = bus.list_agents().await.unwrap().agents[0].last_seen.clone();
-    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    clock.advance(std::time::Duration::from_millis(5));
 
     assert!(matches!(
         bus.send(&name("a"), &name("nobody"), "lost?".into()).await,

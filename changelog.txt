@@ -1,5 +1,15 @@
 UNRELEASED
 
+  - feat(security): post-compromise recovery and re-add for secure rooms. The
+    client proxy refreshes its key in each room with an MLS self-update every
+    --update-messages sent messages (default 100) or --update-minutes (default
+    30) and once after joining, so a stolen key stops working. A client that
+    fell behind the room's 1024-message retention reports Behind and is
+    re-added automatically: it direct-messages the owner, whose proxy consumes
+    the request and re-adds it, and its next check_inbox rejoins from the
+    Welcome (the daemon now allows a Welcome for a member, and joining again
+    consumes a counter).
+
   - feat(security): last-resort KeyPackages and a KeyPackage rate limit. An agent
     publishes one last-resort package (RFC 9420 section 16.8) that is handed
     out when its ordinary ones are gone and never used up, so it can always be

@@ -19,7 +19,7 @@ fuzz_target!(|data: &[u8]| {
     };
     let args: Vec<String> = text.split(' ').map(str::to_string).collect();
     match parse(&args) {
-        Ok(Command::Run { agent, addr }) => {
+        Ok(Command::Run { agent, addr, .. }) => {
             assert!(AgentName::parse(&agent).is_ok());
             assert!(addr.ip().is_loopback());
         }

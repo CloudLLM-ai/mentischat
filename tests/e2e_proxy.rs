@@ -20,12 +20,17 @@ struct Harness {
 }
 
 impl Harness {
-    fn spawn(client: Client, daemon: Daemon) -> Self {
+    fn spawn_with(
+        client: Client,
+        daemon: Daemon,
+        policy: mentischat::client::UpdatePolicy,
+    ) -> Self {
         let (to_proxy, proxy_in) = tokio::io::duplex(1 << 20);
         let (proxy_out, from_proxy) = tokio::io::duplex(1 << 20);
         tokio::spawn(proxy::serve(
             client,
             daemon,
+            policy,
             BufReader::new(proxy_in),
             proxy_out,
         ));
@@ -72,8 +77,16 @@ struct World {
 }
 
 async fn world() -> World {
+    world_with_capacity(mentischat::bus::DEFAULT_ROOM_CAPACITY).await
+}
+
+async fn world_with_capacity(capacity: usize) -> World {
     let dir = tempfile::tempdir().unwrap();
-    let bus = Arc::new(Bus::new(&dir.path().join("daemon")).unwrap());
+    let bus = Arc::new(
+        Bus::new(&dir.path().join("daemon"))
+            .unwrap()
+            .with_room_capacity(capacity),
+    );
     let app = mentischat::build_router(bus);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -94,8 +107,12 @@ async fn world() -> World {
 
 impl World {
     fn harness(&self, agent: &str) -> Harness {
+        self.harness_with(agent, mentischat::client::UpdatePolicy::default())
+    }
+
+    fn harness_with(&self, agent: &str, policy: mentischat::client::UpdatePolicy) -> Harness {
         let id = Identity::open(&self.clients, agent).unwrap();
-        Harness::spawn(Client::open(id, self.daemon).unwrap(), self.daemon)
+        Harness::spawn_with(Client::open(id, self.daemon).unwrap(), self.daemon, policy)
     }
 }
 
@@ -382,9 +399,29 @@ fn the_command_line_parses_and_describes_keys() {
         ])),
         Ok(Command::Run {
             agent: "Vega".into(),
-            addr: "127.0.0.1:1234".parse().unwrap()
+            addr: "127.0.0.1:1234".parse().unwrap(),
+            update: mentischat::client::UpdatePolicy::default(),
         })
     );
+    let tuned = parse(&args(&[
+        "run",
+        "--agent",
+        "a",
+        "--update-messages",
+        "7",
+        "--update-minutes",
+        "2",
+    ]));
+    let Ok(Command::Run { update, .. }) = tuned else {
+        panic!("{tuned:?}");
+    };
+    assert_eq!(update.messages, 7);
+    assert_eq!(update.interval, std::time::Duration::from_secs(120));
+    for bad in [["--update-messages", "x"], ["--update-minutes", "-1"]] {
+        let mut a = args(&["run", "--agent", "a"]);
+        a.extend(bad.map(String::from));
+        assert!(parse(&a).is_err(), "{a:?}");
+    }
     assert_eq!(
         parse(&args(&["key", "init", "--agent", "Vega"])),
         Ok(Command::KeyInit {
@@ -438,4 +475,125 @@ fn the_command_line_parses_and_describes_keys() {
 
 fn id_file_path(dir: &std::path::Path) -> std::path::PathBuf {
     dir.join("identity.key")
+}
+
+/// A client that falls behind is brought back by its proxy alone: it asks the
+/// owner by direct message, the owner's proxy re-adds it without the harness
+/// seeing the request, and its next check_inbox rejoins and reads on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_proxy_that_fell_behind_asks_the_owner_and_rejoins_by_itself() {
+    use mentischat::client::UpdatePolicy;
+    let w = world_with_capacity(6).await;
+    // The owner updates its key after every message, which floods the room
+    // with Commits past its small retention.
+    let eager = UpdatePolicy {
+        messages: 1,
+        interval: std::time::Duration::ZERO,
+    };
+    let (mut alice, mut bob) = (w.harness_with("alice", eager), w.harness("bob"));
+    alice.tool("register", json!({ "agent": "alice" })).await;
+    bob.tool("register", json!({ "agent": "bob" })).await;
+    alice
+        .tool(
+            "create_room",
+            json!({ "agent": "alice", "room": "den", "secure": true }),
+        )
+        .await;
+    alice
+        .tool(
+            "invite",
+            json!({ "agent": "alice", "room": "den", "invitee": "bob" }),
+        )
+        .await;
+    bob.tool("join_room", json!({ "agent": "bob", "room": "den" }))
+        .await;
+    for i in 0..9 {
+        let (err, body) = alice
+            .tool(
+                "send_message",
+                json!({ "from": "alice", "room": "den", "body": format!("note {i}") }),
+            )
+            .await;
+        assert!(!err, "{body}");
+    }
+    // Bob never looked while the room's retention rolled past its Commits. His
+    // first look cannot read them; it asks alice for a re-add.
+    let (_, page) = bob.tool("check_inbox", json!({ "agent": "bob" })).await;
+    assert!(page["messages"].as_array().unwrap().is_empty(), "{page}");
+    // Alice's next look consumes the request: the harness sees no such message.
+    let (_, page) = alice.tool("check_inbox", json!({ "agent": "alice" })).await;
+    assert!(page["messages"].as_array().unwrap().is_empty(), "{page}");
+    // Bob's next look joins from the Welcome; later messages are readable.
+    bob.tool("check_inbox", json!({ "agent": "bob" })).await;
+    alice
+        .tool(
+            "send_message",
+            json!({ "from": "alice", "room": "den", "body": "after the re-add" }),
+        )
+        .await;
+    let (_, page) = bob.tool("check_inbox", json!({ "agent": "bob" })).await;
+    let bodies: Vec<&str> = page["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["body"].as_str().unwrap())
+        .collect();
+    assert_eq!(bodies, ["after the re-add"], "{page}");
+}
+
+/// The proxy updates its key on its own policy: after enough sends the epoch
+/// has moved, and the other side still reads everything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_proxy_refreshes_its_key_by_policy_and_peers_keep_reading() {
+    use mentischat::client::UpdatePolicy;
+    let w = world().await;
+    let every_two = UpdatePolicy {
+        messages: 2,
+        interval: std::time::Duration::ZERO,
+    };
+    let (mut alice, mut bob) = (w.harness_with("alice", every_two), w.harness("bob"));
+    alice.tool("register", json!({ "agent": "alice" })).await;
+    bob.tool("register", json!({ "agent": "bob" })).await;
+    alice
+        .tool(
+            "create_room",
+            json!({ "agent": "alice", "room": "den", "secure": true }),
+        )
+        .await;
+    alice
+        .tool(
+            "invite",
+            json!({ "agent": "alice", "room": "den", "invitee": "bob" }),
+        )
+        .await;
+    bob.tool("join_room", json!({ "agent": "bob", "room": "den" }))
+        .await;
+    for i in 0..5 {
+        alice
+            .tool(
+                "send_message",
+                json!({ "from": "alice", "room": "den", "body": format!("m{i}") }),
+            )
+            .await;
+    }
+    let (_, page) = bob.tool("check_inbox", json!({ "agent": "bob" })).await;
+    let bodies: Vec<&str> = page["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["body"].as_str().unwrap())
+        .collect();
+    assert_eq!(bodies, ["m0", "m1", "m2", "m3", "m4"], "{page}");
+    // Joining added 1 Commit and bob's first look 1 of his own; alice's policy
+    // fired twice (after m1 and m3): four Commits, so the daemon's epoch is 4.
+    let (_, room) = bob
+        .tool("history", json!({ "agent": "bob", "room": "den" }))
+        .await;
+    assert!(room["messages"].as_array().unwrap().len() >= 5);
+    let info = w
+        .daemon
+        .call("GET", "/signed/rooms/den?agent=bob", None)
+        .await
+        .unwrap();
+    assert_eq!(info["epoch"], 4, "{info}");
 }

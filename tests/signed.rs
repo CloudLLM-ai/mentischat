@@ -705,13 +705,19 @@ async fn joining_needs_an_invitation() {
     assert_eq!(code(err), "room_not_found");
 }
 
-/// Joining twice is harmless and does not consume a counter.
+/// Joining again with a fresh counter is harmless; replaying the first join
+/// is a stale counter.
 #[tokio::test]
 async fn joining_again_changes_nothing() {
     let (_d, bus) = fresh_bus("joinagain");
     let (_alice, bob) = alice_and_bob(&bus).await;
-    bob.do_op(&bus, "ops", 1, SignedOp::Join).await.unwrap();
-    bob.say(&bus, "ops", 2, "still fine").await.unwrap();
+    let first = bob.request("ops", 1, SignedOp::Join);
+    assert_eq!(
+        code(bus.signed_op(first).await.unwrap_err()),
+        "stale_counter"
+    );
+    bob.do_op(&bus, "ops", 2, SignedOp::Join).await.unwrap();
+    bob.say(&bus, "ops", 3, "still fine").await.unwrap();
 }
 
 /// A non-member's signed send is refused even with a valid signature.

@@ -22,6 +22,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use openmls::prelude::tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
 use openmls::prelude::*;
+use openmls::treesync::LeafNodeParameters;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use openmls_traits::types::SignatureScheme;
@@ -47,6 +48,52 @@ const COMMIT_RETRIES: usize = 4;
 /// KeyPackages the client keeps on offer.
 pub const KEY_PACKAGE_STOCK: usize = 8;
 
+/// When the client refreshes its own key in a room with an MLS self-update
+/// (an empty Commit that replaces the member's leaf key and ratchets the group
+/// secret), which is what restores confidentiality after a compromise of its
+/// state: whoever stole an old key can read nothing sent after the next update.
+///
+/// A room is due when the client has sent `messages` messages, or `interval`
+/// has passed, since its last update, and right after it joins (a joining
+/// member may have been added with a reused last-resort KeyPackage). A zero
+/// value disables that trigger.
+///
+/// # Examples
+///
+/// ```
+/// use std::time::Duration;
+/// use mentischat::client::UpdatePolicy;
+///
+/// let policy = UpdatePolicy::default();
+/// assert_eq!(policy.messages, 100);
+/// assert_eq!(policy.interval, Duration::from_secs(30 * 60));
+/// assert!(!UpdatePolicy { messages: 0, interval: Duration::ZERO }.enabled());
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpdatePolicy {
+    /// Update after this many sent messages; 0 for never by count.
+    pub messages: u64,
+    /// Update after this long; zero for never by time.
+    pub interval: std::time::Duration,
+}
+
+impl Default for UpdatePolicy {
+    /// Every 100 messages or 30 minutes.
+    fn default() -> Self {
+        Self {
+            messages: 100,
+            interval: std::time::Duration::from_secs(30 * 60),
+        }
+    }
+}
+
+impl UpdatePolicy {
+    /// Whether either trigger is on.
+    pub fn enabled(&self) -> bool {
+        self.messages > 0 || !self.interval.is_zero()
+    }
+}
+
 /// A message the client decrypted, as the harness sees it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -65,7 +112,18 @@ pub struct Received {
 
 /// What the client keeps about one room besides the MLS group.
 #[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 struct RoomLog {
+    /// A Commit this client needs fell out of retention: it must be re-added.
+    behind: bool,
+    /// A fresh self-update is due as soon as possible (just joined).
+    update_due: bool,
+    /// Messages this client has sent since its last self-update.
+    sent_since_update: u64,
+    /// Unix milliseconds of the last self-update, or of joining; 0 = unset.
+    last_update_ms: u64,
+    /// Unix milliseconds a re-add was last requested, to throttle requests.
+    readd_requested_ms: u64,
     /// Highest daemon message id already processed.
     last_id: u64,
     /// This client created the room (and so may remove members).
@@ -178,6 +236,45 @@ impl Client {
     /// The agent's public key.
     pub fn public_key(&self) -> PublicKey {
         self.identity.public()
+    }
+
+    /// Whether this client created `room` (and so may remove members and is
+    /// the one asked to re-add members that fell behind).
+    pub fn owns(&self, room: &str) -> bool {
+        self.rooms.get(&folded(room)).is_some_and(|r| r.owner)
+    }
+
+    /// True at most once per `every` for `room`: whether a re-add request
+    /// should be sent now. Records the request time.
+    pub fn readd_due(&mut self, room: &str, every: std::time::Duration) -> bool {
+        let now = micros_now() / 1000;
+        let Some(log) = self.rooms.get_mut(&folded(room)) else {
+            return false;
+        };
+        if now.saturating_sub(log.readd_requested_ms) < every.as_millis() as u64 {
+            return false;
+        }
+        log.readd_requested_ms = now;
+        self.persist().is_ok()
+    }
+
+    /// The name of the member whose key is the room's owner key, as the daemon
+    /// lists it; `None` when the owner has left.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Daemon`].
+    pub async fn owner_name(&self, room: &str) -> Result<Option<String>, ClientError> {
+        let info = self.room_info(room).await?;
+        let Some(owner) = info["owner"].as_str() else {
+            return Ok(None);
+        };
+        Ok(info["members"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|m| m["publicKey"] == owner)
+            .and_then(|m| m["agent"].as_str().map(str::to_string)))
     }
 
     /// Whether `room` is one of this client's secure rooms.
@@ -416,7 +513,18 @@ impl Client {
             invitee_key: target_key,
         };
         self.post_op(room, invite).await?;
-        let package = self.take_key_package(target, &target_key).await?;
+        self.commit_add(room, target, &target_key).await
+    }
+
+    /// Take a KeyPackage for `target`, Commit its addition and leave it the
+    /// Welcome. The daemon must already list `target` as invited or as a member.
+    async fn commit_add(
+        &mut self,
+        room: &str,
+        target: &str,
+        target_key: &PublicKey,
+    ) -> Result<(), ClientError> {
+        let package = self.take_key_package(target, target_key).await?;
         let mut welcome = None;
         for _ in 0..COMMIT_RETRIES {
             self.sync(room).await?;
@@ -440,6 +548,97 @@ impl Client {
         };
         self.post_op(room, op).await?;
         self.persist()
+    }
+
+    /// Add a member that is already in the room back into its MLS group: the
+    /// recovery for a client that fell behind (see [`ClientError::Behind`]).
+    /// Commits the removal of the member's old leaf if it has one, then adds it
+    /// again from a fresh KeyPackage and leaves it a Welcome, which it picks up
+    /// with [`join_room`](Self::join_room). Any member may do it; the proxy has
+    /// the owner do it on request.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Usage`] when `target` is not a member of the daemon's room;
+    /// otherwise the errors of [`add_member`](Self::add_member).
+    pub async fn readd_member(&mut self, room: &str, target: &str) -> Result<(), ClientError> {
+        self.live_group(room)?;
+        let info = self.room_info(room).await?;
+        let listed = info["members"].as_array().into_iter().flatten().any(|m| {
+            m["agent"]
+                .as_str()
+                .is_some_and(|n| n.eq_ignore_ascii_case(target))
+        });
+        if !listed {
+            return Err(ClientError::Usage(format!(
+                "{target} is not a member of {room}"
+            )));
+        }
+        let target_key = self.registered_key(target).await?;
+        self.commit_removal(room, target).await?;
+        self.commit_add(room, target, &target_key).await
+    }
+
+    /// Refresh this client's own key in the group with an MLS self-update, an
+    /// empty Commit: after it, a key stolen before cannot decrypt anything sent
+    /// later (post-compromise security).
+    ///
+    /// # Errors
+    ///
+    /// The MLS and daemon errors of [`add_member`](Self::add_member).
+    pub async fn self_update(&mut self, room: &str) -> Result<(), ClientError> {
+        for _ in 0..COMMIT_RETRIES {
+            self.sync(room).await?;
+            let mut group = self.live_group(room)?;
+            let bundle = group
+                .self_update(&self.provider, &self.signer, LeafNodeParameters::default())
+                .map_err(mls("self update"))?;
+            let (commit, _, _) = bundle.into_contents();
+            if self.send_commit(room, &mut group, commit).await? {
+                if let Some(log) = self.rooms.get_mut(&folded(room)) {
+                    log.sent_since_update = 0;
+                    log.update_due = false;
+                    log.last_update_ms = micros_now() / 1000;
+                }
+                return self.persist();
+            }
+        }
+        Err(ClientError::Daemon {
+            status: 409,
+            code: "stale_epoch".into(),
+            body: json!({ "error": "stale_epoch" }),
+        })
+    }
+
+    /// Run [`self_update`](Self::self_update) if `policy` says the room is due.
+    /// Returns whether it did.
+    ///
+    /// # Errors
+    ///
+    /// As [`self_update`](Self::self_update); nothing when not due.
+    pub async fn maybe_self_update(
+        &mut self,
+        room: &str,
+        policy: &UpdatePolicy,
+    ) -> Result<bool, ClientError> {
+        let now_ms = micros_now() / 1000;
+        let Some(log) = self.rooms.get_mut(&folded(room)) else {
+            return Ok(false);
+        };
+        if log.ended || log.behind || !policy.enabled() {
+            return Ok(false);
+        }
+        if log.last_update_ms == 0 {
+            log.last_update_ms = now_ms;
+        }
+        let by_count = policy.messages > 0 && log.sent_since_update >= policy.messages;
+        let by_time = !policy.interval.is_zero()
+            && now_ms.saturating_sub(log.last_update_ms) >= policy.interval.as_millis() as u64;
+        if !(log.update_due || by_count || by_time) {
+            return Ok(false);
+        }
+        self.self_update(room).await?;
+        Ok(true)
     }
 
     /// Send `commit` for `group` as a signed Commit message. On success the
@@ -546,6 +745,19 @@ impl Client {
             MlsMessageBodyIn::Welcome(welcome) => welcome,
             _ => return Err(ClientError::Mls("not a welcome".into())),
         };
+        // Rejoining a room this client already has a group for (it fell behind
+        // or was removed) replaces that group with the one in the Welcome.
+        if let Some(log) = self.rooms.get(&folded(room)) {
+            if !(log.behind || log.ended) {
+                return Err(ClientError::Usage(format!(
+                    "already in secure room {room}; nothing to rejoin"
+                )));
+            }
+            if let Ok(mut old) = self.group(room) {
+                old.delete(self.provider.storage())
+                    .map_err(mls("drop old group"))?;
+            }
+        }
         let config = MlsGroupJoinConfig::builder()
             .use_ratchet_tree_extension(true)
             .max_past_epochs(PAST_EPOCHS)
@@ -554,7 +766,10 @@ impl Client {
             .map_err(mls("stage welcome"))?
             .into_group(&self.provider)
             .map_err(mls("join group"))?;
-        self.rooms.insert(folded(room), RoomLog::default());
+        let log = self.rooms.entry(folded(room)).or_default();
+        log.ended = false;
+        log.behind = false;
+        log.update_due = true;
         self.persist()?;
         self.post_op(room, SignedOp::Join).await?;
         Ok(())
@@ -696,6 +911,9 @@ impl Client {
             created_at: receipt["createdAt"].as_str().unwrap_or("").to_string(),
         };
         self.log(room, sent.clone(), true);
+        if let Some(log) = self.rooms.get_mut(&folded(room)) {
+            log.sent_since_update += 1;
+        }
         self.persist()?;
         Ok(sent)
     }
@@ -757,11 +975,26 @@ impl Client {
         if log.ended {
             return Ok(0);
         }
+        if log.behind {
+            return Err(ClientError::Behind {
+                room: room.to_string(),
+            });
+        }
         let mut pending = self.fetch_since(room, log.last_id).await?;
         pending.sort_by_key(|m| m.id);
         let mut decrypted = 0;
         for message in pending {
-            decrypted += usize::from(self.apply(room, &message).await?);
+            match self.apply(room, &message).await {
+                Ok(read) => decrypted += usize::from(read),
+                Err(e @ ClientError::Behind { .. }) => {
+                    if let Some(log) = self.rooms.get_mut(&folded(room)) {
+                        log.behind = true;
+                    }
+                    self.persist()?;
+                    return Err(e);
+                }
+                Err(e) => return Err(e),
+            }
             if let Some(log) = self.rooms.get_mut(&folded(room)) {
                 log.last_id = message.id;
             }
@@ -850,9 +1083,9 @@ impl Client {
             return Ok(false);
         }
         if epoch > current {
-            return Err(ClientError::Mls(format!(
-                "missing commit: group is at epoch {current}, next commit is for {epoch}"
-            )));
+            return Err(ClientError::Behind {
+                room: room.to_string(),
+            });
         }
         let processed = group
             .process_message(&self.provider, protocol)

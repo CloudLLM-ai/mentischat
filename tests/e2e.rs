@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use mentischat::bus::Bus;
-use mentischat::client::{Client, Daemon, Identity};
+use mentischat::client::{Client, Daemon, Identity, UpdatePolicy};
 use mentischat::names::{AgentName, RoomName};
 
 /// A daemon on an ephemeral loopback port; the bus is kept for inspection.
@@ -20,8 +20,17 @@ struct Harness {
 }
 
 async fn harness() -> Harness {
+    harness_with_capacity(mentischat::bus::DEFAULT_ROOM_CAPACITY).await
+}
+
+/// A harness whose rooms keep only their last `capacity` messages.
+async fn harness_with_capacity(capacity: usize) -> Harness {
     let dir = tempfile::tempdir().unwrap();
-    let bus = Arc::new(Bus::new(&dir.path().join("daemon")).unwrap());
+    let bus = Arc::new(
+        Bus::new(&dir.path().join("daemon"))
+            .unwrap()
+            .with_room_capacity(capacity),
+    );
     let app = mentischat::build_router(bus.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -459,4 +468,169 @@ async fn operations_on_an_unknown_secure_room_are_usage_errors() {
     assert!(alice.history("nowhere").is_empty());
     assert!(alice.take_unread("nowhere").unwrap().is_empty());
     assert!(!alice.is_secure("nowhere"));
+}
+
+/// Copy `from`'s client directory for `name` to `to`: what a thief of the files
+/// holds.
+fn clone_client_dir(from: &Path, to: &Path, name: &str) {
+    let (src, dst) = (from.join(name), to.join(name));
+    std::fs::create_dir_all(&dst).unwrap();
+    for file in ["identity.key", "state.json"] {
+        std::fs::copy(src.join(file), dst.join(file)).unwrap();
+    }
+}
+
+/// Post-compromise security: someone who copied a member's files can read what
+/// that member could read until the member's next self-update, and nothing sent
+/// after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_self_update_locks_out_someone_holding_stolen_state() {
+    let h = harness().await;
+    let (mut alice, mut bob, mut carol) = trio(&h).await;
+    let stolen_dir = h._dir.path().join("stolen");
+    clone_client_dir(&h.clients, &stolen_dir, "carol");
+    let mut thief = open_at(&stolen_dir, "carol", h.daemon);
+
+    // Control: before the update the thief reads what carol could.
+    alice.send("den", "before the update").await.unwrap();
+    let wire = h.stored_bodies("den", "alice").await;
+    let (from, body) = wire.last().unwrap();
+    assert_eq!(
+        thief.try_decrypt("den", from, body).unwrap().as_deref(),
+        Some("before the update")
+    );
+
+    carol.self_update("den").await.unwrap();
+    alice.sync("den").await.unwrap();
+    bob.sync("den").await.unwrap();
+    alice
+        .send("den", "after the update: rotate everything")
+        .await
+        .unwrap();
+    assert_eq!(
+        inbox(&mut carol, "den").await,
+        [
+            "alice: before the update",
+            "alice: after the update: rotate everything"
+        ]
+    );
+    assert!(inbox(&mut bob, "den")
+        .await
+        .contains(&"alice: after the update: rotate everything".to_string()));
+
+    let wire = h.stored_bodies("den", "alice").await;
+    let (from, body) = wire.last().unwrap();
+    assert_eq!(thief.try_decrypt("den", from, body).unwrap(), None);
+    // The group moved on without the thief: epochs differ.
+    assert!(carol.group_members("den").unwrap().0 > thief.group_members("den").unwrap().0);
+}
+
+/// The policy fires by message count, by time, and right after joining, and a
+/// disabled policy never does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_update_policy_fires_by_count_by_time_and_on_joining() {
+    let h = harness().await;
+    let mut alice = h.client("alice").await;
+    let mut bob = h.client("bob").await;
+    alice.create_room("den", "").await.unwrap();
+    alice.add_member("den", "bob").await.unwrap();
+    bob.join_room("den").await.unwrap();
+    let epoch = |c: &Client| c.group_members("den").unwrap().0;
+    let by_count = UpdatePolicy {
+        messages: 3,
+        interval: std::time::Duration::ZERO,
+    };
+    let never = UpdatePolicy {
+        messages: 0,
+        interval: std::time::Duration::ZERO,
+    };
+
+    // A fresh joiner is due at once, once.
+    assert!(!bob.maybe_self_update("den", &never).await.unwrap());
+    assert!(bob.maybe_self_update("den", &by_count).await.unwrap());
+    assert!(!bob.maybe_self_update("den", &by_count).await.unwrap());
+    alice.sync("den").await.unwrap();
+
+    // The creator is not due until it has sent three.
+    let before = epoch(&alice);
+    for i in 0..2 {
+        alice.send("den", &format!("m{i}")).await.unwrap();
+        assert!(!alice.maybe_self_update("den", &by_count).await.unwrap());
+    }
+    alice.send("den", "m2").await.unwrap();
+    assert!(!alice.maybe_self_update("den", &never).await.unwrap());
+    assert!(alice.maybe_self_update("den", &by_count).await.unwrap());
+    assert_eq!(epoch(&alice), before + 1);
+    assert!(
+        !alice.maybe_self_update("den", &by_count).await.unwrap(),
+        "count reset"
+    );
+
+    // By time.
+    let by_time = UpdatePolicy {
+        messages: 0,
+        interval: std::time::Duration::from_millis(500),
+    };
+    assert!(!alice.maybe_self_update("den", &by_time).await.unwrap());
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    assert!(alice.maybe_self_update("den", &by_time).await.unwrap());
+    // Bob follows every update and still reads.
+    alice.send("den", "still readable").await.unwrap();
+    assert!(inbox(&mut bob, "den")
+        .await
+        .contains(&"alice: still readable".to_string()));
+    assert!(!alice.maybe_self_update("nowhere", &by_count).await.unwrap());
+}
+
+/// A client that missed Commits past the daemon's retention reports `Behind`
+/// (and keeps reporting it), an up-to-date member re-adds it, and it reads
+/// again, keeping the plaintext it already had.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_that_fell_behind_is_re_added_and_reads_again() {
+    let h = harness_with_capacity(6).await;
+    let (mut alice, _bob, mut carol) = trio(&h).await;
+    alice.send("den", "carol reads this").await.unwrap();
+    assert_eq!(inbox(&mut carol, "den").await, ["alice: carol reads this"]);
+
+    for _ in 0..8 {
+        alice.self_update("den").await.unwrap();
+    }
+    let err = carol.sync("den").await.unwrap_err();
+    assert!(
+        matches!(err, mentischat::client::ClientError::Behind { .. }),
+        "{err}"
+    );
+    let again = carol.sync("den").await.unwrap_err();
+    assert!(
+        matches!(again, mentischat::client::ClientError::Behind { .. }),
+        "{again}"
+    );
+    assert_eq!(carol.history("den").len(), 1, "what it read is kept");
+
+    alice.readd_member("den", "carol").await.unwrap();
+    carol.join_room("den").await.unwrap();
+    alice.send("den", "welcome back").await.unwrap();
+    assert_eq!(inbox(&mut carol, "den").await, ["alice: welcome back"]);
+    carol.send("den", "thanks").await.unwrap();
+    assert!(inbox(&mut alice, "den")
+        .await
+        .contains(&"carol: thanks".to_string()));
+    let (_, mut names) = alice.group_members("den").unwrap();
+    names.sort();
+    assert_eq!(
+        names,
+        ["alice", "bob", "carol"],
+        "one leaf for carol, not two"
+    );
+    assert_eq!(carol.history("den").len(), 3);
+}
+
+/// Re-adding someone who is not in the room is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn re_adding_a_stranger_is_refused() {
+    let h = harness().await;
+    let (mut alice, _bob, _carol) = trio(&h).await;
+    let _eve = h.client("eve").await;
+    let err = alice.readd_member("den", "eve").await.unwrap_err();
+    assert!(err.to_string().contains("not a member"), "{err}");
 }

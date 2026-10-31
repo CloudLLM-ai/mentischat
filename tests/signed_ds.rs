@@ -246,15 +246,20 @@ async fn a_welcome_reaches_only_the_invitee_and_goes_away_on_join() {
             .unwrap(),
         Some(vec![9, 9, 9])
     );
-    // Alice cannot read it back (she is a member, not an invitee) and neither can a stranger.
+    // Alice (a member, not the target) finds nothing waiting for her, and a
+    // stranger learns the room exists no more than for any private room.
     register(&bus, &["eve"]).await;
-    for who in ["alice", "eve"] {
-        let err = bus
-            .signed_welcome(&name(who), &room("den"))
+    assert_eq!(
+        bus.signed_welcome(&name("alice"), &room("den"))
             .await
-            .unwrap_err();
-        assert_eq!(code(err), "room_not_found", "{who}");
-    }
+            .unwrap(),
+        None
+    );
+    let err = bus
+        .signed_welcome(&name("eve"), &room("den"))
+        .await
+        .unwrap_err();
+    assert_eq!(code(err), "room_not_found");
     // A newer Welcome replaces the older.
     alice.op(&bus, "den", 4, store(vec![7])).await.unwrap();
     assert_eq!(
@@ -264,11 +269,13 @@ async fn a_welcome_reaches_only_the_invitee_and_goes_away_on_join() {
         Some(vec![7])
     );
     bob.op(&bus, "den", 1, SignedOp::Join).await.unwrap();
-    let err = bus
-        .signed_welcome(&name("bob"), &room("den"))
-        .await
-        .unwrap_err();
-    assert_eq!(code(err), "room_not_found", "a member needs no Welcome");
+    assert_eq!(
+        bus.signed_welcome(&name("bob"), &room("den"))
+            .await
+            .unwrap(),
+        None,
+        "joining consumed the Welcome"
+    );
 }
 
 /// Only a member may leave a Welcome, only for an invitee, and within bounds.
@@ -586,4 +593,46 @@ async fn a_key_package_request_needs_a_registered_requester() {
         .await
         .unwrap_err();
     assert_eq!(code(err), "unregistered");
+}
+
+/// A member can be handed a fresh Welcome (a re-add after it fell behind),
+/// reads it, and clears it with a join under a fresh counter.
+#[tokio::test]
+async fn a_member_can_be_re_welcomed_and_clears_it_by_joining_again() {
+    let (_d, bus) = fresh_bus("rewelcome");
+    let (alice, bob) = den_with_invited_bob(&bus).await;
+    bob.op(&bus, "den", 1, SignedOp::Join).await.unwrap();
+    let welcome = |bytes: Vec<u8>| SignedOp::Welcome {
+        target: "bob".into(),
+        welcome: bytes,
+    };
+    alice.op(&bus, "den", 3, welcome(vec![4, 2])).await.unwrap();
+    assert_eq!(
+        bus.signed_welcome(&name("bob"), &room("den"))
+            .await
+            .unwrap(),
+        Some(vec![4, 2])
+    );
+    // Alice, also a member, is not the target and sees nothing of it.
+    assert_eq!(
+        bus.signed_welcome(&name("alice"), &room("den"))
+            .await
+            .unwrap(),
+        None
+    );
+    // A replayed join (old counter) does not clear it; a fresh one does.
+    let replay = bob.op(&bus, "den", 1, SignedOp::Join).await.unwrap_err();
+    assert_eq!(code(replay), "stale_counter");
+    assert!(bus
+        .signed_welcome(&name("bob"), &room("den"))
+        .await
+        .unwrap()
+        .is_some());
+    bob.op(&bus, "den", 2, SignedOp::Join).await.unwrap();
+    assert_eq!(
+        bus.signed_welcome(&name("bob"), &room("den"))
+            .await
+            .unwrap(),
+        None
+    );
 }

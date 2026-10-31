@@ -19,7 +19,12 @@
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
-use super::{Client, ClientError, Daemon};
+use super::{Client, ClientError, Daemon, UpdatePolicy};
+
+/// How often a client that fell behind asks the owner to re-add it.
+const READD_REQUEST_EVERY: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+/// Body prefix of the direct message asking a room's owner for a re-add.
+pub const READD_REQUEST_PREFIX: &str = "mentischat/readd ";
 
 /// MCP protocol version answered when the client names none.
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -30,6 +35,16 @@ const INSTRUCTIONS: &str = "This is the mentischat mailbox through a local clien
 /// Serve MCP over `input`/`output` (newline-delimited JSON-RPC, as the MCP
 /// stdio transport specifies) until `input` ends.
 ///
+/// `policy` says when the client refreshes its key in each secure room with an
+/// MLS self-update (see [`UpdatePolicy`]); the proxy checks it after sends and
+/// inbox pulls.
+///
+/// A client that missed Commits past the daemon's retention
+/// ([`ClientError::Behind`]) is brought back automatically: it sends the room's
+/// owner a direct message `mentischat/readd <room>`, the owner's proxy
+/// consumes it (the harness never sees it) and re-adds the sender, and the
+/// sender's next `check_inbox` joins from the Welcome the owner left.
+///
 /// # Errors
 ///
 /// Only I/O failures on `input` or `output`; a failing call is a JSON-RPC or
@@ -37,6 +52,7 @@ const INSTRUCTIONS: &str = "This is the mentischat mailbox through a local clien
 pub async fn serve(
     mut client: Client,
     daemon: Daemon,
+    policy: UpdatePolicy,
     input: impl AsyncBufRead + Unpin,
     mut output: impl AsyncWrite + Unpin,
 ) -> std::io::Result<()> {
@@ -49,7 +65,7 @@ pub async fn serve(
             write(&mut output, &rpc_error(Value::Null, -32700, "parse error")).await?;
             continue;
         };
-        if let Some(reply) = handle(&mut client, daemon, &request).await {
+        if let Some(reply) = handle(&mut client, daemon, &policy, &request).await {
             write(&mut output, &reply).await?;
         }
     }
@@ -72,7 +88,12 @@ fn rpc_result(id: Value, result: Value) -> Value {
 }
 
 /// One request; `None` for a notification, which has no reply.
-async fn handle(client: &mut Client, daemon: Daemon, request: &Value) -> Option<Value> {
+async fn handle(
+    client: &mut Client,
+    daemon: Daemon,
+    policy: &UpdatePolicy,
+    request: &Value,
+) -> Option<Value> {
     let id = request.get("id").cloned()?;
     let params = request.get("params").cloned().unwrap_or(Value::Null);
     Some(match request.get("method").and_then(Value::as_str) {
@@ -85,7 +106,7 @@ async fn handle(client: &mut Client, daemon: Daemon, request: &Value) -> Option<
         Some("tools/call") => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            rpc_result(id, call_tool(client, daemon, name, &args).await)
+            rpc_result(id, call_tool(client, daemon, policy, name, &args).await)
         }
         _ => rpc_error(id, -32601, "method not found"),
     })
@@ -155,17 +176,23 @@ fn arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 }
 
 /// Run `tool`: secure paths here, everything else through the daemon.
-async fn call_tool(client: &mut Client, daemon: Daemon, tool: &str, args: &Value) -> Value {
+async fn call_tool(
+    client: &mut Client,
+    daemon: Daemon,
+    policy: &UpdatePolicy,
+    tool: &str,
+    args: &Value,
+) -> Value {
     let secure_room = arg(args, "room").filter(|r| client.is_secure(r));
     let outcome = match (tool, secure_room) {
         ("create_room", _) if args.get("secure").and_then(Value::as_bool) == Some(true) => {
             Some(create_secure(client, args).await)
         }
-        ("send_message", Some(room)) => Some(send_secure(client, room, args).await),
+        ("send_message", Some(room)) => Some(send_secure(client, policy, room, args).await),
         ("invite", Some(room)) => Some(invite_secure(client, room, args).await),
         ("leave_room", Some(room)) => Some(leave_secure(client, room).await),
         ("history", Some(room)) => Some(history_secure(client, room)),
-        ("check_inbox", _) => return check_inbox(client, daemon, args).await,
+        ("check_inbox", _) => return check_inbox(client, daemon, policy, args).await,
         ("join_room", None) => return join(client, daemon, args).await,
         ("register", _) => return register(client, daemon, args).await,
         _ => None,
@@ -228,9 +255,17 @@ async fn create_secure(client: &mut Client, args: &Value) -> Result<Value, Clien
     }))
 }
 
-async fn send_secure(client: &mut Client, room: &str, args: &Value) -> Result<Value, ClientError> {
+async fn send_secure(
+    client: &mut Client,
+    policy: &UpdatePolicy,
+    room: &str,
+    args: &Value,
+) -> Result<Value, ClientError> {
     let body = arg(args, "body").ok_or_else(|| ClientError::Usage("body is required".into()))?;
     let sent = client.send(room, body).await?;
+    if let Err(e) = client.maybe_self_update(room, policy).await {
+        tracing::warn!(room = %room, error = %e, "self-update failed");
+    }
     Ok(json!({
         "id": sent.id.to_string(), "from": sent.from, "room": room, "createdAt": sent.created_at,
     }))
@@ -295,9 +330,77 @@ async fn join(client: &mut Client, daemon: Daemon, args: &Value) -> Value {
     }
 }
 
+/// Bring one secure room up to date: sync, recover if the client fell behind,
+/// prune departed members (owner), and refresh the key if the policy says so.
+/// A failure here must not hide the rest of the inbox, so it is only logged.
+async fn refresh_room(client: &mut Client, daemon: Daemon, policy: &UpdatePolicy, room: &str) {
+    match client.sync(room).await {
+        Ok(_) => {}
+        Err(ClientError::Behind { .. }) => return recover(client, daemon, room).await,
+        Err(e) => return tracing::warn!(room = %room, error = %e, "secure room sync failed"),
+    }
+    if let Err(e) = client.prune(room).await {
+        tracing::warn!(room = %room, error = %e, "secure room prune failed");
+    }
+    if let Err(e) = client.maybe_self_update(room, policy).await {
+        tracing::warn!(room = %room, error = %e, "self-update failed");
+    }
+}
+
+/// A client that fell behind: join from a Welcome if the owner has left one,
+/// otherwise ask the owner (by direct message, at most every few minutes).
+async fn recover(client: &mut Client, daemon: Daemon, room: &str) {
+    match client.join_room(room).await {
+        Ok(()) => return tracing::info!(room = %room, "re-added to secure room"),
+        Err(ClientError::Usage(_)) => {}
+        Err(e) => return tracing::warn!(room = %room, error = %e, "rejoin failed"),
+    }
+    if !client.readd_due(room, READD_REQUEST_EVERY) {
+        return;
+    }
+    match client.owner_name(room).await {
+        Ok(Some(owner)) => {
+            let args = json!({
+                "from": client.agent(), "to": owner,
+                "body": format!("{READD_REQUEST_PREFIX}{room}"),
+            });
+            forward(daemon, "send_message", &args).await;
+        }
+        Ok(None) => tracing::warn!(room = %room, "the room has no owner to ask for a re-add"),
+        Err(e) => tracing::warn!(room = %room, error = %e, "could not find the room's owner"),
+    }
+}
+
+/// Handle re-add requests among the forwarded direct messages: the owner of the
+/// room re-adds the sender, and the request is dropped from what the harness
+/// sees. A request for a room this client does not own is left alone.
+async fn answer_readd_requests(client: &mut Client, messages: Vec<Value>) -> Vec<Value> {
+    let mut kept = Vec::with_capacity(messages.len());
+    for message in messages {
+        let request = message["body"]
+            .as_str()
+            .and_then(|b| b.strip_prefix(READD_REQUEST_PREFIX))
+            .filter(|_| message["room"].is_null());
+        match (request, message["from"].as_str()) {
+            (Some(room), Some(from)) if client.owns(room) => {
+                if let Err(e) = client.readd_member(room, from).await {
+                    tracing::warn!(room = %room, from = %from, error = %e, "re-add failed");
+                }
+            }
+            _ => kept.push(message),
+        }
+    }
+    kept
+}
+
 /// `check_inbox` through the daemon with the secure rooms' ciphertext swapped
 /// for what this client decrypted.
-async fn check_inbox(client: &mut Client, daemon: Daemon, args: &Value) -> Value {
+async fn check_inbox(
+    client: &mut Client,
+    daemon: Daemon,
+    policy: &UpdatePolicy,
+    args: &Value,
+) -> Value {
     let mut result = forward(daemon, "check_inbox", args).await;
     let secure = client.secure_rooms();
     if secure.is_empty() || result["isError"] == true {
@@ -306,7 +409,7 @@ async fn check_inbox(client: &mut Client, daemon: Daemon, args: &Value) -> Value
     let Some(mut page) = result_json(&result) else {
         return result;
     };
-    let mut messages: Vec<Value> = page["messages"]
+    let plain: Vec<Value> = page["messages"]
         .as_array()
         .cloned()
         .unwrap_or_default()
@@ -317,15 +420,9 @@ async fn check_inbox(client: &mut Client, daemon: Daemon, args: &Value) -> Value
                 .is_none_or(|r| !secure.contains(&r.to_ascii_lowercase()))
         })
         .collect();
+    let mut messages = answer_readd_requests(client, plain).await;
     for room in &secure {
-        // A sync or prune that fails (daemon hiccup, a Commit this client
-        // missed) must not hide the rest of the inbox.
-        if let Err(e) = client.sync(room).await {
-            tracing::warn!(room = %room, error = %e, "secure room sync failed");
-        }
-        if let Err(e) = client.prune(room).await {
-            tracing::warn!(room = %room, error = %e, "secure room prune failed");
-        }
+        refresh_room(client, daemon, policy, room).await;
         match client.take_unread(room) {
             Ok(fresh) => messages.extend(fresh.iter().map(message_json)),
             Err(e) => tracing::warn!(room = %room, error = %e, "reading secure room failed"),

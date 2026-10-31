@@ -8,12 +8,13 @@
 use std::net::SocketAddr;
 use std::path::Path;
 
-use super::{default_client_dir, proxy, Client, ClientError, Daemon, Identity};
+use super::{default_client_dir, proxy, Client, ClientError, Daemon, Identity, UpdatePolicy};
 use crate::names::AgentName;
 
 /// Usage text for `mentischat client`.
 pub const USAGE: &str = "\
 Usage: mentischat client run --agent NAME [--addr HOST:PORT]
+                             [--update-messages N] [--update-minutes M]
        mentischat client key init|show --agent NAME
 
 run   serve MCP over stdio for one agent, signing and encrypting for secure
@@ -22,7 +23,12 @@ key   create (init) or print (show) the agent's Ed25519 identity. Prints the
       public key as hex and as the public_key_bytes array MentisDB expects
 
 Keys live in MENTISCHAT_CLIENT_DIR (default ~/.cloudllm/mentischat/client),
-one 0600 file per agent. --addr defaults to the daemon's 127.0.0.1:9480.";
+one 0600 file per agent. --addr defaults to the daemon's 127.0.0.1:9480.
+
+The client refreshes its key in each secure room with an MLS self-update (so a
+stolen key stops working) every --update-messages sent messages (default 100,
+0 = never by count) or --update-minutes (default 30, 0 = never by time), and
+once right after joining.";
 
 /// A parsed `mentischat client` command line.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +39,8 @@ pub enum Command {
         agent: String,
         /// The daemon's address.
         addr: SocketAddr,
+        /// When to refresh the client's key in each secure room.
+        update: UpdatePolicy,
     },
     /// Create the identity if missing, then print its public key.
     KeyInit {
@@ -88,6 +96,7 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
     };
     let mut agent = None;
     let mut addr = crate::BIND_ADDR;
+    let mut update = UpdatePolicy::default();
     let mut it = flags.into_iter();
     while let Some(flag) = it.next() {
         let value = it
@@ -101,6 +110,17 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
                     return Err(err("--addr must be a loopback address"));
                 }
             }
+            "--update-messages" => {
+                update.messages = value
+                    .parse()
+                    .map_err(|_| err("--update-messages is not a whole number"))?;
+            }
+            "--update-minutes" => {
+                let minutes: u64 = value
+                    .parse()
+                    .map_err(|_| err("--update-minutes is not a whole number"))?;
+                update.interval = std::time::Duration::from_secs(minutes.saturating_mul(60));
+            }
             other => return Err(UsageError(format!("unknown flag {other}"))),
         }
     }
@@ -112,7 +132,11 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
         .collect::<Vec<_>>()
         .as_slice()
     {
-        ["run"] => Ok(Command::Run { agent, addr }),
+        ["run"] => Ok(Command::Run {
+            agent,
+            addr,
+            update,
+        }),
         ["key", "init"] => Ok(Command::KeyInit { agent }),
         ["key", "show"] => Ok(Command::KeyShow { agent }),
         _ => Err(err("unknown subcommand")),
@@ -180,11 +204,15 @@ async fn execute(command: Command) -> Result<(), ClientError> {
             print!("{}", describe_key(&Identity::open(&dir, &agent)?));
             Ok(())
         }
-        Command::Run { agent, addr } => {
+        Command::Run {
+            agent,
+            addr,
+            update,
+        } => {
             let daemon = Daemon::new(addr);
             let client = Client::open(Identity::open(&dir, &agent)?, daemon)?;
             let stdin = tokio::io::BufReader::new(tokio::io::stdin());
-            proxy::serve(client, daemon, stdin, tokio::io::stdout())
+            proxy::serve(client, daemon, update, stdin, tokio::io::stdout())
                 .await
                 .map_err(|e| ClientError::Transport(e.to_string()))
         }

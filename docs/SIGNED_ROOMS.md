@@ -285,6 +285,29 @@ Chosen: `openmls` 0.8.3 with `openmls_rust_crypto` 0.5, `openmls_basic_credentia
 declares none and builds and passes on 1.88 (`make msrv`). The numbers are in
 the changelog entry and the README.
 
+## Key refresh and recovery
+
+**Self-update.** `Client::self_update` Commits an empty update: the member's leaf
+gets a new HPKE key and the epoch secret ratchets through a fresh path, so
+someone holding a stolen copy of the member's state can follow the group only
+until that Commit (they cannot derive the next epoch). The proxy runs it by
+`UpdatePolicy` (`--update-messages`, `--update-minutes`; defaults 100 and 30, 0
+disables a trigger) and once after joining, which also retires the reused
+last-resort init key. It goes through the same one-Commit-per-epoch race and
+retry as every Commit.
+
+**Falling behind.** The room log keeps 1024 messages; a client that misses a
+Commit that has left it reports `ClientError::Behind` and stops syncing. The fix
+is an add: `Client::readd_member` (any member) commits the old leaf out and the
+member back in from a fresh KeyPackage and leaves a Welcome; the daemon allows a
+Welcome for a *member* as well as an invitee, and the member's fresh signed
+`join` clears it. `Client::join_room` replaces the stale group with the one in
+the Welcome and keeps the plaintext log. The proxy automates it: the lagging
+client direct-messages the owner `mentischat/readd <room>` (at most every five
+minutes), the owner's proxy consumes the request and re-adds the sender, and
+the sender's next `check_inbox` rejoins. If the owner has left, the request
+cannot be answered; any member can run the re-add by hand.
+
 ## Limits and what is left
 
 - Membership policy is simple: any member invites, the owner removes. Richer
@@ -296,8 +319,7 @@ the changelog entry and the README.
   daemon restart ends them. Client state survives, but the groups are then
   orphaned and must be recreated.
 - A removed or departed member keeps what it already decrypted; MLS protects
-  what comes after. Compromise recovery needs members to Commit fresh leaves
-  (MLS self-update); the client does not schedule that yet.
+  what comes after.
 - A member's own message is not echoed back by the daemon; the client logs it
   when it sends.
 - Requester names are unauthenticated, so a process that registers many names can

@@ -24,7 +24,7 @@ pub mod session;
 
 pub use http::Daemon;
 pub use identity::{default_client_dir, Identity};
-pub use session::{Client, Received};
+pub use session::{Client, Received, UpdatePolicy};
 
 /// Why a client operation failed.
 #[derive(Debug)]
@@ -39,6 +39,14 @@ pub enum ClientError {
         code: String,
         /// The whole error body.
         body: serde_json::Value,
+    },
+    /// The client missed a Commit that fell out of the daemon's retention, so
+    /// its group state cannot catch up: it must be added to the room again
+    /// (see [`Client::join_room`]; an up-to-date member runs
+    /// [`Client::readd_member`]).
+    Behind {
+        /// The room this client fell behind in.
+        room: String,
     },
     /// An MLS operation failed (bad message, wrong epoch, invalid KeyPackage).
     Mls(String),
@@ -64,6 +72,10 @@ impl fmt::Display for ClientError {
         match self {
             Self::Transport(m) => write!(f, "daemon unreachable: {m}"),
             Self::Daemon { status, code, .. } => write!(f, "daemon error {status}: {code}"),
+            Self::Behind { room } => write!(
+                f,
+                "this client missed commits in {room} and must be added to it again"
+            ),
             Self::Mls(m) => write!(f, "mls: {m}"),
             Self::Storage(m) => write!(f, "storage: {m}"),
             Self::Usage(m) => f.write_str(m),

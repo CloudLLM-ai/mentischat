@@ -699,7 +699,19 @@ impl State {
             if st.retired || st.signed.is_none() {
                 return Err(not_a_signed_room(room));
             }
-            if !st.members.contains_key(name.as_str()) {
+            if st.members.contains_key(name.as_str()) {
+                // A member picking up a Welcome (a re-add) is done with it.
+                let pinned = st
+                    .signed
+                    .as_ref()
+                    .and_then(|s| s.pins.get(name.as_str()).copied());
+                if pinned != Some(key) {
+                    return Err(MailErr::InvalidSignature);
+                }
+                let signed = st.signed.as_mut().ok_or_else(|| not_a_signed_room(room))?;
+                signed.bump(&found, key, counter)?;
+                signed.welcomes.remove(name.as_str());
+            } else {
                 let pinned = st
                     .signed
                     .as_ref()
@@ -817,8 +829,9 @@ impl State {
         let target_key = Key::fold(target.as_str());
         let mut st = found.inner.lock();
         st.require_signed_member(&found, agent, room, key)?;
+        let is_member = st.members.contains_key(target_key.as_str());
         let signed = st.signed.as_mut().ok_or_else(|| not_a_signed_room(room))?;
-        if !signed.invitations.contains_key(target_key.as_str()) {
+        if !is_member && !signed.invitations.contains_key(target_key.as_str()) {
             return Err(MailErr::NotAMember {
                 agent: target.to_string(),
                 room: found.name.to_string(),
@@ -849,7 +862,9 @@ impl State {
             .as_ref()
             .filter(|_| !st.retired)
             .ok_or_else(|| not_a_signed_room(room))?;
-        if !signed.invitations.contains_key(name.as_str()) {
+        if !signed.invitations.contains_key(name.as_str())
+            && !st.members.contains_key(name.as_str())
+        {
             return Err(not_a_signed_room(room));
         }
         Ok(signed.welcomes.get(name.as_str()).cloned())

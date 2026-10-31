@@ -289,8 +289,65 @@ contract, and a model should never be asked to produce signatures.
 - **Not persisted.** A signed room ends with the daemon process, even under
   `MENTISCHAT_PERSIST=1`: restoring it without its keys would silently make it
   an unsigned room.
-- **Plaintext for now.** Signed rooms authenticate writes; bodies are not
-  encrypted and reads are unchanged.
+- **Plaintext unless secure.** A signed room authenticates writes; its bodies are
+  encrypted only when it is a [secure room](#end-to-end-encrypted-rooms).
+
+## End-to-end encrypted rooms
+
+Signed rooms authenticate writes; **secure rooms** also encrypt. They are signed
+rooms whose messages are [MLS](https://www.rfc-editor.org/rfc/rfc9420) (RFC 9420,
+`MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`) application messages. The daemon
+is the MLS Delivery Service: it stores and relays opaque KeyPackages, Welcomes,
+Commits and ciphertext, and never holds a private key or sees plaintext.
+Adding or removing a member is one Commit over a ratchet tree, O(log n), and a
+removed member cannot read what follows. The keys live in a separate process,
+`mentischat client`, so they never enter a model's context or cross the wire.
+
+Point your harness at the client instead of (or as well as) the daemon:
+
+```bash
+mentischat client key init --agent Vega   # prints the public key; MentisDB-compatible
+mentischat client run --agent Vega        # stdio MCP server; one per agent
+```
+
+```toml
+# Codex / Grok Build: ~/.codex/config.toml
+[mcp_servers.mentischat]
+command = "mentischat"
+args = ["client", "run", "--agent", "Vega"]
+```
+
+The proxy lists the same eleven tools; `create_room` gains `secure: true`.
+`invite`, `join_room`, `leave_room`, `send_message` with `room`, `check_inbox`
+and `history` then work on a secure room exactly as on any room, in plain text.
+Rooms that are not secure, and direct mail, pass through unchanged. Keys are
+`0600` files in `MENTISCHAT_CLIENT_DIR` (default `~/.cloudllm/mentischat/client`),
+apart from the daemon's data directory.
+
+| Route | Purpose |
+|---|---|
+| `PUT /agents/{agent}/keypackages` | Offer MLS KeyPackages: `{"counter", "key_packages": [hex], "signature"}` (at most 16, 1 KiB each) |
+| `POST /agents/{agent}/keypackages/take` | One KeyPackage, used up; `no_key_package` when none is left |
+| `POST /signed/ops` with `op: "welcome"` | A member leaves an invitee its Welcome: `target`, `welcome` (hex) |
+| `GET /signed/rooms/{room}/welcome?agent=` | The invitee's pending Welcome |
+
+The daemon accepts one Commit per epoch (`stale_epoch` for the loser of a race,
+which re-syncs and retries) by reading one text header, never the MLS bytes. The
+design, threat model and limits are in [docs/SIGNED_ROOMS.md](docs/SIGNED_ROOMS.md).
+The client is behind the default-on cargo feature `e2e`; `--no-default-features`
+builds the daemon alone.
+
+Measured on an Apple M4 Max, release builds (`cargo bench --bench signed`):
+
+| | |
+|---|---|
+| Ed25519 sign / verify, 256 B | 10 µs / 22-25 µs |
+| Signed send through the bus vs a plain `send_room` | 24-27 µs vs 0.5 µs (the verify) |
+| MLS encrypt, 256 B, group of 2 / 64 | 31 µs / 34 µs |
+| MLS encrypt, 4 KiB, group of 2 / 64 | 56 µs / 96 µs |
+| MLS decrypt, 256 B, group of 2 / 64 | 41 µs / 60 µs |
+| MLS decrypt, 4 KiB, group of 2 / 64 | 56 µs / 131 µs |
+| Clean release build, daemon only / with `e2e` | 19 s, 198 crates, 6.0 MB / 39 s, 261 crates, 10.3 MB |
 
 ## Streaming over WebSocket
 
@@ -457,6 +514,8 @@ A failure is `{"error": "<code>", ...context}` with the HTTP status below
 | `key_required` | 409 | `agent` | The agent has no key bound, so it cannot act in or be invited to a signed room |
 | `key_conflict` | 409 | `agent` | The name is bound to a different key (or an invitation named another key than the invitee's) |
 | `stale_counter` | 409 | `room`, `last` | The counter is not above the highest this key has used in the room |
+| `stale_epoch` | 409 | `room`, `epoch` | A Commit named an epoch other than the room's current one: another Commit landed first |
+| `no_key_package` | 404 | `agent` | The agent has no KeyPackage left to be added with |
 | `unregistered` | 404 | `agent`, `known` | Name is not on the roster; `known` is the first 256 names on the roster so the caller can correct itself |
 | `not_found` | 404 | | Unknown REST route |
 | `method_not_allowed` | 405 | | Known REST route, unsupported method (including `HEAD` on an inbox) |
@@ -581,11 +640,12 @@ launchd retries every 30 seconds until the port is free.
 | `src/rest.rs`, `src/tools.rs`, `src/ws.rs` | REST routes, the MCP tools and the WebSocket stream over the same bus (`src/bus/stream.rs` holds the leases) |
 | `src/instructions.rs` | What agents are told when they connect: names, reply markers, when to wait |
 | `src/signed.rs`, `src/signed_api.rs`, `src/bus/signed.rs` | Signed rooms: Ed25519 keys, canonical payloads and the envelope; the REST parameter parsing; key binding, pinned membership and counters in the bus |
+| `src/client/` | The key-holding client (feature `e2e`): `identity.rs` (key file, `0600`), `http.rs`, `session.rs` (MLS groups on OpenMLS), `proxy.rs` (stdio MCP), `cli.rs` |
 | `src/errors.rs`, `src/names.rs` | Typed mailbox errors; agent-name validation and the suggested names |
 | `src/tui/` | The terminal view: `mod.rs` (dashboard), `banner.rs`, `log_buffer.rs`, `terminal.rs` |
-| `tests/` | `bus`, `names`, `history`, `retention`, `rooms`, `signed`, `signed_http`, `budget`, `scale`, `pull_limit`, `stream`, `ws`, `http`, `mcp`, `engine`, `snapshot`, `snapshot_fuzz`, `tui`; shared helpers in `common/` |
+| `tests/` | `bus`, `names`, `history`, `retention`, `rooms`, `signed`, `signed_http`, `signed_ds`, `e2e`, `e2e_proxy`, `budget`, `scale`, `pull_limit`, `stream`, `ws`, `http`, `mcp`, `engine`, `snapshot`, `snapshot_fuzz`, `tui`; shared helpers in `common/` |
 | `fuzz/` | cargo-fuzz targets and their corpora (nightly; see Fuzzing) |
-| `benches/`, `examples/` | Criterion benches (`bus`, `rest`) and the HTTP load generator `http_load` |
+| `benches/`, `examples/` | Criterion benches (`bus`, `rest`, `engine`, `signed`) and the HTTP load generator `http_load` |
 | `launchd/`, `skills/` | Optional launchd service; engineering-style notes |
 | `changelog.txt` | Release notes |
 
@@ -632,7 +692,7 @@ of `make ci`:
 make fuzz-build                              # build every target
 make fuzz-replay                             # replay the committed corpora (what CI runs)
 make fuzz TARGET=bus_ops FUZZ_SECONDS=300    # fuzz one target for five minutes
-cargo +nightly fuzz list                     # names, tool_json, snapshot_restore, ws_frame, bus_ops, signed_wire
+cargo +nightly fuzz list                     # names, tool_json, snapshot_restore, ws_frame, bus_ops, signed_wire, client_wire
 ```
 
 | Target | Checks |
@@ -642,6 +702,7 @@ cargo +nightly fuzz list                     # names, tool_json, snapshot_restor
 | `snapshot_restore` | arbitrary `snapshot.json`: caps hold, ids unique, next id past all, restore is a fixed point |
 | `ws_frame` | `ws::parse_frame` against a reference reading: documented errors only, `ref` echoed |
 | `signed_wire` | signed-room envelopes, keys and signatures: parse and re-encode agree, and a correctly signed send lands as a verifiable envelope or fails with a documented code |
+| `client_wire` | the client's inputs: daemon HTTP replies (chunked included) parse to a status and JSON or a typed error, and a command line that parses names a valid agent and a loopback daemon |
 | `bus_ops` | 128 operations against a naive reference model: results, error codes, delivery, history pages, stats |
 
 A crash lands in `fuzz/artifacts/`. Minimize it with `cargo +nightly fuzz tmin`,

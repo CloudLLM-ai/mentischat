@@ -1,5 +1,22 @@
 UNRELEASED
 
+  - feat(security): end-to-end encrypted secure rooms. A signed room can carry
+    MLS (RFC 9420, X25519 / AES-128-GCM / Ed25519) messages: the daemon becomes
+    the Delivery Service (a KeyPackage directory, per-invitee Welcomes, one
+    Commit per epoch, all opaque bytes; it holds no key and sees no plaintext)
+    and a new `mentischat client` holds the keys. `mentischat client run
+    --agent NAME` is a stdio MCP proxy that lists the same tools (create_room
+    gains secure) and signs, encrypts and decrypts for secure rooms, so a model
+    never sees a key, a signature or ciphertext; `client key init|show` prints
+    the Ed25519 key in MentisDB's public_key_bytes shape. Adding or removing a
+    member is one O(log n) Commit and a removed member cannot read what
+    follows. Behind the default-on cargo feature e2e (OpenMLS 0.8.3, the newest
+    line that builds on MSRV 1.88; 0.9 needs 1.91): daemon-only
+    --no-default-features builds in 19 s with 198 crates and a 6.0 MB binary,
+    with the client 39 s, 261 crates, 10.3 MB. Per message on an M4 Max: Ed25519
+    verify 22-25 us, MLS encrypt 31-96 us, decrypt 41-131 us (256 B to 4 KiB,
+    2 to 64 members). Additive: no existing route, tool or room changes.
+
   - feat(security): signed rooms. An agent binds an Ed25519 public key to its
     roster name (PUT /agents/{agent}/key, trust on first use, proof of
     possession) and creates a room whose every membership change and message
@@ -12,7 +29,8 @@ UNRELEASED
     the raw 32-byte points MentisDB stores, so one identity works in both.
     Additive only: no MCP tool changed, signed rooms are not snapshotted
     (they never come back unsigned), and a new fuzz target covers the wire.
-    See docs/SIGNED_ROOMS.md.
+    Keys must be real curve points (small-order points are refused) and
+    signatures verify strictly. See docs/SIGNED_ROOMS.md.
 
   - feat(core): mentischat, a local mailbox that lets agents on one machine
     (Claude Code, Codex, Grok Build, opencode, Cursor, or a script) message

@@ -1,6 +1,7 @@
 # Signed, end-to-end encrypted private rooms
 
-Status: design (phase 1 and phase 2 land against this document).
+Status: implemented. Phase 1 (signed rooms) and phase 2 (MLS end-to-end
+encryption with the daemon as Delivery Service) follow this document.
 
 Today a "private" room is invite-only and unlisted, nothing more. Identity is
 the agent name the caller types, no message is signed or encrypted, and any
@@ -130,7 +131,10 @@ signer name (both ASCII-lowercased, since names compare without case), the
 counter as 8-byte big-endian, then the op fields in order: `create`
 description (empty if absent), `invite` invitee name then the invitee's 32-byte
 key, `remove` target name, `send` body. `join` and `leave` have none.
-`register_key` signs name then key with counter 0.
+`register_key` signs name then key with counter 0. `welcome` (phase 2) signs
+the target name then the Welcome bytes; `key_packages` signs the signer's own
+counter, then the package count (4 bytes) and each package, length-prefixed, with
+an empty room.
 
 Rules, enforced by the daemon:
 
@@ -190,36 +194,75 @@ A Bloom filter is lossy and not decomposable that way; the tree is the exact
 structure with the O(log n) property the idea is after. We do not hand-roll it.
 Ciphersuite: `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`.
 
-## E2E architecture (phase 2)
+## E2E architecture (phase 2, as built)
 
-**Daemon = MLS Delivery Service.** For signed rooms it adds:
+**Daemon = MLS Delivery Service.** It stores and relays opaque bytes, keeps
+checking Ed25519 signatures and counters as in phase 1, and parses no MLS and
+holds no group state. For secure rooms it adds, all REST, all additive:
 
-- A KeyPackage directory: `PUT/GET /agents/{agent}/keypackages` (opaque
-  bytes, hex, signed upload, one-time use on fetch).
-- Per-room ordered relay of MLS messages. The room log already gives a total
-  order, and a Commit is accepted only if it names the room's current epoch,
-  so two members racing a Commit cannot fork the group (the loser re-fetches,
-  re-applies the winner's Commit and retries). Welcomes are addressed to one
-  invitee and stored until fetched.
-- It keeps checking Ed25519 signatures and counters as in phase 1. The
-  daemon's member list decides who may post. It does **not** parse MLS and has
-  no group state.
+- `PUT /agents/{agent}/keypackages` `{"counter", "key_packages": [hex], "signature"}`:
+  a KeyPackage directory. Signed under the agent's bound key with a counter of
+  its own; at most 16 packages of at most 1 KiB per agent, oldest dropped.
+- `POST /agents/{agent}/keypackages/take`: hands out one and forgets it
+  (`no_key_package` when none is left). Public, like a KeyPackage.
+- Signed op `welcome` `{target, welcome: hex}`: a member leaves the invitee its
+  MLS Welcome (at most 64 KiB, 1 MiB per room). `GET /signed/rooms/{room}/welcome?agent=`
+  returns it to the invitee only, until it joins.
+- **One Commit per epoch.** A signed `send` whose body starts
+  `mls/1 commit <epoch> ` is a Commit. The daemon accepts it only if `<epoch>`
+  is the room's current epoch, then advances it, under the room lock and only
+  once the message is certain to be stored. A second member racing from the same
+  epoch gets `stale_epoch`, re-syncs, re-applies the winner's Commit and tries
+  again. The room log supplies the total order; the daemon only reads this
+  one text header (strict canonical decimal), never the MLS bytes.
+- `GET /signed/rooms/{room}` also reports `epoch` and `invited`.
 
-**Client = key holder.** `mentischat client --agent NAME` is a stdio MCP proxy
-for one agent: it exposes the same tool names and schemas to the harness,
-forwards to the daemon over loopback REST, and for signed rooms transparently
-signs, encrypts and decrypts. The same binary offers scripting subcommands
-(`key init|show`, `room create|invite|join|remove|send|recv`). Keys are
-`0600` files under `MENTISCHAT_CLIENT_DIR` (default
-`~/.cloudllm/mentischat/client`), kept apart from the daemon's data directory
-so a daemon wipe never deletes an identity. MLS group state is stored beside
-the keys.
+Body formats inside the signed envelope: `mls/1 commit <epoch> <hex>` and
+`mls/1 app <epoch> <hex>` (an MLS PrivateMessage, so handshake traffic is
+encrypted too). An invitee joins from the Welcome (ratchet tree in the
+Welcome, so no directory of trees). Daemon membership and MLS membership are
+kept in step by the client: add = signed `invite` (pins the key), take the
+KeyPackage, Commit, `welcome`, then the invitee's signed `join`; remove =
+Commit first, then the owner's signed `remove`; leave = signed `leave`, and the
+owner's `prune` Commits the leaver out (it keeps invitees that have not joined
+yet).
+
+**Identity is checked, not assumed.** The adder verifies that a KeyPackage's
+credential names the target and that its signature key is the key the daemon
+has bound to that name, and every member re-checks added members' keys against
+the registry before merging a Commit. The MLS credential is a Basic credential
+holding the agent name; the leaf signature key **is** the mentischat Ed25519
+key, so one key signs the daemon-level operations and the MLS messages. A
+message is attributed to the identity MLS authenticated, and dropped if the
+daemon says someone else sent it.
+
+**Client = key holder.** `mentischat client run --agent NAME` is a stdio MCP
+proxy for one agent. It lists the daemon's tools unchanged except that
+`create_room` gains `secure`, forwards every call to the daemon's `/mcp`, and
+for secure rooms signs, encrypts and decrypts: `invite`, `join_room` (on a room
+the daemon says is signed), `leave_room`, `send_message` with `room`,
+`check_inbox` and `history`. Plain rooms and direct mail are forwarded byte for
+byte. The model sees plain text and has no tool that returns a key, a
+signature or ciphertext. `mentischat client key init|show --agent NAME` prints
+the public key as hex and as MentisDB's `public_key_bytes` array.
+
+State, all `0600` in a `0700` directory (`MENTISCHAT_CLIENT_DIR`, default
+`~/.cloudllm/mentischat/client/<agent>/`), written by atomic rename:
+`identity.key` (the seed) and `state.json` (OpenMLS storage, which holds the
+group secrets, plus a plaintext log per room: MLS ciphertext can be decrypted
+once, so `history` for a secure room is served from this log). A key file
+readable by others is refused.
+
+Reads use the room's retained history, not `check_inbox`: history consumes
+nothing, so a client that dies mid-sync repeats the sync instead of losing a
+Commit and falling out of the group. A client that falls behind past the room's
+1024-message retention misses Commits and must be added again.
 
 Why a subcommand of the same binary and not a second crate: one install and
-one version, shared envelope and payload types with the daemon, and no
-publishing of a second package. The OpenMLS dependency tree sits behind a
-default-on cargo feature `e2e`, so a daemon-only build (`--no-default-features`)
-does not pay for it.
+one version, shared envelope and payload types with the daemon, and no second
+package to publish. The OpenMLS dependency tree sits behind the default-on
+cargo feature `e2e`; a daemon-only build (`--no-default-features`) compiles
+none of it.
 
 Why not keep keys in the daemon: the daemon would see every secret, which
 defeats E2E. Why not give the LLM a signing tool: its context would carry
@@ -227,14 +270,29 @@ either the key or a signing oracle usable by prompt injection; the proxy keeps
 the key in a process the model cannot read, and the model only ever supplies
 plaintext.
 
-Dependencies: `openmls` 0.8.3 with `openmls_rust_crypto` 0.5 and
-`openmls_basic_credential` 0.5. Versions 0.9 and later require Rust 1.91,
-above this crate's MSRV of 1.88; 0.8.3 builds on 1.88.
+### OpenMLS evaluation
+
+Chosen: `openmls` 0.8.3 with `openmls_rust_crypto` 0.5, `openmls_basic_credential`
+0.5 and `openmls_memory_storage` 0.5. Every 0.9 release (0.9.0 to 0.9.2) and the
+0.6 provider crates declare Rust 1.91, above this crate's MSRV of 1.88; 0.8.3
+declares none and builds and passes on 1.88 (`make msrv`). The numbers are in
+the changelog entry and the README.
 
 ## Limits and what is left
 
-- Membership policy in phase 1 is simple (any member invites, owner removes).
-  A richer role model would be a protocol revision.
-- No device multiplicity: one key per name per room.
-- No persistence of signed rooms across daemon restarts.
-- The OS keychain is not used yet.
+- Membership policy is simple: any member invites, the owner removes. Richer
+  roles would be a protocol revision.
+- One key per name; no device multiplicity. A name's key is bound trust on
+  first use: the first process to bind a name wins until that registration
+  leaves the roster.
+- Signed rooms, key bindings and the KeyPackage directory are in memory only; a
+  daemon restart ends them. Client state survives, but the groups are then
+  orphaned and must be recreated.
+- A removed or departed member keeps what it already decrypted; MLS protects
+  what comes after. Compromise recovery needs members to Commit fresh leaves
+  (MLS self-update); the client does not schedule that yet.
+- A member's own message is not echoed back by the daemon; the client logs it
+  when it sends.
+- Anyone local can drain an agent's KeyPackages (they are public). The agent's
+  client republishes on `register`; a last-resort KeyPackage is not implemented.
+- The OS keychain is not used yet; the key file is the `~/.ssh` boundary.

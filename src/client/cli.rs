@@ -20,7 +20,8 @@ Usage: mentischat client run --agent NAME [--addr HOST:PORT]
 run   serve MCP over stdio for one agent, signing and encrypting for secure
       rooms; configure your harness with this as an MCP stdio server
 key   create (init) or print (show) the agent's Ed25519 identity. Prints the
-      public key as hex and as the public_key_bytes array MentisDB expects
+      public key as hex and as the public_key_bytes array MentisDB expects,
+      plus the operator command that registers it on a MentisDB chain
 
 Keys live in MENTISCHAT_CLIENT_DIR (default ~/.cloudllm/mentischat/client),
 one 0600 file per agent. --addr defaults to the daemon's 127.0.0.1:9480.
@@ -144,18 +145,25 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
 }
 
 /// The text `key init` and `key show` print: the public key as hex, as the
-/// `public_key_bytes` array MentisDB's `add_agent_key` takes, and a suggested
-/// MentisDB `key_id` of the form `<agent>-<yyyymm>`, the convention MentisDB
-/// suggests (reuse the same `key_id` for the same key in both systems).
+/// `public_key_bytes` array MentisDB stores, a suggested MentisDB `key_id` of
+/// the form `<agent>-<yyyymm>` (the convention MentisDB suggests; reuse the
+/// same `key_id` for the same key in both systems), and the command that
+/// registers the key on a MentisDB chain.
+///
+/// Registering a key is operator-only in MentisDB: an agent cannot add its own
+/// key over MCP or REST, so the printed `mentisdb agent key add` line is for the
+/// person who runs the MentisDB daemon (it needs the dashboard PIN, or
+/// `--offline` on the daemon's machine). Replace `<chain>` with the chain key.
 pub fn describe_key(identity: &Identity) -> String {
     let key = identity.public();
     let hex = key.to_hex();
     let bytes: Vec<String> = key.as_bytes().iter().map(u8::to_string).collect();
     format!(
-        "agent: {}\npublic key (hex): {hex}\nmentisdb key_id: {}\nmentisdb public_key_bytes: [{}]\n",
-        identity.agent(),
-        suggested_key_id(identity.agent(), &yyyymm()),
-        bytes.join(",")
+        "agent: {agent}\npublic key (hex): {hex}\nmentisdb key_id: {key_id}\nmentisdb public_key_bytes: [{bytes}]\n\
+         register (MentisDB operator): mentisdb agent key add {agent} --key-id {key_id} --public-key-hex {hex} --chain <chain>\n",
+        agent = identity.agent(),
+        key_id = suggested_key_id(identity.agent(), &yyyymm()),
+        bytes = bytes.join(",")
     )
 }
 

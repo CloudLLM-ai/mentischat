@@ -478,6 +478,15 @@ fn the_command_line_parses_and_describes_keys() {
     );
     let array: Vec<String> = id.public().as_bytes().iter().map(u8::to_string).collect();
     assert!(text.contains(&format!("[{}]", array.join(","))));
+    // Key registration is operator-only in MentisDB, so the output carries the
+    // exact operator command with this key's id and hex.
+    let register = text
+        .lines()
+        .find(|l| l.starts_with("register (MentisDB operator): "))
+        .unwrap();
+    assert!(register.contains(&format!(
+        "mentisdb agent key add Vega --key-id {key_id} --public-key-hex {hex} --chain <chain>"
+    )));
     assert!(!text.contains(
         std::fs::read_to_string(id.dir().join("identity.key"))
             .unwrap()

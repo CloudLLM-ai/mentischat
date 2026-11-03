@@ -890,3 +890,102 @@ async fn check_inbox_takes_a_limit_over_mcp() {
     );
     assert_eq!(inbox["inputSchema"]["required"], json!(["agent"]));
 }
+
+/// `POST /mcp` with the given `Host` header, and nothing else a browser would add.
+fn mcp_post_with_host(host: &str) -> http::Request<axum::body::Body> {
+    let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {} });
+    http::Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("content-type", "application/json")
+        .header("host", host)
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// cloudllm_mcp 0.4.0 checks `Host` itself on loopback binds. Every form a local
+/// client can send to the daemon (name, IPv4 and IPv6 literal, with or without the
+/// port) must still reach the tools.
+#[tokio::test]
+async fn mcp_accepts_every_loopback_host_form() {
+    let (_d, app) = app();
+    for host in [
+        "127.0.0.1:9480",
+        "127.0.0.1",
+        "localhost:9480",
+        "localhost",
+        "[::1]:9480",
+        "[::1]",
+    ] {
+        let resp = app.clone().oneshot(mcp_post_with_host(host)).await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "Host {host}");
+    }
+}
+
+/// A DNS-rebinding page reaches `/mcp` under its own hostname. The daemon's own
+/// middleware and cloudllm_mcp's guard each reject it; neither may let it through.
+#[tokio::test]
+async fn mcp_rejects_a_foreign_host() {
+    let (_d, app) = app();
+    for host in [
+        "evil.example:9480",
+        "localhost.evil.example:9480",
+        "127.0.0.1.evil.example",
+        "127.0.0.2:9480",
+    ] {
+        let resp = app.clone().oneshot(mcp_post_with_host(host)).await.unwrap();
+        assert_eq!(resp.status().as_u16(), 403, "Host {host}");
+    }
+}
+
+/// The daemon serves no SSE stream (its live view is the WebSocket), so
+/// `SsePayloadMode` never applies. `GET /mcp` is now authenticated upstream and
+/// must stay 405 for a loopback caller and 403 for a hostile page, and never
+/// answer `200 text/event-stream`.
+#[tokio::test]
+async fn get_mcp_stream_stays_closed_and_guarded() {
+    let (_d, app) = app();
+    let get = |header: Option<(&str, &str)>| {
+        let builder = http::Request::builder().method("GET").uri("/mcp");
+        let builder = match header {
+            Some((name, value)) => builder.header(name, value),
+            None => builder,
+        };
+        builder.body(axum::body::Body::empty()).unwrap()
+    };
+    for (header, want) in [
+        (None, 405),
+        (Some(("host", "localhost:9480")), 405),
+        (Some(("origin", "http://127.0.0.1:9480")), 405),
+        (Some(("host", "evil.example")), 403),
+        (Some(("origin", "https://evil.example")), 403),
+        (Some(("origin", "http://localhost.evil.example")), 403),
+    ] {
+        let resp = app.clone().oneshot(get(header)).await.unwrap();
+        let content_type = resp.headers().get("content-type").cloned();
+        assert_eq!(resp.status().as_u16(), want, "{header:?}");
+        assert_ne!(
+            content_type.as_ref().and_then(|v| v.to_str().ok()),
+            Some("text/event-stream"),
+            "{header:?}"
+        );
+    }
+}
+
+/// An unauthenticated loopback daemon has no bearer token, so cloudllm_mcp 0.4.0's
+/// "an empty token never matches" rule must not lock out a client that sends none
+/// (or sends an `Authorization` header anyway).
+#[tokio::test]
+async fn mcp_needs_no_bearer_token() {
+    let (_d, app) = app();
+    for authorization in [None, Some("Bearer "), Some("Bearer anything")] {
+        let mut request = mcp_post_with_host("localhost:9480");
+        if let Some(value) = authorization {
+            request
+                .headers_mut()
+                .insert("authorization", value.parse().unwrap());
+        }
+        let resp = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "{authorization:?}");
+    }
+}

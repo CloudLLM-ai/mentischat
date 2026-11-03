@@ -307,6 +307,20 @@ UNRELEASED
     daemon after a crash or non-zero exit but not after a clean stop, and
     retries every 30 s while another instance owns the port.
 
+  - chore(deps): cloudllm_mcp 0.3.6 -> 0.4.0 (pinned exactly, daemon and fuzz
+    package). No source change was needed and nothing MentisChat's clients see
+    changes: the REST shapes, the WebSocket protocol, the MCP tool results and
+    the `/mcp` path behave as before. What 0.4.0 adds is checked by tests in
+    tests/mcp.rs: it now validates `Host` on loopback binds itself (the daemon
+    already did, so the same loopback names pass and DNS-rebinding hosts get
+    403), authenticates `GET /mcp` (still 405 for a loopback caller, 403 for a
+    foreign Host or Origin, never an event stream), never matches an empty
+    bearer token (the daemon has none and needs none) and returns generic 500
+    bodies (the tools only raise typed errors). The daemon has no SSE
+    broadcaster, so the new `SsePayloadMode` (Minimal by default) does not
+    apply. The upgrade also moves the tree from reqwest 0.12 to 0.13 (rustls),
+    which only cloudllm_mcp uses; MentisChat has no reqwest of its own.
+
   - chore(build): the Makefile wraps cargo (build, release, ci, fmt,
     fmt-check, check, clippy, test, doc, msrv, install, uninstall, publish;
     the verify targets and install pass --locked) and runs the daemon with

@@ -247,8 +247,10 @@ impl Bus {
     ///
     /// # Errors
     ///
-    /// `shutting_down` once the bus is closed; `name_taken`; `roster_full`
-    /// when a new name would exceed [`MAX_ROSTER`]; `invalid_description`.
+    /// `shutting_down` once the bus is closed; `name_taken`; `numbered_name`
+    /// when a name that is neither registered nor held is numbered
+    /// ([`AgentName::is_numbered`]); `roster_full` when a new name would
+    /// exceed [`MAX_ROSTER`]; `invalid_description`.
     pub async fn register_with(
         &self,
         name: &AgentName,
@@ -274,6 +276,12 @@ impl Bus {
                 until: rfc3339_ms(h.until_ms),
             };
             return Err(state.name_taken(&holds, name.to_string(), reason, now));
+        }
+        if name.is_numbered() {
+            return Err(MailErr::NumberedName {
+                agent: name.to_string(),
+                suggestions: state.free_suggestions(&holds, now),
+            });
         }
         let agents = state.roster.len();
         if agents >= MAX_ROSTER as usize {

@@ -46,6 +46,16 @@ pub enum MailboxError {
         /// Free names to pick instead.
         suggestions: Vec<String>,
     },
+    /// A new registration of a numbered name, one ending in `.`, `_` or `-`
+    /// followed only by digits (`vega_1`, `vega-2`); see
+    /// [`crate::names::AgentName::is_numbered`]. Carries free names to pick
+    /// instead.
+    NumberedName {
+        /// The name that was asked for.
+        agent: String,
+        /// Free names to pick instead.
+        suggestions: Vec<String>,
+    },
     /// `before` is not a positive integer.
     InvalidCursor,
     /// `limit` is not an integer of at least 1 (and is not a digit string
@@ -195,6 +205,7 @@ impl MailboxError {
             Self::InvalidCursor => "invalid_cursor",
             Self::InvalidLimit => "invalid_limit",
             Self::NameTaken { .. } => "name_taken",
+            Self::NumberedName { .. } => "numbered_name",
             Self::Unregistered { .. } => "unregistered",
             Self::QueueFull { .. } => "queue_full",
             Self::StorageFull { .. } => "storage_full",
@@ -227,6 +238,7 @@ impl MailboxError {
         use axum::http::StatusCode;
         match self {
             Self::InvalidName { .. }
+            | Self::NumberedName { .. }
             | Self::InvalidRoom { .. }
             | Self::InvalidBody
             | Self::InvalidWait
@@ -288,6 +300,9 @@ impl MailboxError {
                     }
                 }
                 body
+            }
+            Self::NumberedName { agent, suggestions } => {
+                json!({ "error": self.code(), "agent": agent, "suggestions": suggestions })
             }
             Self::Unregistered { agent, known } => {
                 json!({ "error": self.code(), "agent": agent, "known": known })

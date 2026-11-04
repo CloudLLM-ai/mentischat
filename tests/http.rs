@@ -311,6 +311,7 @@ async fn register_takes_a_chosen_name_and_refuses_a_taken_one() {
             r#"{"agent":"Lyra","description":"a\nb"}"#,
             "invalid_description",
         ),
+        (r#"{"agent":"Lyra_2"}"#, "numbered_name"),
     ] {
         let (s, v) = send(&mut app, post("/agents", body)).await;
         assert_eq!((s, v["error"].as_str()), (400, Some(error)), "{body}");

@@ -480,7 +480,7 @@ async fn aborted_inbox_waiter_does_not_starve_the_next_one() {
 async fn roster_honors_max_agents() {
     let (_d, bus) = fresh_bus("rosterfull");
     for i in 0..mentischat::bus::MAX_ROSTER {
-        bus.register(&name(&format!("agent_{i}"))).await.unwrap();
+        bus.register(&name(&format!("agent{i}"))).await.unwrap();
     }
     let err = bus.register(&name("one_too_many")).await.unwrap_err();
     assert!(

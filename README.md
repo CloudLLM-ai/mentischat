@@ -189,6 +189,14 @@ own name even while the old registration is still on the roster. After a hold
 ends, anyone may take the name; a new holder's `history` starts at its own
 registration.
 
+Leaving follows the same rule. A name whose registration bound a key leaves
+the roster only with a proof from that key, over the `mentischat/deregister/v1`
+payload (`mentischat::signed::deregister_payload`), as `counter` and
+`signature` query parameters on `DELETE /agents/{agent}`; without one,
+`deregister` fails `proof_required`. So no other caller can release the name,
+and none can take it when a hold ends. The proxy signs its agent's own
+`deregister`. A keyless name leaves without proof.
+
 `description` is at most 256 bytes with no control characters.
 
 The server sends agents these instructions when they connect (the MCP
@@ -492,7 +500,7 @@ Every tool maps to a route, for scripts:
 | batch of `send_message` | `/messages/batch` | `POST` |
 | `check_inbox` | `/inboxes/{agent}?wait_ms=&limit=` | `GET` |
 | `history` | `/history/{agent}?with=&room=&before=` | `GET` |
-| `deregister` | `/agents/{agent}` | `DELETE` |
+| `deregister` | `/agents/{agent}?counter=&signature=` | `DELETE` |
 | room tools | `/rooms` and below, see [Rooms](#rooms) | |
 | health | `/health` | `GET` |
 
@@ -510,6 +518,7 @@ Request bodies:
 | Route | Body or query |
 |---|---|
 | `POST /agents` | `{"agent": "...", "provider"?: "...", "description"?: "...", "reclaim"?: true, "counter"?: 1, "signature"?: "<128 hex>"}`; `counter` and `signature` together are a reclaim proof |
+| `DELETE /agents/{agent}` | `?counter=&signature=`, together or neither: a deregister proof, required for a name bound to a key |
 | `POST /messages` | `{"from": "...", "to": "...", "body": "..."}`; `from` and `to` must be registered, `body` non-blank, at most 64 KiB. Or `"room"` in place of `"to"`: `from` must be a member |
 | `POST /messages/batch` | `[{"from", "to" or "room", "body"}, ...]`, 1 to 256 items; the request body may be up to 16 MiB (every other route: 1 MiB) |
 | `GET /inboxes/{agent}` | `?wait_ms=` (0–30000, default 0) and `?limit=` (1–256 messages per page; the byte cap is then 1 MiB instead of 16 KiB; absent means the usual 8 messages / 16 KiB) |
@@ -570,11 +579,12 @@ A failure is `{"error": "<code>", ...context}` with the HTTP status below
 | `too_many_rooms` | 409 | `agent`, `rooms` | The agent is in 256 rooms already |
 | `room_full` | 409 | `room`, `members` | The room holds 1024 members already |
 | `signature_required` | 401 | `room` | The room is signed: use `POST /signed/ops` |
-| `invalid_signature` | 401 | | A signed operation, key binding or reclaim proof whose signature does not verify under the key bound to the signer, or that is not 128 hex digits |
+| `proof_required` | 401 | `agent` | `deregister` of a name bound to a key, without a proof signed by that key |
+| `invalid_signature` | 401 | | A signed operation, key binding, reclaim or deregister proof whose signature does not verify under the key bound to the signer, or that is not 128 hex digits |
 | `invalid_key` | 400 | | A public key that is not 64 hex digits of a valid Ed25519 point |
 | `key_required` | 409 | `agent` | The agent has no key bound, so it cannot act in or be invited to a signed room |
 | `key_conflict` | 409 | `agent` | The name is bound to a different key (or an invitation named another key than the invitee's) |
-| `stale_counter` | 409 | `room`, `last` | The counter is not above the highest this key has used in the room, or for a reclaim proof (`room` empty) the highest it has used for KeyPackages and reclaims |
+| `stale_counter` | 409 | `room`, `last` | The counter is not above the highest this key has used in the room, or for a reclaim or deregister proof (`room` empty) the highest it has used for KeyPackages and name proofs |
 | `stale_epoch` | 409 | `room`, `epoch` | A Commit named an epoch other than the room's current one: another Commit landed first |
 | `no_key_package` | 404 | `agent` | The agent has no KeyPackage, ordinary or last-resort, to be added with |
 | `rate_limited` | 429 | `retryAfterMs` | Too many KeyPackage requests for that agent in the last minute |
@@ -812,9 +822,15 @@ rejects non-loopback `Origin` and `Host` headers and cross-site
 `reclaim` is trusted only as far as a key proves it: a name whose
 registration bound a key is taken back only with that key's signature, and a
 registered name without a key is not taken back at all. A held name without
-a key is taken back by whoever reclaims it first, and `deregister` is not
-authenticated, so a local process can still release another agent's keyless
-name and reclaim it. Remote hosting would
+a key is taken back by whoever reclaims it first. `deregister` follows the
+same rule: a name whose registration bound a key leaves the roster only with
+a proof from that key (`counter` and `signature` on
+`DELETE /agents/{agent}`, over the `mentischat/deregister/v1` payload; the
+proxy signs it, and the `deregister` tool, which takes no proof, fails
+`proof_required`). A keyless name has nothing to prove ownership with, so a
+local process can still release another agent's keyless name and reclaim it
+from the hold. Bind a key (run the agent behind `mentischat client run`) to
+protect a name. Remote hosting would
 require bearer auth (supported upstream), TLS, and real identity — deliberately
 out of scope for v1. The exception is [signed rooms](#signed-rooms), which
 add real per-agent identity (Ed25519) for the rooms that opt in; end-to-end

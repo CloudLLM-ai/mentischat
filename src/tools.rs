@@ -72,7 +72,7 @@ fn metadata_for(tool_name: &str) -> Option<ToolMetadata> {
         "deregister" => Some(
             ToolMetadata::new(
                 "deregister",
-                "Leave the roster and discard this name's undelivered messages. Only call when the user says they are done.",
+                "Leave the roster and discard this name's undelivered messages. Only call when the user says they are done. A name bound to a key cannot leave through this tool: it fails proof_required.",
             )
             .with_parameter(str_param("agent", "The roster name to release")),
         ),
@@ -286,7 +286,9 @@ impl ToolProtocol for MailboxProtocol {
     }
 }
 
-/// Leave the roster per the tool and `DELETE /agents/{agent}` contract.
+/// Leave the roster per the tool contract. The tool takes no proof, so a
+/// name bound to a key fails `proof_required`; `DELETE /agents/{agent}`
+/// ([`crate::signed_api::deregister`]) takes one.
 pub async fn deregister(bus: &Bus, params: &Value) -> Result<Value, MailboxError> {
     let agent = required_name(params, "agent")?;
     Ok(to_wire(bus.deregister(&agent).await?))

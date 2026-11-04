@@ -303,9 +303,11 @@ pub enum OpKind {
     PublishKeyPackages,
     /// Prove ownership of a key-bound name to take it back with `reclaim`.
     Reclaim,
+    /// Prove ownership of a key-bound name to take it off the roster.
+    Deregister,
 }
 
-/// An `op` name that is not one of the ten.
+/// An `op` name that is not one of the eleven.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnknownOp;
 
@@ -331,6 +333,7 @@ impl OpKind {
             Self::Welcome => "welcome",
             Self::PublishKeyPackages => "key_packages",
             Self::Reclaim => "reclaim",
+            Self::Deregister => "deregister",
         }
     }
 }
@@ -356,6 +359,7 @@ impl FromStr for OpKind {
             "welcome" => Self::Welcome,
             "key_packages" => Self::PublishKeyPackages,
             "reclaim" => Self::Reclaim,
+            "deregister" => Self::Deregister,
             _ => return Err(UnknownOp),
         })
     }
@@ -478,6 +482,24 @@ pub fn register_key_payload(signer: &str, key: &PublicKey) -> Vec<u8> {
 /// ```
 pub fn reclaim_payload(signer: &str, counter: u64) -> Vec<u8> {
     header(OpKind::Reclaim, "", signer, counter, 0)
+}
+
+/// The bytes signed to take the roster name `signer` off the roster with
+/// `deregister` while it is bound to a key: proof that the caller holds that
+/// key. The counter follows the same rule as [`reclaim_payload`]: strictly
+/// above every counter the key has used. The room is empty.
+///
+/// # Examples
+///
+/// ```
+/// use mentischat::signed::{deregister_payload, reclaim_payload};
+///
+/// assert!(deregister_payload("Vega", 7).starts_with(b"mentischat/deregister/v1\0"));
+/// assert_eq!(deregister_payload("Vega", 7), deregister_payload("vega", 7));
+/// assert_ne!(deregister_payload("vega", 7), reclaim_payload("vega", 7));
+/// ```
+pub fn deregister_payload(signer: &str, counter: u64) -> Vec<u8> {
+    header(OpKind::Deregister, "", signer, counter, 0)
 }
 
 /// The bytes signed to publish `packages` (opaque serialized MLS KeyPackages)

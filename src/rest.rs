@@ -130,13 +130,18 @@ async fn list(
     ))
 }
 
-/// `DELETE /agents/{agent}` — same as the deregister tool.
+/// `DELETE /agents/{agent}?counter=&signature=`: deregister, with the proof
+/// a key-bound name needs.
 async fn deregister_one(
     State(bus): State<Ctx>,
     path: Result<Path<String>, PathRejection>,
+    query: Result<Query<HashMap<String, String>>, QueryRejection>,
 ) -> Reply {
-    let params = json!({ "agent": path_agent(path)? });
-    Ok(Json(crate::tools::deregister(&bus, &params).await?))
+    let Query(q) = query.map_err(|_| MailboxError::InvalidBody)?;
+    let params = query_params(&q, &["counter", "signature"]);
+    Ok(Json(
+        crate::signed_api::deregister(&bus, &path_agent(path)?, &params).await?,
+    ))
 }
 
 /// `POST /messages` `{ "from", "to", "body" }` — same as send_message.

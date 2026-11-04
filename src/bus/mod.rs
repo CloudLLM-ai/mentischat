@@ -33,7 +33,7 @@ use tokio::time::Instant;
 
 use crate::errors::TakenReason;
 use crate::names::{AgentName, RoomName};
-use crate::signed::reclaim_payload;
+use crate::signed::{deregister_payload, reclaim_payload};
 
 mod clock;
 mod convos;
@@ -341,14 +341,67 @@ impl Bus {
         Ok(outcome)
     }
 
+    /// Leave the roster without a proof. See
+    /// [`deregister_with`](Self::deregister_with): a name whose registration
+    /// bound a key fails `proof_required`.
+    pub async fn deregister(&self, name: &AgentName) -> Result<DiscardOutcome, MailErr> {
+        self.deregister_with(name, None).await
+    }
+
     /// Leave the roster, deleting the mail addressed to this name (read or
     /// not) and waking its parked pulls (they fail `unregistered`). Messages
     /// it sent stay with their recipients. The name is then held for
     /// [`Retention::name_hold`].
-    pub async fn deregister(&self, name: &AgentName) -> Result<DiscardOutcome, MailErr> {
+    ///
+    /// A name whose registration bound a key leaves only with `proof`, a
+    /// signature by that key over [`deregister_payload`] at a counter above
+    /// every one the key has used; the hold then keeps that counter. A
+    /// keyless name needs no proof and ignores one.
+    ///
+    /// # Errors
+    ///
+    /// `unregistered` when the name is not on the roster (or its
+    /// registration was replaced while the call ran); `proof_required` for a
+    /// key-bound name without a proof; `invalid_signature` or
+    /// `stale_counter` for a proof that does not verify or reuses a counter;
+    /// `shutting_down`.
+    pub async fn deregister_with(
+        &self,
+        name: &AgentName,
+        proof: Option<KeyProof>,
+    ) -> Result<DiscardOutcome, MailErr> {
         let state = self.open()?;
+        let key = name.folded();
+        let agent = state
+            .roster
+            .get(&key)
+            .ok_or_else(|| state.unregistered(name.as_str()))?;
+        let bound = {
+            let st = agent.inner.lock();
+            st.key.map(|k| (k, st.key_counter))
+        };
+        match ownership(name, bound, proof, deregister_payload)? {
+            Ownership::Keyless => {}
+            Ownership::Unproven => {
+                return Err(MailErr::ProofRequired {
+                    agent: agent.name.to_string(),
+                })
+            }
+            Ownership::Proven(counter) => {
+                let mut st = agent.inner.lock();
+                if counter <= st.key_counter {
+                    return Err(MailErr::StaleCounter {
+                        room: String::new(),
+                        last: st.key_counter,
+                    });
+                }
+                st.key_counter = counter;
+            }
+        }
         let until_ms = self.now_ms() + self.retention.name_hold.as_millis() as u64;
-        match state.remove_agent(&name.folded(), until_ms) {
+        // Only the registration that was checked: one that replaced it since
+        // has not been proven.
+        match state.remove_agent(&key, Some(agent.gen), until_ms) {
             Some((agent, discarded)) => Ok(DiscardOutcome {
                 agent: agent.name.to_string(),
                 discarded,
@@ -810,7 +863,7 @@ impl Bus {
             ..SweepOutcome::default()
         };
         for key in stale {
-            if let Some((agent, discarded)) = state.remove_agent(&key, until_ms) {
+            if let Some((agent, discarded)) = state.remove_agent(&key, None, until_ms) {
                 out.discarded += discarded;
                 out.dropped_agents.push(agent.name.to_string());
             }

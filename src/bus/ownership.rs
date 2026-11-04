@@ -1,12 +1,15 @@
 //! Who owns a name: the proof check behind a `reclaim`
-//! ([`Bus::register_with`](super::Bus::register_with)).
+//! ([`Bus::register_with`](super::Bus::register_with)) and a `deregister`
+//! ([`Bus::deregister_with`](super::Bus::deregister_with)).
 //!
 //! A registration that bound a key is owned by the holder of that key, shown
-//! by a signature over the operation's payload ([`reclaim_payload`]) at a
-//! counter above every one the key has used. A registration that bound no key
-//! cannot be proven; each operation decides what that means.
+//! by a signature over the operation's payload ([`reclaim_payload`] or
+//! [`deregister_payload`]) at a counter above every one the key has used. A
+//! registration that bound no key cannot be proven; each operation decides
+//! what that means.
 //!
 //! [`reclaim_payload`]: crate::signed::reclaim_payload
+//! [`deregister_payload`]: crate::signed::deregister_payload
 
 use super::model::KeyProof;
 use super::MailErr;

@@ -50,15 +50,31 @@ fn public_key(params: &Value, key: &str) -> Result<PublicKey, MailboxError> {
 pub async fn register(bus: &Bus, params: &Value) -> Result<Value, MailboxError> {
     let (name, opts) = registration(params)?;
     let opts = crate::bus::Registration {
-        proof: reclaim_proof(params)?,
+        proof: key_proof(params)?,
         ..opts
     };
     Ok(to_wire(bus.register_with(&name, opts).await?))
 }
 
-/// The reclaim proof in `params`: `counter` and `signature` together, or
+/// `DELETE /agents/{agent}` with `counter` and `signature` (query
+/// parameters, together or neither): leave the roster, with the proof a
+/// key-bound name needs (see [`Bus::deregister_with`]). The deregister tool
+/// has no proof parameters, so over MCP only a keyless name can leave.
+///
+/// # Errors
+///
+/// See [`Bus::deregister_with`], plus `invalid_name`, `invalid_signature`
+/// for a signature that does not parse, and `invalid_body` for a bad
+/// `counter` or one of the two without the other.
+pub async fn deregister(bus: &Bus, agent: &str, params: &Value) -> Result<Value, MailboxError> {
+    let agent = AgentName::parse(agent)?;
+    let proof = key_proof(params)?;
+    Ok(to_wire(bus.deregister_with(&agent, proof).await?))
+}
+
+/// The key proof in `params`: `counter` and `signature` together, or
 /// neither.
-fn reclaim_proof(params: &Value) -> Result<Option<KeyProof>, MailboxError> {
+fn key_proof(params: &Value) -> Result<Option<KeyProof>, MailboxError> {
     let given = |key: &str| params.get(key).filter(|v| !v.is_null());
     match (given("counter"), given("signature")) {
         (None, None) => Ok(None),
@@ -105,7 +121,7 @@ fn parse_op(params: &Value) -> Result<SignedOp, MailboxError> {
         .map_err(|_| MailboxError::InvalidBody)?;
     let own = |key: &str| text(params, key).map(str::to_string);
     Ok(match kind {
-        OpKind::RegisterKey | OpKind::PublishKeyPackages | OpKind::Reclaim => {
+        OpKind::RegisterKey | OpKind::PublishKeyPackages | OpKind::Reclaim | OpKind::Deregister => {
             return Err(MailboxError::InvalidBody)
         }
         OpKind::Create => SignedOp::Create {

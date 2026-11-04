@@ -33,7 +33,8 @@ use super::http::query_escape;
 use super::identity::write_private;
 use super::{ClientError, Daemon, Identity};
 use crate::signed::{
-    hex_decode_vec, hex_encode, key_packages_payload, register_key_payload, PublicKey, SignedOp,
+    hex_decode_vec, hex_encode, key_packages_payload, reclaim_payload, register_key_payload,
+    PublicKey, SignedOp,
 };
 
 /// The one ciphersuite: X25519 HPKE, AES-128-GCM, SHA-256, Ed25519.
@@ -328,6 +329,54 @@ impl Client {
     pub async fn register(&self, reclaim: bool) -> Result<Value, ClientError> {
         let body = json!({ "agent": self.agent(), "reclaim": reclaim });
         self.daemon.call("POST", "/agents", Some(&body)).await
+    }
+
+    /// Take this identity's name back with `reclaim` and a proof signed by its
+    /// key, through `POST /agents`: how an agent whose registration is still
+    /// on the roster, or held, gets it back after a restart. `args` are the
+    /// register tool's arguments (`provider`, `description`); `agent`,
+    /// `reclaim`, `counter` and `signature` are set here. Retries once with a
+    /// higher counter if the daemon says the counter fell behind.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Daemon`]: `name_taken` when the name is registered with
+    /// no key bound, `invalid_signature` when it is bound (or, while held,
+    /// was bound) to another key.
+    pub async fn reclaim(&mut self, args: &Value) -> Result<Value, ClientError> {
+        for attempt in 0..2 {
+            let counter = self.next_counter();
+            let signature = self
+                .identity
+                .keypair()
+                .sign(&reclaim_payload(self.agent(), counter));
+            let body: serde_json::Map<String, Value> = args
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .chain([
+                    ("agent".to_string(), json!(self.agent())),
+                    ("reclaim".to_string(), json!(true)),
+                    ("counter".to_string(), json!(counter)),
+                    ("signature".to_string(), json!(signature.to_hex())),
+                ])
+                .collect();
+            match self
+                .daemon
+                .call("POST", "/agents", Some(&body.into()))
+                .await
+            {
+                Err(ClientError::Daemon { code, body, .. })
+                    if code == "stale_counter" && attempt == 0 =>
+                {
+                    let last = body.get("last").and_then(Value::as_u64).unwrap_or(0);
+                    self.last_counter = self.last_counter.max(last);
+                }
+                other => return other,
+            }
+        }
+        Err(ClientError::Usage("counter retry exhausted".into()))
     }
 
     /// Bind this identity's key to the name and make sure

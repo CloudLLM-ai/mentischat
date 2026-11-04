@@ -109,7 +109,8 @@ trust-on-first-use:
   Ed25519 signature over the `mentischat/reclaim/v1` payload (name and
   counter) under the bound key, at a counter above every one the key has
   used for KeyPackages and reclaims. A registered name with no key is never
-  taken back. The `register` tool has no proof fields.
+  taken back. The `register` tool has no proof fields; the client proxy
+  signs the proof when its agent calls `register` with `reclaim: true`.
 - `GET /agents/{agent}/key` returns the bound key, which is how an inviter
   finds the key to pin for an invitee.
 - Keys live in memory with the roster entry, and with the hold that follows

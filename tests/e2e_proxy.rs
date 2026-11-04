@@ -685,3 +685,85 @@ async fn a_rolled_back_daemon_shows_as_a_warning_in_check_inbox() {
         "{body}"
     );
 }
+
+/// A restarted proxy takes back its own name, still registered or held,
+/// with a reclaim it signs, and a proxy with another key for the same name
+/// cannot. The harness only ever passes `reclaim: true`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restarted_proxy_reclaims_its_own_name_and_an_impostor_cannot() {
+    let w = world().await;
+    let mut first = w.harness("vega");
+    let (err, out) = first.tool("register", json!({ "agent": "vega" })).await;
+    assert!(!err, "{out}");
+    assert_eq!(out["secure"], true, "{out}");
+    drop(first);
+
+    // The same identity after a restart: the name is still registered.
+    let mut again = w.harness("vega");
+    let list = again.rpc("tools/list", json!({})).await;
+    let register = list["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "register")
+        .unwrap()
+        .clone();
+    let reclaim_doc = register["inputSchema"]["properties"]["reclaim"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(reclaim_doc.contains("proves"), "{reclaim_doc}");
+    let (err, out) = again.tool("register", json!({ "agent": "vega" })).await;
+    assert!(err && out["error"] == "name_taken", "{out}");
+    let (err, out) = again
+        .tool(
+            "register",
+            json!({ "agent": "vega", "reclaim": true, "description": "back" }),
+        )
+        .await;
+    assert!(!err, "{out}");
+    assert_eq!(
+        (out["created"].as_bool(), out["secure"].as_bool()),
+        (Some(false), Some(true)),
+        "{out}"
+    );
+    assert_eq!(out["description"], "back");
+
+    // Another key for the name: its signed reclaim does not verify.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let id = Identity::open(elsewhere.path(), "vega").unwrap();
+    let mut impostor = Harness::spawn_with(
+        Client::open(id, w.daemon).unwrap(),
+        w.daemon,
+        Default::default(),
+    );
+    let (err, out) = impostor
+        .tool("register", json!({ "agent": "vega", "reclaim": true }))
+        .await;
+    assert!(err && out["error"] == "invalid_signature", "{out}");
+
+    // After a deregister the hold keeps the key: the impostor still fails,
+    // the owner gets the name back.
+    let (err, out) = again.tool("deregister", json!({ "agent": "vega" })).await;
+    assert!(!err, "{out}");
+    let (err, out) = impostor
+        .tool("register", json!({ "agent": "vega", "reclaim": "true" }))
+        .await;
+    assert!(err && out["error"] == "invalid_signature", "{out}");
+    let (err, out) = again
+        .tool("register", json!({ "agent": "vega", "reclaim": true }))
+        .await;
+    assert!(!err, "{out}");
+    assert_eq!(
+        (out["created"].as_bool(), out["secure"].as_bool()),
+        (Some(true), Some(true)),
+        "{out}"
+    );
+    assert!(
+        w.bus
+            .agent_key(&mentischat::names::AgentName::parse("vega").unwrap())
+            .await
+            .unwrap()
+            .is_some(),
+        "the proxy bound its key again"
+    );
+}

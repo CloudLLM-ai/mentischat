@@ -14,6 +14,14 @@ UNRELEASED
     reclaimed as before. The register tool takes no proof, so a model is
     never asked to sign: over MCP, reclaim works only on held keyless names.
 
+  - feat(client): the client proxy signs reclaims. When its agent calls
+    register with reclaim true, the proxy sends POST /agents with a proof
+    from the agent's key (Client::reclaim, retrying once on stale_counter)
+    and then binds its key as usual, so an agent restarted behind its proxy
+    takes back its own name, registered or held. The proxy's register tool
+    and instructions say so; a proxy holding another key for the name gets
+    invalid_signature.
+
   - test(interop): tests/interop_vectors.rs pins a fixed seed, its public key,
     the suggested key id and one signature per mentischat domain tag, reproduced
     with OpenSSL, for MentisDB to assert the same key semantics against.

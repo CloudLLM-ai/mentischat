@@ -33,14 +33,15 @@ use tokio::time::Instant;
 
 use crate::errors::TakenReason;
 use crate::names::{AgentName, RoomName};
+use crate::signed::reclaim_payload;
 
 mod clock;
 mod convos;
 mod delivery;
 mod log;
 mod model;
+mod ownership;
 mod park;
-mod reclaim;
 mod rooms;
 mod sharded;
 mod signed;
@@ -51,11 +52,10 @@ mod stream;
 
 pub use clock::{now_rfc3339, rfc3339};
 pub use model::{
-    parse_duration, AgentOverview, DiscardOutcome, HistoryPage, InboxPage, Message, Overview,
-    ReclaimProof, RegisterOutcome, Registration, Retention, RosterEntry, RosterListing,
-    SendReceipt, Stats, SweepOutcome, MAX_BATCH, MAX_BODY_BYTES, MAX_DESCRIPTION_BYTES,
-    MAX_PENDING_PER_AGENT, MAX_RETURN_BYTES, MAX_ROSTER, MAX_TOTAL_MESSAGES, MAX_WAITERS_PER_AGENT,
-    MAX_WAIT_MS,
+    parse_duration, AgentOverview, DiscardOutcome, HistoryPage, InboxPage, KeyProof, Message,
+    Overview, RegisterOutcome, Registration, Retention, RosterEntry, RosterListing, SendReceipt,
+    Stats, SweepOutcome, MAX_BATCH, MAX_BODY_BYTES, MAX_DESCRIPTION_BYTES, MAX_PENDING_PER_AGENT,
+    MAX_RETURN_BYTES, MAX_ROSTER, MAX_TOTAL_MESSAGES, MAX_WAITERS_PER_AGENT, MAX_WAIT_MS,
 };
 pub use model::{
     LeaveOutcome, RoomEntry, RoomInfo, RoomListing, DEFAULT_ROOM_CAPACITY, MAX_RETAINED_BYTES,
@@ -77,8 +77,8 @@ pub use stream::{Push, StreamSession};
 use clock::{rfc3339_ms, unix_ms, Clock};
 use delivery::{history_page, history_rows};
 use log::{json_len, Msg};
+use ownership::{ownership, Ownership};
 use park::{ParkGuard, Signal};
-use reclaim::{ownership, Ownership};
 use state::{Agent, Key, Page, Pulled, State};
 
 type MailErr = crate::errors::MailboxError;
@@ -280,7 +280,8 @@ impl Bus {
                     let st = agent.inner.lock();
                     st.key.map(|k| (k, st.key_counter))
                 };
-                if let Ownership::Proven(counter) = ownership(name, bound, opts.proof)? {
+                let owned = ownership(name, bound, opts.proof, reclaim_payload)?;
+                if let Ownership::Proven(counter) = owned {
                     return refresh_agent(&agent, counter, now, provider, description);
                 }
             }
@@ -292,7 +293,8 @@ impl Bus {
             None => 0,
             Some(h) => {
                 let owned = if opts.reclaim {
-                    ownership(name, h.key.map(|k| (k.key, k.counter)), opts.proof)?
+                    let bound = h.key.map(|k| (k.key, k.counter));
+                    ownership(name, bound, opts.proof, reclaim_payload)?
                 } else {
                     Ownership::Unproven
                 };

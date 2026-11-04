@@ -8,7 +8,7 @@
 
 use serde_json::Value;
 
-use crate::bus::{Bus, ReclaimProof, SignedRequest};
+use crate::bus::{Bus, KeyProof, SignedRequest};
 use crate::errors::MailboxError;
 use crate::names::{AgentName, RoomName};
 use crate::signed::{hex_decode_vec, OpKind, PublicKey, Signature, SignedOp};
@@ -37,7 +37,7 @@ fn public_key(params: &Value, key: &str) -> Result<PublicKey, MailboxError> {
 /// `POST /agents` `{ "agent", "provider"?, "description"?, "reclaim"?,
 /// "counter"?, "signature"? }`: the register tool's parameters plus an
 /// optional reclaim proof, `counter` and `signature` together (see
-/// [`ReclaimProof`]). The proof is how a client holding a name's key takes
+/// [`KeyProof`]). The proof is how a client holding a name's key takes
 /// the name back; the register tool has no proof parameters, so a model is
 /// never asked to sign.
 ///
@@ -58,11 +58,11 @@ pub async fn register(bus: &Bus, params: &Value) -> Result<Value, MailboxError> 
 
 /// The reclaim proof in `params`: `counter` and `signature` together, or
 /// neither.
-fn reclaim_proof(params: &Value) -> Result<Option<ReclaimProof>, MailboxError> {
+fn reclaim_proof(params: &Value) -> Result<Option<KeyProof>, MailboxError> {
     let given = |key: &str| params.get(key).filter(|v| !v.is_null());
     match (given("counter"), given("signature")) {
         (None, None) => Ok(None),
-        (Some(counter), Some(_)) => Ok(Some(ReclaimProof {
+        (Some(counter), Some(_)) => Ok(Some(KeyProof {
             counter: uint(counter).ok_or(MailboxError::InvalidBody)?,
             signature: signature(params)?,
         })),

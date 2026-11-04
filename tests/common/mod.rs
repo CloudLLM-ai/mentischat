@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use mentischat::bus::{Bus, ReclaimProof, Registration, Retention, Stats};
+use mentischat::bus::{Bus, KeyProof, Registration, Retention, Stats};
 use mentischat::names::{AgentName, RoomName};
 use mentischat::signed::{reclaim_payload, register_key_payload, Keypair};
 
@@ -62,8 +62,8 @@ pub async fn bind_key(bus: &Bus, agent: &str, seed: u8) -> Keypair {
 }
 
 /// A reclaim proof for `agent` at `counter`, signed by `keys`.
-pub fn proof(keys: &Keypair, agent: &str, counter: u64) -> ReclaimProof {
-    ReclaimProof {
+pub fn proof(keys: &Keypair, agent: &str, counter: u64) -> KeyProof {
+    KeyProof {
         counter,
         signature: keys.sign(&reclaim_payload(agent, counter)),
     }

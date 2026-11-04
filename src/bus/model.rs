@@ -95,33 +95,35 @@ pub struct Registration {
     pub reclaim: bool,
     /// The signature that proves the caller holds the key bound to the name,
     /// for a `reclaim`. Ignored when the name needs none.
-    pub proof: Option<ReclaimProof>,
+    pub proof: Option<KeyProof>,
 }
 
-/// Proof that a `reclaim` comes from the holder of the name's key: a
-/// signature over [`reclaim_payload`](crate::signed::reclaim_payload) for the
-/// name and `counter`, under the key bound to the name (or to the
-/// registration whose name is held).
+/// Proof that an operation on a name comes from the holder of the key bound
+/// to it (or to the registration whose name is held): a signature, under that
+/// key, over the operation's payload for the name and `counter`
+/// ([`reclaim_payload`](crate::signed::reclaim_payload) for a reclaim).
+/// Each operation has its own payload, so a proof for one is never valid for
+/// another.
 ///
 /// # Examples
 ///
 /// ```
-/// use mentischat::bus::ReclaimProof;
+/// use mentischat::bus::KeyProof;
 /// use mentischat::signed::{reclaim_payload, Keypair};
 ///
 /// let keys = Keypair::from_seed([7; 32]);
-/// let proof = ReclaimProof {
+/// let proof = KeyProof {
 ///     counter: 1,
 ///     signature: keys.sign(&reclaim_payload("Vega", 1)),
 /// };
 /// assert!(keys.public().verify(&reclaim_payload("vega", 1), &proof.signature).is_ok());
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReclaimProof {
+pub struct KeyProof {
     /// Above every counter the key has used: the counter of its last
-    /// KeyPackage publish or reclaim. A lower one fails `stale_counter`.
+    /// KeyPackage publish or name proof. A lower one fails `stale_counter`.
     pub counter: u64,
-    /// The signature over the reclaim payload.
+    /// The signature over the operation's payload.
     pub signature: crate::signed::Signature,
 }
 

@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mentischat::bus::{Bus, KeyProof, Registration, Retention, Stats};
 use mentischat::names::{AgentName, RoomName};
-use mentischat::signed::{reclaim_payload, register_key_payload, Keypair};
+use mentischat::signed::{deregister_payload, reclaim_payload, register_key_payload, Keypair};
 
 pub fn name(s: &str) -> AgentName {
     AgentName::parse(s).expect("valid test name")
@@ -66,6 +66,14 @@ pub fn proof(keys: &Keypair, agent: &str, counter: u64) -> KeyProof {
     KeyProof {
         counter,
         signature: keys.sign(&reclaim_payload(agent, counter)),
+    }
+}
+
+/// A deregister proof for `agent` at `counter`, signed by `keys`.
+pub fn deregister_proof(keys: &Keypair, agent: &str, counter: u64) -> KeyProof {
+    KeyProof {
+        counter,
+        signature: keys.sign(&deregister_payload(agent, counter)),
     }
 }
 

@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{bus_with, fresh_bus, name, proven_reclaim, register, room};
+use common::{bus_with, deregister_proof, fresh_bus, name, proven_reclaim, register, room};
 use mentischat::bus::{Bus, Retention, SignedOutcome, SignedRequest};
 use mentischat::errors::MailboxError;
 use mentischat::signed::{
@@ -216,6 +216,7 @@ fn payloads_start_with_a_per_operation_domain_tag() {
         OpKind::Welcome,
         OpKind::PublishKeyPackages,
         OpKind::Reclaim,
+        OpKind::Deregister,
     ]
     .into_iter()
     .map(domain_tag)
@@ -265,6 +266,7 @@ fn op_kinds_roundtrip_through_strings() {
         OpKind::Welcome,
         OpKind::PublishKeyPackages,
         OpKind::Reclaim,
+        OpKind::Deregister,
     ] {
         assert_eq!(kind.to_string().parse::<OpKind>(), Ok(kind));
     }
@@ -369,8 +371,13 @@ async fn a_binding_dies_with_the_registration() {
     let (_d, bus) = fresh_bus("keydeath");
     let alice = Actor::new("alice", 1);
     alice.join_roster(&bus).await;
-    bus.deregister(&name("alice")).await.unwrap();
-    bus.register_with(&name("alice"), proven_reclaim(&alice.keys, "alice", 1))
+    bus.deregister_with(
+        &name("alice"),
+        Some(deregister_proof(&alice.keys, "alice", 1)),
+    )
+    .await
+    .unwrap();
+    bus.register_with(&name("alice"), proven_reclaim(&alice.keys, "alice", 2))
         .await
         .unwrap();
     assert!(bus.agent_key(&name("alice")).await.unwrap().is_none());
@@ -570,7 +577,9 @@ fn bus_without_holds(tag: &str) -> (tempfile::TempDir, std::sync::Arc<Bus>) {
 async fn a_name_taken_over_after_deregistering_is_not_a_member() {
     let (_d, bus) = bus_without_holds("takeover");
     let (_alice, bob) = alice_and_bob(&bus).await;
-    bus.deregister(&name("bob")).await.unwrap();
+    bus.deregister_with(&name("bob"), Some(deregister_proof(&bob.keys, "bob", 1)))
+        .await
+        .unwrap();
     // Eve registers as bob with her own key.
     bus.register(&name("bob")).await.unwrap();
     let eve = Actor::new("bob", 77);
@@ -690,7 +699,9 @@ async fn invitations_pin_the_invitees_key() {
         .do_op(&bus, "ops", 4, alice.invite_op(&bob))
         .await
         .unwrap();
-    bus.deregister(&name("bob")).await.unwrap();
+    bus.deregister_with(&name("bob"), Some(deregister_proof(&bob.keys, "bob", 1)))
+        .await
+        .unwrap();
     bus.register(&name("bob")).await.unwrap();
     let imposter = Actor::new("bob", 88);
     imposter.bind(&bus).await.unwrap();

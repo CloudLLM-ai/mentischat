@@ -143,6 +143,12 @@ pub enum MailboxError {
         /// The signed room.
         room: String,
     },
+    /// A `deregister` of a name whose registration bound a key, without a
+    /// proof signed by that key.
+    ProofRequired {
+        /// The key-bound agent.
+        agent: String,
+    },
     /// A signed operation whose signature does not verify under the key the
     /// signer is bound to, or a field of it that does not parse.
     InvalidSignature,
@@ -219,6 +225,7 @@ impl MailboxError {
             Self::TooManyRooms { .. } => "too_many_rooms",
             Self::RoomFull { .. } => "room_full",
             Self::SignatureRequired { .. } => "signature_required",
+            Self::ProofRequired { .. } => "proof_required",
             Self::InvalidSignature => "invalid_signature",
             Self::InvalidKey => "invalid_key",
             Self::KeyRequired { .. } => "key_required",
@@ -246,7 +253,9 @@ impl MailboxError {
             | Self::InvalidCursor
             | Self::InvalidKey
             | Self::InvalidLimit => StatusCode::BAD_REQUEST,
-            Self::SignatureRequired { .. } | Self::InvalidSignature => StatusCode::UNAUTHORIZED,
+            Self::SignatureRequired { .. }
+            | Self::ProofRequired { .. }
+            | Self::InvalidSignature => StatusCode::UNAUTHORIZED,
             Self::Unregistered { .. }
             | Self::RoomNotFound { .. }
             | Self::NoKeyPackage { .. }
@@ -315,7 +324,9 @@ impl MailboxError {
             Self::TooManyWaiters { agent, waiting } => {
                 json!({ "error": self.code(), "agent": agent, "waiting": waiting })
             }
-            Self::KeyRequired { agent } | Self::KeyConflict { agent } => {
+            Self::KeyRequired { agent }
+            | Self::KeyConflict { agent }
+            | Self::ProofRequired { agent } => {
                 json!({ "error": self.code(), "agent": agent })
             }
             Self::RateLimited { retry_after_ms } => {

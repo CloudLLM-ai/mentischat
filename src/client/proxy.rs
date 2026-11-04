@@ -125,8 +125,8 @@ fn initialize(params: &Value) -> Value {
     })
 }
 
-/// The daemon's tools, with `secure` added to `create_room` and `register`
-/// describing the reclaim this client can prove.
+/// The daemon's tools, with `secure` added to `create_room`, and `register`
+/// and `deregister` describing what this client can prove.
 async fn tools_list(daemon: Daemon) -> Result<Value, ClientError> {
     let reply = mcp_call(daemon, "tools/list", json!({})).await?;
     let mut tools = reply["tools"].clone();
@@ -138,6 +138,13 @@ async fn tools_list(daemon: Daemon) -> Result<Value, ClientError> {
             if let Some(d) = tool["description"].as_str() {
                 tool["description"] = json!(format!(
                     "{d} Through this client, reclaim: true also takes back your name while it is still registered: the client signs the proof."
+                ));
+            }
+        }
+        if tool["name"] == "deregister" {
+            if let Some(d) = tool["description"].as_str() {
+                tool["description"] = json!(format!(
+                    "{d} Through this client your own name can leave: the client signs the proof."
                 ));
             }
         }
@@ -189,6 +196,12 @@ fn wants_reclaim(args: &Value) -> bool {
     }
 }
 
+/// Whether the call's `agent` is the name this client holds the key for, in
+/// any case: only then can it sign for it.
+fn is_own_name(client: &Client, args: &Value) -> bool {
+    arg(args, "agent").is_some_and(|a| a.eq_ignore_ascii_case(client.agent()))
+}
+
 /// A string argument, if present and non-empty.
 fn arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key)
@@ -216,6 +229,7 @@ async fn call_tool(
         ("check_inbox", _) => return check_inbox(client, daemon, policy, args).await,
         ("join_room", None) => return join(client, daemon, args).await,
         ("register", _) => return register(client, daemon, args).await,
+        ("deregister", _) if is_own_name(client, args) => Some(client.deregister().await),
         _ => None,
     };
     match outcome {

@@ -986,3 +986,32 @@ async fn mcp_needs_no_bearer_token() {
         assert_eq!(resp.status().as_u16(), 200, "{authorization:?}");
     }
 }
+
+/// The deregister tool takes no proof, so over MCP a key-bound name cannot
+/// leave: the call fails `proof_required` and the agent stays registered.
+#[tokio::test]
+async fn the_deregister_tool_cannot_release_a_key_bound_name() {
+    use mentischat::signed::{register_key_payload, Keypair};
+    let (_d, app) = app();
+    let (err, _) = call(&app, "register", json!({ "agent": "Vega" })).await;
+    assert!(!err);
+    let keys = Keypair::from_seed([1; 32]);
+    let key = keys.public();
+    let body = json!({
+        "public_key": key.to_hex(),
+        "signature": keys.sign(&register_key_payload("Vega", &key)).to_hex(),
+    });
+    let req = http::Request::builder()
+        .method("PUT")
+        .uri("/agents/Vega/key")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), 200);
+
+    let (err, out) = call(&app, "deregister", json!({ "agent": "vega" })).await;
+    assert!(err, "{out}");
+    assert_eq!(out["error"], "proof_required");
+    let (_, roster) = call(&app, "list_agents", json!({})).await;
+    assert_eq!(roster["agents"][0]["name"], "Vega", "still registered");
+}

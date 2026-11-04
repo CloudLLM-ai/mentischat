@@ -33,8 +33,8 @@ use super::http::query_escape;
 use super::identity::write_private;
 use super::{ClientError, Daemon, Identity};
 use crate::signed::{
-    hex_decode_vec, hex_encode, key_packages_payload, reclaim_payload, register_key_payload,
-    PublicKey, SignedOp,
+    deregister_payload, hex_decode_vec, hex_encode, key_packages_payload, reclaim_payload,
+    register_key_payload, PublicKey, Signature, SignedOp,
 };
 
 /// The one ciphersuite: X25519 HPKE, AES-128-GCM, SHA-256, Ed25519.
@@ -335,8 +335,7 @@ impl Client {
     /// key, through `POST /agents`: how an agent whose registration is still
     /// on the roster, or held, gets it back after a restart. `args` are the
     /// register tool's arguments (`provider`, `description`); `agent`,
-    /// `reclaim`, `counter` and `signature` are set here. Retries once with a
-    /// higher counter if the daemon says the counter fell behind.
+    /// `reclaim`, `counter` and `signature` are set here.
     ///
     /// # Errors
     ///
@@ -344,29 +343,65 @@ impl Client {
     /// no key bound, `invalid_signature` when it is bound (or, while held,
     /// was bound) to another key.
     pub async fn reclaim(&mut self, args: &Value) -> Result<Value, ClientError> {
-        for attempt in 0..2 {
-            let counter = self.next_counter();
-            let signature = self
-                .identity
-                .keypair()
-                .sign(&reclaim_payload(self.agent(), counter));
-            let body: serde_json::Map<String, Value> = args
-                .as_object()
-                .into_iter()
-                .flatten()
-                .map(|(k, v)| (k.clone(), v.clone()))
+        let agent = self.agent().to_string();
+        let fields: Vec<(String, Value)> = args
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        self.call_proven(reclaim_payload, |counter, signature| {
+            let body: serde_json::Map<String, Value> = fields
+                .iter()
+                .cloned()
                 .chain([
-                    ("agent".to_string(), json!(self.agent())),
+                    ("agent".to_string(), json!(agent)),
                     ("reclaim".to_string(), json!(true)),
                     ("counter".to_string(), json!(counter)),
                     ("signature".to_string(), json!(signature.to_hex())),
                 ])
                 .collect();
-            match self
-                .daemon
-                .call("POST", "/agents", Some(&body.into()))
-                .await
-            {
+            ("POST", "/agents".to_string(), Some(body.into()))
+        })
+        .await
+    }
+
+    /// Take this identity's name off the roster with a proof signed by its
+    /// key, through `DELETE /agents/{agent}`: a name bound to a key leaves
+    /// only so. The daemon ignores the proof for a keyless name.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Daemon`]: `unregistered`, or `invalid_signature` when
+    /// the name is bound to another key.
+    pub async fn deregister(&mut self) -> Result<Value, ClientError> {
+        let agent = query_escape(self.agent());
+        self.call_proven(deregister_payload, |counter, signature| {
+            let path = format!(
+                "/agents/{agent}?counter={counter}&signature={}",
+                signature.to_hex()
+            );
+            ("DELETE", path, None)
+        })
+        .await
+    }
+
+    /// Sign `payload` for this identity's name at a fresh counter and send
+    /// the request `request` builds from the counter and signature. Retries
+    /// once with a higher counter if the daemon says the counter fell behind.
+    async fn call_proven(
+        &mut self,
+        payload: fn(&str, u64) -> Vec<u8>,
+        request: impl Fn(u64, &Signature) -> (&'static str, String, Option<Value>),
+    ) -> Result<Value, ClientError> {
+        for attempt in 0..2 {
+            let counter = self.next_counter();
+            let signature = self
+                .identity
+                .keypair()
+                .sign(&payload(self.agent(), counter));
+            let (method, path, body) = request(counter, &signature);
+            match self.daemon.call(method, &path, body.as_ref()).await {
                 Err(ClientError::Daemon { code, body, .. })
                     if code == "stale_counter" && attempt == 0 =>
                 {

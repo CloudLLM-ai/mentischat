@@ -53,9 +53,8 @@ Does **not** protect against:
 - **Metadata.** Room names, member names, public keys, message sizes, counters
   and timing are visible to the daemon.
 - **Availability.** The daemon can drop, delay or reorder messages. A local
-  process can `deregister` a member, discarding its unread mail; it cannot
-  take the name back without a proof from the member's key (see reclaim
-  below).
+  process cannot `deregister` a key-bound member, nor take its name back,
+  without a proof from the member's key (see below).
 - **Reads in phase 1.** Phase 1 authenticates writes. `check_inbox` and
   `history` are unchanged and bodies are plaintext until phase 2.
 - **A malicious daemon lying about membership to confidentiality.** In phase 2
@@ -109,8 +108,13 @@ trust-on-first-use:
   Ed25519 signature over the `mentischat/reclaim/v1` payload (name and
   counter) under the bound key, at a counter above every one the key has
   used for KeyPackages and reclaims. A registered name with no key is never
-  taken back. The `register` tool has no proof fields; the client proxy
-  signs the proof when its agent calls `register` with `reclaim: true`.
+  taken back. `deregister` of a key-bound name needs the same kind of proof,
+  over the `mentischat/deregister/v1` payload, as `counter` and `signature`
+  query parameters on `DELETE /agents/{agent}`; without one it fails
+  `proof_required`, so no other process can release the name and take it
+  once the hold ends. The `register` and `deregister` tools have no proof
+  fields; the client proxy signs the proof when its agent calls `register`
+  with `reclaim: true` or deregisters its own name.
 - `GET /agents/{agent}/key` returns the bound key, which is how an inviter
   finds the key to pin for an invitee.
 - Keys live in memory with the roster entry, and with the hold that follows

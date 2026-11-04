@@ -11,7 +11,9 @@ use tower::ServiceExt;
 
 use mentischat::bus::Bus;
 use mentischat::rest;
-use mentischat::signed::{reclaim_payload, register_key_payload, Envelope, Keypair, SignedOp};
+use mentischat::signed::{
+    deregister_payload, reclaim_payload, register_key_payload, Envelope, Keypair, SignedOp,
+};
 
 fn app() -> (tempfile::TempDir, Router) {
     let dir = tempfile::tempdir().unwrap();
@@ -309,4 +311,61 @@ async fn post_agents_reclaims_a_key_bound_name_with_a_signed_proof() {
         let (s, v) = call(&app, "POST", "/agents", Some(bad.clone())).await;
         assert_eq!(v["error"].as_str(), Some(error), "{bad} -> {s} {v}");
     }
+}
+
+/// `DELETE /agents/{agent}` releases a key-bound name only with `counter` and
+/// `signature` query parameters signed by its key, and maps each failure.
+#[tokio::test]
+async fn delete_agents_needs_a_signed_proof_for_a_key_bound_name() {
+    let (_d, app) = app();
+    let owner = Keypair::from_seed([1; 32]);
+    enroll(&app, "Vega", &owner).await;
+    let uri = |keys: &Keypair, counter: u64| {
+        let sig = keys.sign(&deregister_payload("vega", counter));
+        format!("/agents/vega?counter={counter}&signature={}", sig.to_hex())
+    };
+
+    let (s, v) = call(&app, "DELETE", "/agents/vega", None).await;
+    assert_eq!(
+        (s, v["error"].as_str(), v["agent"].as_str()),
+        (401, Some("proof_required"), Some("Vega")),
+        "{v}"
+    );
+    let stranger = Keypair::from_seed([9; 32]);
+    let (s, v) = call(&app, "DELETE", &uri(&stranger, 5), None).await;
+    assert_eq!(
+        (s, v["error"].as_str()),
+        (401, Some("invalid_signature")),
+        "{v}"
+    );
+    let reclaim_sig = owner.sign(&reclaim_payload("vega", 5)).to_hex();
+    let (s, v) = call(
+        &app,
+        "DELETE",
+        &format!("/agents/vega?counter=5&signature={reclaim_sig}"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        (s, v["error"].as_str()),
+        (401, Some("invalid_signature")),
+        "{v}"
+    );
+    for bad in [
+        "/agents/vega?counter=5",
+        "/agents/vega?signature=00",
+        "/agents/vega?counter=x&signature=00",
+    ] {
+        let (s, v) = call(&app, "DELETE", bad, None).await;
+        assert_eq!(
+            (s, v["error"].as_str()),
+            (400, Some("invalid_body")),
+            "{bad} {v}"
+        );
+    }
+
+    let (s, v) = call(&app, "DELETE", &uri(&owner, 5), None).await;
+    assert_eq!((s, v["agent"].as_str()), (200, Some("Vega")), "{v}");
+    let (s, v) = call(&app, "GET", "/agents/vega/key", None).await;
+    assert_eq!((s, v["error"].as_str()), (404, Some("unregistered")), "{v}");
 }

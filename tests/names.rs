@@ -6,7 +6,10 @@ mod common;
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime};
 
-use common::{bind_key, bus_with, bus_with_clock, fresh_bus, name, proof, proven_reclaim, reclaim};
+use common::{
+    bind_key, bus_with, bus_with_clock, deregister_proof, fresh_bus, name, proof, proven_reclaim,
+    reclaim,
+};
 use mentischat::bus::{rfc3339, Bus, Registration, Retention};
 use mentischat::errors::{MailboxError, TakenReason};
 use mentischat::names::{AgentName, SUGGESTED_NAMES, SUGGESTION_COUNT};
@@ -514,7 +517,9 @@ async fn a_held_key_bound_name_needs_its_keys_proof() {
     let (_d, bus) = fresh_bus("keyed_hold");
     bus.register(&name("Vega")).await.unwrap();
     let owner = bind_key(&bus, "Vega", 1).await;
-    bus.deregister(&name("Vega")).await.unwrap();
+    bus.deregister_with(&name("Vega"), Some(deregister_proof(&owner, "Vega", 1)))
+        .await
+        .unwrap();
     let stranger = mentischat::signed::Keypair::from_seed([9; 32]);
 
     let err = bus
@@ -538,14 +543,17 @@ async fn a_held_key_bound_name_needs_its_keys_proof() {
     );
 }
 
-/// The counter a held reclaim used carries into the new registration and the
-/// hold after it, so the same proof cannot be replayed through either.
+/// The counter a held reclaim used carries into the new registration, and a
+/// deregister's into the hold after it, so no proof can be replayed through
+/// either.
 #[tokio::test]
 async fn a_held_reclaim_proof_cannot_be_replayed() {
     let (_d, bus) = fresh_bus("held_replay");
     bus.register(&name("Vega")).await.unwrap();
     let owner = bind_key(&bus, "Vega", 1).await;
-    bus.deregister(&name("Vega")).await.unwrap();
+    bus.deregister_with(&name("Vega"), Some(deregister_proof(&owner, "Vega", 1)))
+        .await
+        .unwrap();
     bus.register_with(&name("Vega"), proven_reclaim(&owner, "Vega", 5))
         .await
         .unwrap();
@@ -555,14 +563,16 @@ async fn a_held_reclaim_proof_cannot_be_replayed() {
             .await,
         Err(MailboxError::StaleCounter { last: 5, .. })
     ));
-    bus.deregister(&name("Vega")).await.unwrap();
+    bus.deregister_with(&name("Vega"), Some(deregister_proof(&owner, "Vega", 6)))
+        .await
+        .unwrap();
     assert!(matches!(
         bus.register_with(&name("Vega"), proven_reclaim(&owner, "Vega", 5))
             .await,
-        Err(MailboxError::StaleCounter { last: 5, .. })
+        Err(MailboxError::StaleCounter { last: 6, .. })
     ));
     assert!(
-        bus.register_with(&name("Vega"), proven_reclaim(&owner, "Vega", 6))
+        bus.register_with(&name("Vega"), proven_reclaim(&owner, "Vega", 7))
             .await
             .unwrap()
             .created
@@ -582,4 +592,77 @@ async fn a_held_keyless_name_is_reclaimed_without_proof() {
             .unwrap()
             .created
     );
+}
+
+/// A key-bound name leaves the roster only with a deregister proof from its
+/// own key. Without one it fails `proof_required` and stays registered with
+/// its mail; another key's proof, a reclaim proof, or a reused counter fail
+/// too. So no other caller can release it, and so none can take it once the
+/// hold ends.
+#[tokio::test]
+async fn a_key_bound_name_leaves_only_with_its_keys_proof() {
+    let (_d, bus) = fresh_bus("keyed_leave");
+    bus.register(&name("Vega")).await.unwrap();
+    let owner = bind_key(&bus, "Vega", 1).await;
+    bus.register(&name("orion")).await.unwrap();
+    bus.send(&name("orion"), &name("Vega"), "for vega".into())
+        .await
+        .unwrap();
+    let stranger = mentischat::signed::Keypair::from_seed([9; 32]);
+
+    match bus.deregister(&name("vega")).await {
+        Err(MailboxError::ProofRequired { agent }) => assert_eq!(agent, "Vega"),
+        other => panic!("expected proof_required, got {other:?}"),
+    }
+    assert!(matches!(
+        bus.deregister_with(&name("vega"), Some(deregister_proof(&stranger, "vega", 3)))
+            .await,
+        Err(MailboxError::InvalidSignature)
+    ));
+    assert!(
+        matches!(
+            bus.deregister_with(&name("vega"), Some(proof(&owner, "vega", 3)))
+                .await,
+            Err(MailboxError::InvalidSignature)
+        ),
+        "a reclaim proof is not a deregister proof"
+    );
+    assert!(matches!(
+        bus.deregister_with(&name("vega"), Some(deregister_proof(&owner, "vega", 0)))
+            .await,
+        Err(MailboxError::StaleCounter { last: 0, .. })
+    ));
+    let page = bus.check_inbox(&name("Vega"), 0).await.unwrap();
+    assert_eq!(
+        page.messages.len(),
+        1,
+        "every refused deregister kept the mail"
+    );
+
+    let out = bus
+        .deregister_with(&name("vega"), Some(deregister_proof(&owner, "vega", 3)))
+        .await
+        .unwrap();
+    assert_eq!(out.agent, "Vega");
+    assert!(bus
+        .list_agents()
+        .await
+        .unwrap()
+        .agents
+        .iter()
+        .all(|a| a.name != "Vega"));
+}
+
+/// A keyless name leaves without proof, and a proof sent anyway is ignored.
+#[tokio::test]
+async fn a_keyless_name_leaves_without_proof() {
+    let (_d, bus) = fresh_bus("keyless_leave");
+    bus.register(&name("Vega")).await.unwrap();
+    bus.register(&name("Lyra")).await.unwrap();
+    let anyone = mentischat::signed::Keypair::from_seed([9; 32]);
+    assert!(bus.deregister(&name("Vega")).await.is_ok());
+    assert!(bus
+        .deregister_with(&name("Lyra"), Some(deregister_proof(&anyone, "Lyra", 1)))
+        .await
+        .is_ok());
 }

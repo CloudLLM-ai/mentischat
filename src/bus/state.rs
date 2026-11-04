@@ -1033,9 +1033,18 @@ impl State {
     /// addressed to it, read or not, wake its parked pulls (they fail
     /// `unregistered`) and hold the name until `until_ms`. Messages it sent
     /// stay with their recipients. Returns the agent and how many messages
-    /// were discarded; `None` when it is not on the roster.
-    pub(super) fn remove_agent(&self, key: &str, until_ms: u64) -> Option<(Arc<Agent>, i64)> {
+    /// were discarded; `None` when it is not on the roster, or when `gen` is
+    /// given and the name's registration is no longer that one.
+    pub(super) fn remove_agent(
+        &self,
+        key: &str,
+        gen: Option<u64>,
+        until_ms: u64,
+    ) -> Option<(Arc<Agent>, i64)> {
         let mut holds = self.holds.lock();
+        if gen.is_some_and(|g| self.roster.get(key).is_none_or(|a| a.gen != g)) {
+            return None;
+        }
         let agent = self.roster.remove(key)?;
         self.names.write().remove(key);
         let rooms;

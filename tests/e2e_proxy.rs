@@ -767,3 +767,42 @@ async fn a_restarted_proxy_reclaims_its_own_name_and_an_impostor_cannot() {
         "the proxy bound its key again"
     );
 }
+
+/// A proxy deregisters its own key-bound name by signing for it; a proxy with
+/// another key for the name, and a plain caller, cannot. A deregister naming
+/// another agent goes to the daemon unsigned and fails the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn only_the_key_holder_deregisters_a_key_bound_name() {
+    let w = world().await;
+    let mut vega = w.harness("vega");
+    let (err, out) = vega.tool("register", json!({ "agent": "vega" })).await;
+    assert!(!err && out["secure"] == true, "{out}");
+    let mut lyra = w.harness("lyra");
+    let (err, out) = lyra.tool("register", json!({ "agent": "lyra" })).await;
+    assert!(!err && out["secure"] == true, "{out}");
+
+    let vega_name = mentischat::names::AgentName::parse("vega").unwrap();
+    let plain = w.bus.deregister(&vega_name).await.unwrap_err();
+    assert_eq!(plain.code(), "proof_required");
+    let (err, out) = lyra.tool("deregister", json!({ "agent": "vega" })).await;
+    assert!(err && out["error"] == "proof_required", "{out}");
+
+    let elsewhere = tempfile::tempdir().unwrap();
+    let id = Identity::open(elsewhere.path(), "vega").unwrap();
+    let mut impostor = Harness::spawn_with(
+        Client::open(id, w.daemon).unwrap(),
+        w.daemon,
+        Default::default(),
+    );
+    let (err, out) = impostor
+        .tool("deregister", json!({ "agent": "Vega" }))
+        .await;
+    assert!(err && out["error"] == "invalid_signature", "{out}");
+
+    let (err, out) = vega.tool("deregister", json!({ "agent": "Vega" })).await;
+    assert!(!err, "{out}");
+    assert_eq!(out["agent"], "vega");
+    let roster = w.bus.list_agents().await.unwrap();
+    let names: Vec<&str> = roster.agents.iter().map(|a| a.name.as_str()).collect();
+    assert_eq!(names, ["lyra"]);
+}

@@ -5,7 +5,7 @@ mod common;
 
 use std::os::unix::fs::PermissionsExt;
 
-use common::{bind_key, name, proven_reclaim, reclaim, stats};
+use common::{bind_key, deregister_proof, name, proven_reclaim, reclaim, stats};
 use mentischat::bus::{remove_snapshot, Bus, SnapshotError};
 use mentischat::errors::MailboxError;
 
@@ -290,7 +290,9 @@ async fn a_held_key_survives_a_restart() {
     bus.register_with(&name("Vega"), proven_reclaim(&owner, "Vega", 4))
         .await
         .unwrap();
-    bus.deregister(&name("Vega")).await.unwrap();
+    bus.deregister_with(&name("Vega"), Some(deregister_proof(&owner, "Vega", 5)))
+        .await
+        .unwrap();
     bus.close().await;
 
     let bus = Bus::new(&data).unwrap();
@@ -299,12 +301,12 @@ async fn a_held_key_survives_a_restart() {
         Err(MailboxError::NameTaken { .. })
     ));
     assert!(matches!(
-        bus.register_with(&name("Vega"), proven_reclaim(&owner, "Vega", 4))
+        bus.register_with(&name("Vega"), proven_reclaim(&owner, "Vega", 5))
             .await,
-        Err(MailboxError::StaleCounter { last: 4, .. })
+        Err(MailboxError::StaleCounter { last: 5, .. })
     ));
     assert!(
-        bus.register_with(&name("Vega"), proven_reclaim(&owner, "Vega", 5))
+        bus.register_with(&name("Vega"), proven_reclaim(&owner, "Vega", 6))
             .await
             .unwrap()
             .created

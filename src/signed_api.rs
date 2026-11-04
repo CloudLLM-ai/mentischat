@@ -8,11 +8,11 @@
 
 use serde_json::Value;
 
-use crate::bus::{Bus, SignedRequest};
+use crate::bus::{Bus, ReclaimProof, SignedRequest};
 use crate::errors::MailboxError;
 use crate::names::{AgentName, RoomName};
 use crate::signed::{hex_decode_vec, OpKind, PublicKey, Signature, SignedOp};
-use crate::tools::{to_wire, uint};
+use crate::tools::{registration, to_wire, uint};
 
 /// A required string field; a missing or non-string value is `invalid_body`.
 fn text<'a>(params: &'a Value, key: &str) -> Result<&'a str, MailboxError> {
@@ -32,6 +32,42 @@ fn public_key(params: &Value, key: &str) -> Result<PublicKey, MailboxError> {
     text(params, key)?
         .parse()
         .map_err(|_| MailboxError::InvalidKey)
+}
+
+/// `POST /agents` `{ "agent", "provider"?, "description"?, "reclaim"?,
+/// "counter"?, "signature"? }`: the register tool's parameters plus an
+/// optional reclaim proof, `counter` and `signature` together (see
+/// [`ReclaimProof`]). The proof is how a client holding a name's key takes
+/// the name back; the register tool has no proof parameters, so a model is
+/// never asked to sign.
+///
+/// # Errors
+///
+/// See [`Bus::register_with`], plus `invalid_name`, `invalid_description`,
+/// `invalid_signature` for a signature that does not parse, and
+/// `invalid_body` for a bad `reclaim` or `counter`, or one of `counter` and
+/// `signature` without the other.
+pub async fn register(bus: &Bus, params: &Value) -> Result<Value, MailboxError> {
+    let (name, opts) = registration(params)?;
+    let opts = crate::bus::Registration {
+        proof: reclaim_proof(params)?,
+        ..opts
+    };
+    Ok(to_wire(bus.register_with(&name, opts).await?))
+}
+
+/// The reclaim proof in `params`: `counter` and `signature` together, or
+/// neither.
+fn reclaim_proof(params: &Value) -> Result<Option<ReclaimProof>, MailboxError> {
+    let given = |key: &str| params.get(key).filter(|v| !v.is_null());
+    match (given("counter"), given("signature")) {
+        (None, None) => Ok(None),
+        (Some(counter), Some(_)) => Ok(Some(ReclaimProof {
+            counter: uint(counter).ok_or(MailboxError::InvalidBody)?,
+            signature: signature(params)?,
+        })),
+        _ => Err(MailboxError::InvalidBody),
+    }
 }
 
 /// `PUT /agents/{agent}/key` `{ "public_key", "signature" }`: bind the key to
@@ -69,7 +105,9 @@ fn parse_op(params: &Value) -> Result<SignedOp, MailboxError> {
         .map_err(|_| MailboxError::InvalidBody)?;
     let own = |key: &str| text(params, key).map(str::to_string);
     Ok(match kind {
-        OpKind::RegisterKey | OpKind::PublishKeyPackages => return Err(MailboxError::InvalidBody),
+        OpKind::RegisterKey | OpKind::PublishKeyPackages | OpKind::Reclaim => {
+            return Err(MailboxError::InvalidBody)
+        }
         OpKind::Create => SignedOp::Create {
             description: match params.get("description") {
                 None | Some(Value::Null) => String::new(),

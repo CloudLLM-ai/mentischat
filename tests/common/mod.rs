@@ -7,8 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use mentischat::bus::{Bus, Registration, Retention, Stats};
+use mentischat::bus::{Bus, ReclaimProof, Registration, Retention, Stats};
 use mentischat::names::{AgentName, RoomName};
+use mentischat::signed::{reclaim_payload, register_key_payload, Keypair};
 
 pub fn name(s: &str) -> AgentName {
     AgentName::parse(s).expect("valid test name")
@@ -45,7 +46,40 @@ pub fn idle_after(secs: u64) -> Retention {
     }
 }
 
-/// Register options that take a registered or held name back.
+/// Bind a deterministic key (`seed` fills the 32-byte secret) to `agent`,
+/// which must be registered, and return it.
+pub async fn bind_key(bus: &Bus, agent: &str, seed: u8) -> Keypair {
+    let keys = Keypair::from_seed([seed; 32]);
+    let key = keys.public();
+    bus.register_key(
+        &name(agent),
+        key,
+        &keys.sign(&register_key_payload(agent, &key)),
+    )
+    .await
+    .expect("bind key");
+    keys
+}
+
+/// A reclaim proof for `agent` at `counter`, signed by `keys`.
+pub fn proof(keys: &Keypair, agent: &str, counter: u64) -> ReclaimProof {
+    ReclaimProof {
+        counter,
+        signature: keys.sign(&reclaim_payload(agent, counter)),
+    }
+}
+
+/// Register options that take `agent` back with a proof signed by `keys` at
+/// `counter`.
+pub fn proven_reclaim(keys: &Keypair, agent: &str, counter: u64) -> Registration {
+    Registration {
+        reclaim: true,
+        proof: Some(proof(keys, agent, counter)),
+        ..Registration::default()
+    }
+}
+
+/// Register options that take a held keyless name back (no proof).
 pub fn reclaim() -> Registration {
     Registration {
         reclaim: true,

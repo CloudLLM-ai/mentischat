@@ -79,6 +79,21 @@ pub(super) struct Hold {
     /// The previous registration's start; a reclaim keeps it, so the agent's
     /// sent mail is still in its `history`.
     pub registered_ms: u64,
+    /// The key the previous registration had bound, if any: a reclaim during
+    /// the hold must then be signed by it.
+    pub key: Option<HeldKey>,
+}
+
+/// The key a registration had bound when its name left the roster.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct HeldKey {
+    /// The bound key.
+    pub key: crate::signed::PublicKey,
+    /// The proof-of-possession signature that bound it, kept so a restored
+    /// snapshot can verify the key again.
+    pub proof: crate::signed::Signature,
+    /// The highest counter the key had signed.
+    pub counter: u64,
 }
 
 /// A message pushed to a stream and awaiting its acknowledgement.
@@ -130,12 +145,14 @@ pub(super) struct AgentState {
     /// up before that sees it here and fails `unregistered`.
     pub removed: bool,
     /// The Ed25519 key bound to this registration (trust on first use), for
-    /// signed rooms. Dies with the roster entry; never snapshotted.
+    /// signed rooms and for proving a `reclaim`. Dies with the roster entry;
+    /// the hold that follows keeps it only to check a reclaim.
     pub key: Option<crate::signed::PublicKey>,
     /// The proof-of-possession signature that bound `key`, kept so a restored
     /// snapshot can verify the binding again.
     pub key_proof: Option<crate::signed::Signature>,
-    /// Highest counter this agent has signed for a KeyPackage publish.
+    /// Highest counter this agent has signed for a KeyPackage publish or a
+    /// reclaim.
     pub key_counter: u64,
     /// Serialized MLS KeyPackages others may take to add this agent to an
     /// end-to-end encrypted room, oldest first. Opaque to the daemon.
@@ -1031,11 +1048,17 @@ impl State {
             self.readers.remove(key);
             rooms = std::mem::take(&mut st.rooms);
             self.sent_by_gone.fetch_add(st.sent, Relaxed);
+            let held_key = st.key.zip(st.key_proof).map(|(bound, proof)| HeldKey {
+                key: bound,
+                proof,
+                counter: st.key_counter,
+            });
             holds.insert(
                 key.to_string(),
                 Hold {
                     until_ms,
                     registered_ms: st.registered_ms,
+                    key: held_key,
                 },
             );
             let direct = st.leased_direct();

@@ -6,8 +6,8 @@ mod common;
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime};
 
-use common::{bus_with, bus_with_clock, fresh_bus, name, reclaim};
-use mentischat::bus::{rfc3339, Bus, Retention};
+use common::{bind_key, bus_with, bus_with_clock, fresh_bus, name, proof, proven_reclaim, reclaim};
+use mentischat::bus::{rfc3339, Bus, Registration, Retention};
 use mentischat::errors::{MailboxError, TakenReason};
 use mentischat::names::{AgentName, SUGGESTED_NAMES, SUGGESTION_COUNT};
 
@@ -304,11 +304,17 @@ async fn reclaim_of_a_free_name_simply_creates_it() {
     assert_eq!(out.agent, "Castor");
 }
 
+/// A proven reclaim in another case returns the registered spelling; the
+/// proof folds the name, so it verifies under either spelling.
 #[tokio::test]
 async fn reclaim_of_a_registered_name_keeps_its_spelling() {
     let (_d, bus) = fresh_bus("reclaim_spelling");
     bus.register(&name("Castor")).await.unwrap();
-    let out = bus.register_with(&name("CASTOR"), reclaim()).await.unwrap();
+    let keys = bind_key(&bus, "Castor", 3).await;
+    let out = bus
+        .register_with(&name("CASTOR"), proven_reclaim(&keys, "CASTOR", 1))
+        .await
+        .unwrap();
     assert!(!out.created);
     assert_eq!(out.agent, "Castor");
 }
@@ -408,4 +414,172 @@ async fn names_with_digits_that_are_not_numbered_register() {
     for ok in ["vega2", "grok-review.v2", "build-2a", "2b", "r2-d2x"] {
         assert!(bus.register(&name(ok)).await.unwrap().created, "{ok}");
     }
+}
+
+/// Reclaim options for `agent` with a proof at `counter` signed by `keys`,
+/// which need not be the name's key.
+fn reclaim_signed_by(
+    keys: &mentischat::signed::Keypair,
+    agent: &str,
+    counter: u64,
+) -> Registration {
+    Registration {
+        reclaim: true,
+        proof: Some(proof(keys, agent, counter)),
+        ..Registration::default()
+    }
+}
+
+/// A registered name with no key cannot be taken back: reclaim fails
+/// `name_taken` like a plain register, and the holder keeps its inbox.
+#[tokio::test]
+async fn a_registered_keyless_name_cannot_be_reclaimed() {
+    let (_d, bus) = fresh_bus("keyless_live");
+    bus.register(&name("Vega")).await.unwrap();
+    bus.register(&name("orion")).await.unwrap();
+    bus.send(&name("orion"), &name("Vega"), "for vega".into())
+        .await
+        .unwrap();
+    let err = bus
+        .register_with(&name("vega"), reclaim())
+        .await
+        .unwrap_err();
+    let suggestions = taken(err, "Vega", false);
+    assert_eq!(suggestions.len(), SUGGESTION_COUNT);
+    let page = bus.check_inbox(&name("Vega"), 0).await.unwrap();
+    assert_eq!(page.messages.len(), 1, "the mail is still Vega's");
+}
+
+/// A registered key-bound name is taken back only with a proof from its own
+/// key: none fails `name_taken`, another key's fails `invalid_signature`, and
+/// the right key's succeeds once per counter.
+#[tokio::test]
+async fn a_registered_key_bound_name_needs_its_keys_proof() {
+    let (_d, bus) = fresh_bus("keyed_live");
+    bus.register(&name("Vega")).await.unwrap();
+    let owner = bind_key(&bus, "Vega", 1).await;
+    let stranger = mentischat::signed::Keypair::from_seed([9; 32]);
+
+    let err = bus
+        .register_with(&name("vega"), reclaim())
+        .await
+        .unwrap_err();
+    taken(err, "Vega", false);
+    assert!(matches!(
+        bus.register_with(&name("vega"), reclaim_signed_by(&stranger, "vega", 5))
+            .await,
+        Err(MailboxError::InvalidSignature)
+    ));
+    let mine = bus
+        .register_with(&name("vega"), proven_reclaim(&owner, "vega", 5))
+        .await
+        .unwrap();
+    assert!(!mine.created);
+    assert_eq!(mine.agent, "Vega");
+    assert!(
+        matches!(
+            bus.register_with(&name("vega"), proven_reclaim(&owner, "vega", 5))
+                .await,
+            Err(MailboxError::StaleCounter { last: 5, .. })
+        ),
+        "a replayed proof is refused"
+    );
+    assert!(bus
+        .register_with(&name("vega"), proven_reclaim(&owner, "vega", 6))
+        .await
+        .is_ok());
+}
+
+/// A proof for one name does not take another: the payload names the signer.
+#[tokio::test]
+async fn a_reclaim_proof_is_for_one_name() {
+    let (_d, bus) = fresh_bus("proof_name");
+    bus.register(&name("Vega")).await.unwrap();
+    let owner = bind_key(&bus, "Vega", 1).await;
+    let wrong_name = Registration {
+        reclaim: true,
+        proof: Some(proof(&owner, "orion", 5)),
+        ..Registration::default()
+    };
+    assert!(matches!(
+        bus.register_with(&name("Vega"), wrong_name).await,
+        Err(MailboxError::InvalidSignature)
+    ));
+}
+
+/// A held name whose registration had a key is taken back only with that
+/// key's proof, and the reclaim resumes the earlier registration.
+#[tokio::test]
+async fn a_held_key_bound_name_needs_its_keys_proof() {
+    let (_d, bus) = fresh_bus("keyed_hold");
+    bus.register(&name("Vega")).await.unwrap();
+    let owner = bind_key(&bus, "Vega", 1).await;
+    bus.deregister(&name("Vega")).await.unwrap();
+    let stranger = mentischat::signed::Keypair::from_seed([9; 32]);
+
+    let err = bus
+        .register_with(&name("Vega"), reclaim())
+        .await
+        .unwrap_err();
+    taken(err, "Vega", true);
+    assert!(matches!(
+        bus.register_with(&name("Vega"), reclaim_signed_by(&stranger, "Vega", 5))
+            .await,
+        Err(MailboxError::InvalidSignature)
+    ));
+    let back = bus
+        .register_with(&name("Vega"), proven_reclaim(&owner, "Vega", 5))
+        .await
+        .unwrap();
+    assert!(back.created);
+    assert!(
+        bus.agent_key(&name("Vega")).await.unwrap().is_none(),
+        "the binding died with the registration; the client binds again"
+    );
+}
+
+/// The counter a held reclaim used carries into the new registration and the
+/// hold after it, so the same proof cannot be replayed through either.
+#[tokio::test]
+async fn a_held_reclaim_proof_cannot_be_replayed() {
+    let (_d, bus) = fresh_bus("held_replay");
+    bus.register(&name("Vega")).await.unwrap();
+    let owner = bind_key(&bus, "Vega", 1).await;
+    bus.deregister(&name("Vega")).await.unwrap();
+    bus.register_with(&name("Vega"), proven_reclaim(&owner, "Vega", 5))
+        .await
+        .unwrap();
+    bind_key(&bus, "Vega", 1).await;
+    assert!(matches!(
+        bus.register_with(&name("Vega"), proven_reclaim(&owner, "Vega", 5))
+            .await,
+        Err(MailboxError::StaleCounter { last: 5, .. })
+    ));
+    bus.deregister(&name("Vega")).await.unwrap();
+    assert!(matches!(
+        bus.register_with(&name("Vega"), proven_reclaim(&owner, "Vega", 5))
+            .await,
+        Err(MailboxError::StaleCounter { last: 5, .. })
+    ));
+    assert!(
+        bus.register_with(&name("Vega"), proven_reclaim(&owner, "Vega", 6))
+            .await
+            .unwrap()
+            .created
+    );
+}
+
+/// A held keyless name is taken back without proof: there is no key to
+/// prove, and the name has left the roster.
+#[tokio::test]
+async fn a_held_keyless_name_is_reclaimed_without_proof() {
+    let (_d, bus) = fresh_bus("keyless_hold");
+    bus.register(&name("Vega")).await.unwrap();
+    bus.deregister(&name("Vega")).await.unwrap();
+    assert!(
+        bus.register_with(&name("Vega"), reclaim())
+            .await
+            .unwrap()
+            .created
+    );
 }

@@ -110,11 +110,11 @@ fn query_params(q: &HashMap<String, String>, keys: &[&str]) -> Value {
         .into()
 }
 
-/// `POST /agents` `{ "agent", "provider"?, "description"?, "reclaim"? }` —
-/// same as register.
+/// `POST /agents` `{ "agent", "provider"?, "description"?, "reclaim"?,
+/// "counter"?, "signature"? }`: register, with an optional reclaim proof.
 async fn register(State(bus): State<Ctx>, body: Result<Json<Value>, JsonRejection>) -> Reply {
     Ok(Json(
-        crate::tools::register_agent(&bus, &json_body(body)?).await?,
+        crate::signed_api::register(&bus, &json_body(body)?).await?,
     ))
 }
 

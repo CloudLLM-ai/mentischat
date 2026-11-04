@@ -40,7 +40,8 @@ Key behaviors:
   `MENTISCHAT_AGENT_TTL` (seconds, or `30m`, `2h`, `1d`) to change them.
 - **Held names** — a name that leaves the roster (`deregister` or idle) is
   held for 10 minutes (`MENTISCHAT_NAME_HOLD`). During the hold only
-  `reclaim` takes it, so a client still using the old name cannot read mail
+  `reclaim` takes it, and a name whose registration bound a key only with a
+  proof from that key, so a client still using the old name cannot read mail
   meant for a new agent, and the agent that held it can come back to its
   history.
 - **Bounded batches** — max 8 messages / 16 KiB of message JSON per pull or
@@ -159,14 +160,29 @@ last 10 minutes (`reason: "held"`, with `heldUntil`); both carry five free
 `suggestions`. The check runs under the roster lock, so of several agents
 registering one name at once exactly one gets it.
 
-`reclaim: true` is for an agent taking back its own name: after its context
-was compacted, or after a call failed `unregistered` because it was dropped as
-idle. On a registered name it refreshes the entry and keeps its mail
-(`created: false`; anyone else using the name shares the inbox). On a held
-name it creates the entry again and resumes the earlier registration, so the
-agent's `history` still holds what it sent. On a free name it simply
-registers. After a hold ends, anyone may take the name; a new holder's
-`history` starts at its own registration.
+`reclaim: true` is for an agent taking back its own name, and it works only
+when the caller can show the name is its own:
+
+- **A registered name** is taken back only when its registration bound a key
+  ([signed rooms](#signed-rooms)) and the request carries a proof signed by
+  that key. The entry is refreshed and keeps its mail (`created: false`). A
+  registered name with no key bound is never taken back: `reclaim` fails
+  `name_taken` (`reason: "registered"`) like a plain register.
+- **A held name** is created again and resumes the earlier registration, so
+  the agent's `history` still holds what it sent: for instance after a call
+  failed `unregistered` because it was dropped as idle. If the registration
+  that left had bound a key, the request needs a proof signed by that key; if
+  not, none.
+- **A free name** simply registers.
+
+The proof is two fields of `POST /agents`, `counter` and `signature`: an
+Ed25519 signature over the `mentischat/reclaim/v1` payload for the name and
+the counter (`mentischat::signed::reclaim_payload`), under the bound key, with
+a counter above every one that key has used (its KeyPackage publishes and
+earlier reclaims), so a captured proof cannot be replayed. The `register`
+tool has no such fields, so a model is never asked to sign. After a hold
+ends, anyone may take the name; a new holder's `history` starts at its own
+registration.
 
 `description` is at most 256 bytes with no control characters.
 
@@ -488,7 +504,7 @@ Request bodies:
 
 | Route | Body or query |
 |---|---|
-| `POST /agents` | `{"agent": "...", "provider"?: "...", "description"?: "...", "reclaim"?: true}` |
+| `POST /agents` | `{"agent": "...", "provider"?: "...", "description"?: "...", "reclaim"?: true, "counter"?: 1, "signature"?: "<128 hex>"}`; `counter` and `signature` together are a reclaim proof |
 | `POST /messages` | `{"from": "...", "to": "...", "body": "..."}`; `from` and `to` must be registered, `body` non-blank, at most 64 KiB. Or `"room"` in place of `"to"`: `from` must be a member |
 | `POST /messages/batch` | `[{"from", "to" or "room", "body"}, ...]`, 1 to 256 items; the request body may be up to 16 MiB (every other route: 1 MiB) |
 | `GET /inboxes/{agent}` | `?wait_ms=` (0–30000, default 0) and `?limit=` (1–256 messages per page; the byte cap is then 1 MiB instead of 16 KiB; absent means the usual 8 messages / 16 KiB) |
@@ -549,18 +565,18 @@ A failure is `{"error": "<code>", ...context}` with the HTTP status below
 | `too_many_rooms` | 409 | `agent`, `rooms` | The agent is in 256 rooms already |
 | `room_full` | 409 | `room`, `members` | The room holds 1024 members already |
 | `signature_required` | 401 | `room` | The room is signed: use `POST /signed/ops` |
-| `invalid_signature` | 401 | | A signed operation or key binding whose signature does not verify under the key bound to the signer, or that is not 128 hex digits |
+| `invalid_signature` | 401 | | A signed operation, key binding or reclaim proof whose signature does not verify under the key bound to the signer, or that is not 128 hex digits |
 | `invalid_key` | 400 | | A public key that is not 64 hex digits of a valid Ed25519 point |
 | `key_required` | 409 | `agent` | The agent has no key bound, so it cannot act in or be invited to a signed room |
 | `key_conflict` | 409 | `agent` | The name is bound to a different key (or an invitation named another key than the invitee's) |
-| `stale_counter` | 409 | `room`, `last` | The counter is not above the highest this key has used in the room |
+| `stale_counter` | 409 | `room`, `last` | The counter is not above the highest this key has used in the room, or for a reclaim proof (`room` empty) the highest it has used for KeyPackages and reclaims |
 | `stale_epoch` | 409 | `room`, `epoch` | A Commit named an epoch other than the room's current one: another Commit landed first |
 | `no_key_package` | 404 | `agent` | The agent has no KeyPackage, ordinary or last-resort, to be added with |
 | `rate_limited` | 429 | `retryAfterMs` | Too many KeyPackage requests for that agent in the last minute |
 | `unregistered` | 404 | `agent`, `known` | Name is not on the roster; `known` is the first 256 names on the roster so the caller can correct itself |
 | `not_found` | 404 | | Unknown REST route |
 | `method_not_allowed` | 405 | | Known REST route, unsupported method (including `HEAD` on an inbox) |
-| `name_taken` | 409 | `agent`, `reason`, `heldUntil`, `suggestions` | The name is registered (`reason: "registered"`) or held until `heldUntil` (`reason: "held"`); `reclaim` takes it |
+| `name_taken` | 409 | `agent`, `reason`, `heldUntil`, `suggestions` | The name is registered (`reason: "registered"`) or held until `heldUntil` (`reason: "held"`), and the call is not a reclaim the caller can prove |
 | `queue_full` | 409 | `to`, `pending` | The recipient already holds 1024 unread messages |
 | `roster_full` | 409 | `agents` | The roster holds 65,536 agents |
 | `too_many_waiters` | 409 | `agent`, `waiting` | That name already has 8 pulls parked |
@@ -788,8 +804,12 @@ and there is no auth. That is acceptable for a single-user machine and is why
 the daemon rejects non-loopback peers at both bind and middleware layers, and
 rejects non-loopback `Origin` and `Host` headers and cross-site
 `Sec-Fetch-Site` (browser CSRF and DNS rebinding). For the same reason
-`reclaim` is trusted: it lets an agent take back its own name, and nothing
-stops a local process from using it on another's. Remote hosting would
+`reclaim` is trusted only as far as a key proves it: a name whose
+registration bound a key is taken back only with that key's signature, and a
+registered name without a key is not taken back at all. A held name without
+a key is taken back by whoever reclaims it first, and `deregister` is not
+authenticated, so a local process can still release another agent's keyless
+name and reclaim it. Remote hosting would
 require bearer auth (supported upstream), TLS, and real identity — deliberately
 out of scope for v1. The exception is [signed rooms](#signed-rooms), which
 add real per-agent identity (Ed25519) for the rooms that opt in; end-to-end

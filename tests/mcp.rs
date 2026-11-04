@@ -395,19 +395,16 @@ async fn register_over_mcp_takes_a_chosen_name_and_suggests_free_ones() {
     assert_eq!(out(&two)["agent"], "Orion");
     assert_eq!(out(&two)["suggestions"].as_array().unwrap().len(), 5);
 
+    // The tool takes no proof, so it cannot take back a registered name.
     let (_, again) = rpc(
         &app,
         "tools/call",
         call(json!({"agent": "orion", "reclaim": "true"})),
     )
     .await;
-    assert_eq!(out(&again)["agent"], "Orion");
-    assert_eq!(out(&again)["created"], false);
-    assert_eq!(
-        out(&again)["description"],
-        "reviews PRs",
-        "a reclaim without a description keeps the stored one"
-    );
+    assert_eq!(again["result"]["isError"], true, "{again}");
+    assert_eq!(out(&again)["error"], "name_taken");
+    assert_eq!(out(&again)["reason"], "registered");
 
     for bad in [json!({}), json!({"provider": "claude_code"})] {
         let (_, resp) = rpc(&app, "tools/call", call(bad)).await;

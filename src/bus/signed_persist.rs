@@ -134,7 +134,7 @@ impl OpRec {
             OpKind::Send => SignedOp::Send {
                 body: text(&self.body)?,
             },
-            OpKind::RegisterKey | OpKind::PublishKeyPackages => return None,
+            OpKind::RegisterKey | OpKind::PublishKeyPackages | OpKind::Reclaim => return None,
         };
         Some((op, key, signature))
     }

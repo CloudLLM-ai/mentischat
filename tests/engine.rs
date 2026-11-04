@@ -165,6 +165,9 @@ async fn counts_stay_consistent_while_agents_come_and_go() {
         task.await.unwrap();
     }
     churn.await.unwrap();
+    // Leave and come back once more so flaky ends registered: a reclaim takes
+    // the held keyless name.
+    let _ = bus.deregister(&name("flaky")).await;
     bus.register_with(&name("flaky"), common::reclaim())
         .await
         .unwrap();

@@ -30,7 +30,7 @@ pub const READD_REQUEST_PREFIX: &str = "mentischat/readd ";
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
 /// What the proxy tells the harness about itself.
-const INSTRUCTIONS: &str = "This is the mentischat mailbox through a local client that holds your keys. Use the tools as usual. To make a room whose messages only its members can read, call create_room with secure true: it is signed and end-to-end encrypted, and invite, join_room, send_message, check_inbox and history then work on it as on any room.";
+const INSTRUCTIONS: &str = "This is the mentischat mailbox through a local client that holds your keys. Use the tools as usual. If register fails name_taken for your own name, for example after a restart, call it again with reclaim true: the client proves the name is yours. To make a room whose messages only its members can read, call create_room with secure true: it is signed and end-to-end encrypted, and invite, join_room, send_message, check_inbox and history then work on it as on any room.";
 
 /// Serve MCP over `input`/`output` (newline-delimited JSON-RPC, as the MCP
 /// stdio transport specifies) until `input` ends.
@@ -125,11 +125,22 @@ fn initialize(params: &Value) -> Value {
     })
 }
 
-/// The daemon's tools, with `secure` added to `create_room`.
+/// The daemon's tools, with `secure` added to `create_room` and `register`
+/// describing the reclaim this client can prove.
 async fn tools_list(daemon: Daemon) -> Result<Value, ClientError> {
     let reply = mcp_call(daemon, "tools/list", json!({})).await?;
     let mut tools = reply["tools"].clone();
     for tool in tools.as_array_mut().into_iter().flatten() {
+        if tool["name"] == "register" {
+            tool["inputSchema"]["properties"]["reclaim"]["description"] = json!(
+                "true to take back your own name, registered or held, for example after a restart; this client proves it is yours with your key"
+            );
+            if let Some(d) = tool["description"].as_str() {
+                tool["description"] = json!(format!(
+                    "{d} Through this client, reclaim: true also takes back your name while it is still registered: the client signs the proof."
+                ));
+            }
+        }
         if tool["name"] == "create_room" {
             tool["inputSchema"]["properties"]["secure"] = json!({
                 "type": "boolean",
@@ -166,6 +177,16 @@ fn failure(e: &ClientError) -> Value {
         other => json!({ "error": "client_error", "message": other.to_string() }),
     };
     tool_result(&body, true)
+}
+
+/// Whether a register call asks to reclaim: `reclaim` true, or the string
+/// `"true"` as some local models send it (as the daemon accepts).
+fn wants_reclaim(args: &Value) -> bool {
+    match args.get("reclaim") {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => s == "true",
+        _ => false,
+    }
 }
 
 /// A string argument, if present and non-empty.
@@ -224,8 +245,18 @@ fn result_json(result: &Value) -> Option<Value> {
     serde_json::from_str(text).ok()
 }
 
+/// Register, then bind this client's key. A reclaim is signed here and sent
+/// to `POST /agents` with its proof, since the daemon's tool takes none;
+/// anything else goes to the daemon's tool unchanged.
 async fn register(client: &mut Client, daemon: Daemon, args: &Value) -> Value {
-    let mut result = forward(daemon, "register", args).await;
+    let mut result = if wants_reclaim(args) {
+        match client.reclaim(args).await {
+            Ok(value) => tool_result(&value, false),
+            Err(e) => failure(&e),
+        }
+    } else {
+        forward(daemon, "register", args).await
+    };
     if result["isError"] == true {
         return result;
     }

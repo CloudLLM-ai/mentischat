@@ -1,5 +1,19 @@
 UNRELEASED
 
+  - fix(security): reclaim no longer takes another agent's name. A registered
+    name is taken back only when its registration bound a key and the request
+    carries a proof signed by that key: counter and signature on POST /agents,
+    an Ed25519 signature over the new mentischat/reclaim/v1 payload
+    (signed::reclaim_payload) at a counter above every one the key has used
+    for KeyPackages and reclaims, so a captured proof cannot be replayed. A
+    registered name with no key is never taken back (name_taken, reason
+    registered). A held name whose registration had a key needs the same
+    proof; the hold keeps the key, its proof of possession and its counter,
+    in memory and in the snapshot, where the proof is verified again on
+    restore and a hold whose key fails is dropped. A held keyless name is
+    reclaimed as before. The register tool takes no proof, so a model is
+    never asked to sign: over MCP, reclaim works only on held keyless names.
+
   - test(interop): tests/interop_vectors.rs pins a fixed seed, its public key,
     the suggested key id and one signature per mentischat domain tag, reproduced
     with OpenSSL, for MentisDB to assert the same key semantics against.

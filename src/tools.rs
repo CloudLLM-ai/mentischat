@@ -45,7 +45,7 @@ fn metadata_for(tool_name: &str) -> Option<ToolMetadata> {
         "register" => Some(
             ToolMetadata::new(
                 "register",
-                "Join the local mentischat roster under a name of your own (one word; case does not matter), e.g. a star, constellation or moon such as Vega or Orion; list_agents suggests free ones. Also pass provider, where you are running (claude_code, claude_desktop, cursor, codex, grok_build, grok_desktop), and description, your model (e.g. claude sonnet 5.5). A name in use or recently released fails name_taken, and a numbered name such as Vega_2 fails numbered_name, both with suggestions. Pass reclaim: true only to take back your own name.",
+                "Join the local mentischat roster under a name of your own (one word; case does not matter), e.g. a star, constellation or moon such as Vega or Orion; list_agents suggests free ones. Also pass provider, where you are running (claude_code, claude_desktop, cursor, codex, grok_build, grok_desktop), and description, your model (e.g. claude sonnet 5.5). A name in use or recently released fails name_taken, and a numbered name such as Vega_2 fails numbered_name, both with suggestions. Pass reclaim: true only to take back your own name after it left the roster; a registered name cannot be taken back.",
             )
             .with_parameter(str_param(
                 "agent",
@@ -64,7 +64,7 @@ fn metadata_for(tool_name: &str) -> Option<ToolMetadata> {
             .with_parameter(
                 ToolParameter::new("reclaim", ToolParameterType::Boolean)
                     .with_description(
-                        "true to take back a name you registered earlier even though it is registered or held; it keeps that name's mail and history",
+                        "true to take back a name you registered earlier that left the roster and is held; it resumes that name's history. A name that is still registered, or whose registration bound a key, fails name_taken",
                     )
                     .with_default(json!(false)),
             ),
@@ -352,16 +352,31 @@ fn unknown_tool(name: &str) -> Box<dyn std::error::Error + Send + Sync> {
     Box::new(ToolError::NotFound(crate::names::echo(name)))
 }
 
-/// Register per the tool and `POST /agents` contract: `agent` is the name
-/// to claim; `provider`, `description` and `reclaim` are optional.
+/// Register per the tool contract: `agent` is the name to claim;
+/// `provider`, `description` and `reclaim` are optional. The tool takes no
+/// reclaim proof, so it cannot take back a key-bound name; `POST /agents`
+/// ([`crate::signed_api::register`]) can.
 pub async fn register_agent(bus: &Bus, params: &Value) -> Result<Value, MailboxError> {
+    let (name, opts) = registration(params)?;
+    Ok(to_wire(bus.register_with(&name, opts).await?))
+}
+
+/// The name and options of a register call, without a reclaim proof.
+///
+/// # Errors
+///
+/// `invalid_name` for a missing or bad `agent` or `provider`;
+/// `invalid_description`; `invalid_body` for a `reclaim` that is not a
+/// boolean.
+pub fn registration(params: &Value) -> Result<(AgentName, Registration), MailboxError> {
     let name = required_name(params, "agent")?;
     let opts = Registration {
         description: parse_description(params.get("description"))?,
         provider: parse_provider(params.get("provider"))?,
         reclaim: parse_reclaim(params.get("reclaim"))?,
+        proof: None,
     };
-    Ok(to_wire(bus.register_with(&name, opts).await?))
+    Ok((name, opts))
 }
 
 /// One history page per the tool contract: `agent` is required, `with`,

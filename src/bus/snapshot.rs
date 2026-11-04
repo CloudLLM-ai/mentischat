@@ -20,7 +20,7 @@ use super::clock::Clock;
 use super::log::{json_len, Msg, Target};
 use super::rooms::{Member, Room, RoomState};
 use super::signed_persist::{replay, Replayed, SignedRec};
-use super::state::{convo_key, Agent, Hold, Key, State};
+use super::state::{convo_key, Agent, HeldKey, Hold, Key, State};
 use super::{
     Bus, Retention, MAX_PENDING_PER_AGENT, MAX_ROOMS, MAX_ROOMS_PER_AGENT, MAX_ROOM_MEMBERS,
     MAX_ROSTER, MAX_TOTAL_MESSAGES,
@@ -159,6 +159,13 @@ struct HoldRec {
     key: String,
     until_ms: u64,
     registered_ms: u64,
+    /// The key the registration that left had bound, with its proof of
+    /// possession; verified again on restore. Absent when it had none, and
+    /// from snapshots from before reclaim proofs.
+    #[serde(default)]
+    bound: Option<KeyRec>,
+    #[serde(default)]
+    key_counter: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -256,6 +263,11 @@ pub(super) fn capture(state: &State) -> Snapshot {
                 key: key.clone(),
                 until_ms: h.until_ms,
                 registered_ms: h.registered_ms,
+                bound: h.key.map(|k| KeyRec {
+                    public_key: k.key.to_hex(),
+                    signature: k.proof.to_hex(),
+                }),
+                key_counter: h.key.map_or(0, |k| k.counter),
             })
             .collect(),
         messages,
@@ -376,18 +388,42 @@ fn rebuild(snapshot: Snapshot) -> State {
     state
 }
 
-/// Keep the held names, up to [`MAX_ROSTER`] of them.
+/// Keep the held names, up to [`MAX_ROSTER`] of them. A held key comes back
+/// only if its proof of possession verifies again for the held name. A hold whose key does not verify is
+/// dropped, as if the snapshot had omitted it, rather than restored without
+/// its key, which would let anyone reclaim the name for the rest of the hold.
 fn restore_holds(state: &State, holds: Vec<HoldRec>) {
     let mut held = state.holds.lock();
     for rec in holds.into_iter().take(MAX_ROSTER as usize) {
+        let key = match rec.bound {
+            None => None,
+            Some(bound) => match verified_key(&rec.key, &bound) {
+                Some((key, proof)) => Some(HeldKey {
+                    key,
+                    proof,
+                    counter: rec.key_counter,
+                }),
+                None => continue,
+            },
+        };
         held.insert(
             rec.key,
             Hold {
                 until_ms: rec.until_ms,
                 registered_ms: rec.registered_ms,
+                key,
             },
         );
     }
+}
+
+/// The key and proof in `rec`, if the proof binds that key to `name`.
+fn verified_key(name: &str, rec: &KeyRec) -> Option<(PublicKey, Signature)> {
+    let key = rec.public_key.parse::<PublicKey>().ok()?;
+    let proof = rec.signature.parse::<Signature>().ok()?;
+    key.verify(&register_key_payload(name, &key), &proof)
+        .ok()
+        .map(|()| (key, proof))
 }
 
 /// File the direct messages, then queue each recipient's read ones in the
@@ -470,13 +506,7 @@ fn restore_keys(
     let mut skipped = 0;
     let mut st = agent.inner.lock();
     if let Some(rec) = key {
-        let bound = rec.public_key.parse::<PublicKey>().ok().and_then(|k| {
-            let proof = rec.signature.parse::<Signature>().ok()?;
-            k.verify(&register_key_payload(&agent.name, &k), &proof)
-                .ok()
-                .map(|()| (k, proof))
-        });
-        match bound {
+        match verified_key(&agent.name, &rec) {
             Some((k, proof)) => {
                 st.key = Some(k);
                 st.key_proof = Some(proof);

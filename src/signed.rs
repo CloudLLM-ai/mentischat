@@ -301,9 +301,11 @@ pub enum OpKind {
     Welcome,
     /// Publish MLS KeyPackages for others to add this agent with.
     PublishKeyPackages,
+    /// Prove ownership of a key-bound name to take it back with `reclaim`.
+    Reclaim,
 }
 
-/// An `op` name that is not one of the nine.
+/// An `op` name that is not one of the ten.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnknownOp;
 
@@ -328,6 +330,7 @@ impl OpKind {
             Self::Send => "send",
             Self::Welcome => "welcome",
             Self::PublishKeyPackages => "key_packages",
+            Self::Reclaim => "reclaim",
         }
     }
 }
@@ -352,6 +355,7 @@ impl FromStr for OpKind {
             "send" => Self::Send,
             "welcome" => Self::Welcome,
             "key_packages" => Self::PublishKeyPackages,
+            "reclaim" => Self::Reclaim,
             _ => return Err(UnknownOp),
         })
     }
@@ -455,6 +459,25 @@ pub fn register_key_payload(signer: &str, key: &PublicKey) -> Vec<u8> {
     let mut out = header(OpKind::RegisterKey, "", signer, 0, 32);
     out.extend_from_slice(key.as_bytes());
     out
+}
+
+/// The bytes signed to take back the roster name `signer` with `reclaim`
+/// while it is bound to a key, registered or held: proof that the caller holds
+/// that key. The counter is the signer's own, strictly above every counter the
+/// key has used (the same sequence as [`key_packages_payload`]), so a captured
+/// proof cannot be replayed; the room is empty.
+///
+/// # Examples
+///
+/// ```
+/// use mentischat::signed::reclaim_payload;
+///
+/// assert!(reclaim_payload("Vega", 7).starts_with(b"mentischat/reclaim/v1\0"));
+/// assert_eq!(reclaim_payload("Vega", 7), reclaim_payload("vega", 7));
+/// assert_ne!(reclaim_payload("vega", 7), reclaim_payload("vega", 8));
+/// ```
+pub fn reclaim_payload(signer: &str, counter: u64) -> Vec<u8> {
+    header(OpKind::Reclaim, "", signer, counter, 0)
 }
 
 /// The bytes signed to publish `packages` (opaque serialized MLS KeyPackages)

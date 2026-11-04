@@ -323,12 +323,10 @@ impl Model {
         match *op {
             Op::Register { a, reclaim, .. } => {
                 let a = idx(a, AGENTS);
+                // No agent here binds a key, so a registered name cannot be
+                // proven and is never taken back; a held one is, by reclaim.
                 if self.roster.contains(&a) {
-                    return if reclaim {
-                        Out::Registered { created: false }
-                    } else {
-                        Out::Err("name_taken")
-                    };
+                    return Out::Err("name_taken");
                 }
                 if self.holds.contains_key(&a) && !reclaim {
                     return Out::Err("name_taken");

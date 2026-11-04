@@ -4,8 +4,8 @@
 
 mod common;
 
-use common::{fresh_bus, name, register, room};
-use mentischat::bus::{Bus, SignedOutcome, SignedRequest};
+use common::{bus_with, fresh_bus, name, proven_reclaim, register, room};
+use mentischat::bus::{Bus, Retention, SignedOutcome, SignedRequest};
 use mentischat::errors::MailboxError;
 use mentischat::signed::{
     hex_decode, hex_encode, register_key_payload, Envelope, EnvelopeError, Keypair, OpKind,
@@ -215,6 +215,7 @@ fn payloads_start_with_a_per_operation_domain_tag() {
         OpKind::Send,
         OpKind::Welcome,
         OpKind::PublishKeyPackages,
+        OpKind::Reclaim,
     ]
     .into_iter()
     .map(domain_tag)
@@ -261,6 +262,9 @@ fn op_kinds_roundtrip_through_strings() {
         OpKind::Leave,
         OpKind::Remove,
         OpKind::Send,
+        OpKind::Welcome,
+        OpKind::PublishKeyPackages,
+        OpKind::Reclaim,
     ] {
         assert_eq!(kind.to_string().parse::<OpKind>(), Ok(kind));
     }
@@ -358,15 +362,15 @@ async fn binding_a_key_requires_its_signature() {
     assert_eq!(code(err), "invalid_signature");
 }
 
-/// The binding belongs to the roster entry: after deregister and a fresh
-/// registration the name has no key.
+/// The binding belongs to the roster entry: after deregister and a reclaim
+/// proven by the old key, the name has no key until one is bound again.
 #[tokio::test]
 async fn a_binding_dies_with_the_registration() {
     let (_d, bus) = fresh_bus("keydeath");
     let alice = Actor::new("alice", 1);
     alice.join_roster(&bus).await;
     bus.deregister(&name("alice")).await.unwrap();
-    bus.register_with(&name("alice"), common::reclaim())
+    bus.register_with(&name("alice"), proven_reclaim(&alice.keys, "alice", 1))
         .await
         .unwrap();
     assert!(bus.agent_key(&name("alice")).await.unwrap().is_none());
@@ -548,17 +552,27 @@ async fn another_key_cannot_act_as_a_member() {
     assert!(pull_bodies(&bus, "bob").await.is_empty());
 }
 
-/// Taking over a member's name after it left the roster inherits nothing: the
-/// pin left with it.
+/// A bus whose released names are not held, so a name is free to anyone as
+/// soon as it leaves the roster: the state after a hold has ended.
+fn bus_without_holds(tag: &str) -> (tempfile::TempDir, std::sync::Arc<Bus>) {
+    bus_with(
+        tag,
+        Retention {
+            name_hold: std::time::Duration::ZERO,
+            ..Retention::default()
+        },
+    )
+}
+
+/// Taking over a member's name after it left the roster and its hold ended
+/// inherits nothing: the pin left with it.
 #[tokio::test]
 async fn a_name_taken_over_after_deregistering_is_not_a_member() {
-    let (_d, bus) = fresh_bus("takeover");
+    let (_d, bus) = bus_without_holds("takeover");
     let (_alice, bob) = alice_and_bob(&bus).await;
     bus.deregister(&name("bob")).await.unwrap();
     // Eve registers as bob with her own key.
-    bus.register_with(&name("bob"), common::reclaim())
-        .await
-        .unwrap();
+    bus.register(&name("bob")).await.unwrap();
     let eve = Actor::new("bob", 77);
     eve.bind(&bus).await.unwrap();
     let err = eve.say(&bus, "ops", 99, "i am bob").await.unwrap_err();
@@ -649,7 +663,7 @@ async fn rejoining_does_not_reopen_old_counters() {
 /// the key the inviter signed for.
 #[tokio::test]
 async fn invitations_pin_the_invitees_key() {
-    let (_d, bus) = fresh_bus("pin");
+    let (_d, bus) = bus_without_holds("pin");
     let alice = Actor::new("alice", 1);
     alice.join_roster(&bus).await;
     alice.do_op(&bus, "ops", 1, create_op()).await.unwrap();
@@ -677,9 +691,7 @@ async fn invitations_pin_the_invitees_key() {
         .await
         .unwrap();
     bus.deregister(&name("bob")).await.unwrap();
-    bus.register_with(&name("bob"), common::reclaim())
-        .await
-        .unwrap();
+    bus.register(&name("bob")).await.unwrap();
     let imposter = Actor::new("bob", 88);
     imposter.bind(&bus).await.unwrap();
     let err = imposter

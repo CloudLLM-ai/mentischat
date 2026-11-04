@@ -285,13 +285,14 @@ async fn register_takes_a_chosen_name_and_refuses_a_taken_one() {
     assert_eq!(v["reason"], "registered");
     assert_eq!(v["suggestions"].as_array().unwrap().len(), 5);
 
+    // Vega bound no key, so nothing can prove a reclaim of it.
     let (s, v) = send(
         &mut app,
         post("/agents", r#"{"agent":"vega","reclaim":true}"#),
     )
     .await;
-    assert_eq!((s, v["created"].as_bool()), (200, Some(false)), "{v}");
-    assert_eq!(v["provider"], "claude_code", "kept");
+    assert_eq!((s, v["error"].as_str()), (409, Some("name_taken")), "{v}");
+    assert_eq!(v["reason"], "registered");
 
     send(&mut app, req("DELETE", "/agents/Vega")).await;
     let (s, v) = send(&mut app, post("/agents", r#"{"agent":"Vega"}"#)).await;

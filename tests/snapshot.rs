@@ -5,7 +5,7 @@ mod common;
 
 use std::os::unix::fs::PermissionsExt;
 
-use common::{name, reclaim, stats};
+use common::{bind_key, name, proven_reclaim, reclaim, stats};
 use mentischat::bus::{remove_snapshot, Bus, SnapshotError};
 use mentischat::errors::MailboxError;
 
@@ -276,4 +276,68 @@ async fn a_restored_numbered_name_keeps_its_registration_and_mail() {
         bus.register(&name("Vega_1")).await,
         Err(MailboxError::NameTaken { .. })
     ));
+}
+
+/// A hold keeps the key its registration had across a restart: after it, the
+/// name still needs that key's proof, and the counter the key had used.
+#[tokio::test]
+async fn a_held_key_survives_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("held_key");
+    let bus = Bus::new(&data).unwrap();
+    bus.register(&name("Vega")).await.unwrap();
+    let owner = bind_key(&bus, "Vega", 1).await;
+    bus.register_with(&name("Vega"), proven_reclaim(&owner, "Vega", 4))
+        .await
+        .unwrap();
+    bus.deregister(&name("Vega")).await.unwrap();
+    bus.close().await;
+
+    let bus = Bus::new(&data).unwrap();
+    assert!(matches!(
+        bus.register_with(&name("Vega"), reclaim()).await,
+        Err(MailboxError::NameTaken { .. })
+    ));
+    assert!(matches!(
+        bus.register_with(&name("Vega"), proven_reclaim(&owner, "Vega", 4))
+            .await,
+        Err(MailboxError::StaleCounter { last: 4, .. })
+    ));
+    assert!(
+        bus.register_with(&name("Vega"), proven_reclaim(&owner, "Vega", 5))
+            .await
+            .unwrap()
+            .created
+    );
+}
+
+/// A held key whose proof of possession does not verify drops its hold, as
+/// if the snapshot had left the hold out, rather than coming back keyless.
+#[tokio::test]
+async fn a_held_key_that_does_not_verify_drops_the_hold() {
+    let keys = mentischat::signed::Keypair::from_seed([1; 32]);
+    let other = mentischat::signed::Keypair::from_seed([2; 32]);
+    let forged = other.sign(&mentischat::signed::register_key_payload(
+        "vega",
+        &keys.public(),
+    ));
+    let mut snap = snapshot(&[], vec![], vec![]);
+    snap["holds"] = serde_json::json!([
+        {"key": "vega", "until_ms": u64::MAX / 4, "registered_ms": 1,
+         "bound": {"public_key": keys.public().to_hex(), "signature": forged.to_hex()},
+         "key_counter": 0},
+        {"key": "orion", "until_ms": u64::MAX / 4, "registered_ms": 1},
+    ]);
+    let (_d, bus) = bus_from(snap);
+    assert!(
+        bus.register(&name("Vega")).await.unwrap().created,
+        "the hold with a bad key is gone"
+    );
+    assert!(
+        matches!(
+            bus.register(&name("Orion")).await,
+            Err(MailboxError::NameTaken { .. })
+        ),
+        "a keyless hold from an older snapshot still holds"
+    );
 }

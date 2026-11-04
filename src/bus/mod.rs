@@ -40,6 +40,7 @@ mod delivery;
 mod log;
 mod model;
 mod park;
+mod reclaim;
 mod rooms;
 mod sharded;
 mod signed;
@@ -51,9 +52,10 @@ mod stream;
 pub use clock::{now_rfc3339, rfc3339};
 pub use model::{
     parse_duration, AgentOverview, DiscardOutcome, HistoryPage, InboxPage, Message, Overview,
-    RegisterOutcome, Registration, Retention, RosterEntry, RosterListing, SendReceipt, Stats,
-    SweepOutcome, MAX_BATCH, MAX_BODY_BYTES, MAX_DESCRIPTION_BYTES, MAX_PENDING_PER_AGENT,
-    MAX_RETURN_BYTES, MAX_ROSTER, MAX_TOTAL_MESSAGES, MAX_WAITERS_PER_AGENT, MAX_WAIT_MS,
+    ReclaimProof, RegisterOutcome, Registration, Retention, RosterEntry, RosterListing,
+    SendReceipt, Stats, SweepOutcome, MAX_BATCH, MAX_BODY_BYTES, MAX_DESCRIPTION_BYTES,
+    MAX_PENDING_PER_AGENT, MAX_RETURN_BYTES, MAX_ROSTER, MAX_TOTAL_MESSAGES, MAX_WAITERS_PER_AGENT,
+    MAX_WAIT_MS,
 };
 pub use model::{
     LeaveOutcome, RoomEntry, RoomInfo, RoomListing, DEFAULT_ROOM_CAPACITY, MAX_RETAINED_BYTES,
@@ -76,6 +78,7 @@ use clock::{rfc3339_ms, unix_ms, Clock};
 use delivery::{history_page, history_rows};
 use log::{json_len, Msg};
 use park::{ParkGuard, Signal};
+use reclaim::{ownership, Ownership};
 use state::{Agent, Key, Page, Pulled, State};
 
 type MailErr = crate::errors::MailboxError;
@@ -240,17 +243,25 @@ impl Bus {
     ///
     /// A free name is created. A name another agent has registered, or one
     /// held after it left the roster, fails `name_taken` with free
-    /// suggestions, unless `opts.reclaim` is set: then a registered name has
-    /// its `last_seen`, provider and description refreshed and keeps its
-    /// mail (anyone using it shares the inbox), and a held name is created
-    /// again with its previous registration's history.
+    /// suggestions unless `opts.reclaim` is set and the caller shows it owns
+    /// the name:
+    ///
+    /// - A registered name is taken back only when its registration has a
+    ///   key bound and `opts.proof` is signed by that key. Its `last_seen`,
+    ///   provider and description are refreshed and it keeps its mail. A
+    ///   registered name with no key is never taken back.
+    /// - A held name is created again with its previous registration's
+    ///   history. If that registration had a key bound, `opts.proof` must be
+    ///   signed by it; if not, no proof is needed.
     ///
     /// # Errors
     ///
     /// `shutting_down` once the bus is closed; `name_taken`; `numbered_name`
     /// when a name that is neither registered nor held is numbered
-    /// ([`AgentName::is_numbered`]); `roster_full` when a new name would
-    /// exceed [`MAX_ROSTER`]; `invalid_description`.
+    /// ([`AgentName::is_numbered`]); `invalid_signature` or `stale_counter`
+    /// for a reclaim proof that does not verify or reuses a counter;
+    /// `roster_full` when a new name would exceed [`MAX_ROSTER`];
+    /// `invalid_description`.
     pub async fn register_with(
         &self,
         name: &AgentName,
@@ -265,18 +276,38 @@ impl Bus {
         let mut holds = state.holds.lock();
         if let Some(agent) = state.roster.get(&key) {
             if opts.reclaim {
-                return Ok(refresh_agent(&agent, now, provider, description));
+                let bound = {
+                    let st = agent.inner.lock();
+                    st.key.map(|k| (k, st.key_counter))
+                };
+                if let Ownership::Proven(counter) = ownership(name, bound, opts.proof)? {
+                    return refresh_agent(&agent, counter, now, provider, description);
+                }
             }
             let stored = agent.name.to_string();
             return Err(state.name_taken(&holds, stored, TakenReason::Registered, now));
         }
         let hold = holds.get(&key).filter(|h| h.until_ms > now).cloned();
-        if let (Some(h), false) = (&hold, opts.reclaim) {
-            let reason = TakenReason::Held {
-                until: rfc3339_ms(h.until_ms),
-            };
-            return Err(state.name_taken(&holds, name.to_string(), reason, now));
-        }
+        let key_counter = match &hold {
+            None => 0,
+            Some(h) => {
+                let owned = if opts.reclaim {
+                    ownership(name, h.key.map(|k| (k.key, k.counter)), opts.proof)?
+                } else {
+                    Ownership::Unproven
+                };
+                match owned {
+                    Ownership::Keyless => 0,
+                    Ownership::Proven(counter) => counter,
+                    Ownership::Unproven => {
+                        let reason = TakenReason::Held {
+                            until: rfc3339_ms(h.until_ms),
+                        };
+                        return Err(state.name_taken(&holds, name.to_string(), reason, now));
+                    }
+                }
+            }
+        };
         if name.is_numbered() {
             return Err(MailErr::NumberedName {
                 agent: name.to_string(),
@@ -300,6 +331,8 @@ impl Bus {
             registered_ms,
             now,
         );
+        // A proven reclaim used `key_counter`; the next one must go above it.
+        agent.inner.lock().key_counter = key_counter;
         let outcome = register_outcome(&agent, true);
         state.add_agent(key.clone(), Arc::new(agent));
         holds.remove(&key);
@@ -870,17 +903,31 @@ fn register_outcome(agent: &Agent, created: bool) -> RegisterOutcome {
     }
 }
 
-/// Refresh a registered agent's `last_seen`, and its provider and
-/// description when given (`None` keeps the stored value; an empty
-/// description clears it).
+/// Refresh a registered agent for a reclaim proven at `counter`: its
+/// `last_seen`, and its provider and description when given (`None` keeps
+/// the stored value; an empty description clears it). The counter is checked
+/// again under the agent's lock, as a KeyPackage publish may have raised the
+/// key's counter since the proof was checked.
+///
+/// # Errors
+///
+/// `stale_counter` when `counter` is no longer above the key's counter.
 fn refresh_agent(
     agent: &Agent,
+    counter: u64,
     now: u64,
     provider: Option<String>,
     description: Option<String>,
-) -> RegisterOutcome {
+) -> Result<RegisterOutcome, MailErr> {
     {
         let mut st = agent.inner.lock();
+        if counter <= st.key_counter {
+            return Err(MailErr::StaleCounter {
+                room: String::new(),
+                last: st.key_counter,
+            });
+        }
+        st.key_counter = counter;
         st.last_seen_ms = now;
         if provider.is_some() {
             st.provider = provider;
@@ -889,7 +936,7 @@ fn refresh_agent(
             st.description = Some(description).filter(|d| !d.is_empty());
         }
     }
-    register_outcome(agent, false)
+    Ok(register_outcome(agent, false))
 }
 
 /// One roster row with everything `list_agents` and `overview` need.

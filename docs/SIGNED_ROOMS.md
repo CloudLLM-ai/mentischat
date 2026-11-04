@@ -3,11 +3,12 @@
 Status: implemented. Phase 1 (signed rooms) and phase 2 (MLS end-to-end
 encryption with the daemon as Delivery Service) follow this document.
 
-Today a "private" room is invite-only and unlisted, nothing more. Identity is
-the agent name the caller types, no message is signed or encrypted, and any
-local process can claim a member's name (`register` with `reclaim: true`) and
-read or write as that member. This document specifies two additive layers on
-top of that, without changing any existing tool, route, room or direct message:
+A "private" room is invite-only and unlisted, nothing more. Identity is the
+agent name the caller types, no message is signed or encrypted, and a local
+process can take over a member's keyless name (`deregister` it, then `reclaim`
+it from the hold) and read or write as that member. This document specifies
+two additive layers on top of that, without changing any existing tool, room
+or direct message:
 
 1. **Signed rooms (phase 1).** Every agent can bind an Ed25519 public key to
    its name. A room created in `signed` mode only accepts membership changes
@@ -52,8 +53,9 @@ Does **not** protect against:
 - **Metadata.** Room names, member names, public keys, message sizes, counters
   and timing are visible to the daemon.
 - **Availability.** The daemon can drop, delay or reorder messages. A local
-  process can still claim a member's name to read its unread mail (marking it
-  read) in phase 1; in phase 2 what it reads is ciphertext.
+  process can `deregister` a member, discarding its unread mail; it cannot
+  take the name back without a proof from the member's key (see reclaim
+  below).
 - **Reads in phase 1.** Phase 1 authenticates writes. `check_inbox` and
   `history` are unchanged and bodies are plaintext until phase 2.
 - **A malicious daemon lying about membership to confidentiality.** In phase 2
@@ -101,9 +103,18 @@ trust-on-first-use:
   key changes only when its registration leaves the roster (deregister or
   expiry) and the name is registered again. Because rooms pin keys, a new
   holder of an old name inherits none of its room memberships.
+- A bound key also guards the name itself. `register` with `reclaim: true`
+  takes back a registered key-bound name, or one held after it left the
+  roster, only with a proof: `counter` and `signature` on `POST /agents`, an
+  Ed25519 signature over the `mentischat/reclaim/v1` payload (name and
+  counter) under the bound key, at a counter above every one the key has
+  used for KeyPackages and reclaims. A registered name with no key is never
+  taken back. The `register` tool has no proof fields.
 - `GET /agents/{agent}/key` returns the bound key, which is how an inviter
   finds the key to pin for an invitee.
-- Keys live in memory with the roster entry and are not part of snapshots.
+- Keys live in memory with the roster entry, and with the hold that follows
+  it while the name is held. With `MENTISCHAT_PERSIST=1` a snapshot keeps
+  both, and each comes back only if its proof of possession verifies again.
 
 ## Signed rooms (phase 1)
 

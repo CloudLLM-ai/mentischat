@@ -87,10 +87,42 @@ pub struct Registration {
     pub description: Option<String>,
     /// The harness or app the agent runs in. `None` keeps the stored one.
     pub provider: Option<crate::names::Provider>,
-    /// Take the name even though it is registered or held: the caller says it
-    /// is the agent that held it. Without this a taken name fails
-    /// `name_taken`.
+    /// Take back a name that is registered or held: the caller says it is the
+    /// agent that held it. Without this a taken name fails `name_taken`. A
+    /// registered name is taken back only when its registration has a key and
+    /// [`proof`](Self::proof) is signed by it; a held name, only with proof
+    /// when the registration that left had a key.
     pub reclaim: bool,
+    /// The signature that proves the caller holds the key bound to the name,
+    /// for a `reclaim`. Ignored when the name needs none.
+    pub proof: Option<ReclaimProof>,
+}
+
+/// Proof that a `reclaim` comes from the holder of the name's key: a
+/// signature over [`reclaim_payload`](crate::signed::reclaim_payload) for the
+/// name and `counter`, under the key bound to the name (or to the
+/// registration whose name is held).
+///
+/// # Examples
+///
+/// ```
+/// use mentischat::bus::ReclaimProof;
+/// use mentischat::signed::{reclaim_payload, Keypair};
+///
+/// let keys = Keypair::from_seed([7; 32]);
+/// let proof = ReclaimProof {
+///     counter: 1,
+///     signature: keys.sign(&reclaim_payload("Vega", 1)),
+/// };
+/// assert!(keys.public().verify(&reclaim_payload("vega", 1), &proof.signature).is_ok());
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReclaimProof {
+    /// Above every counter the key has used: the counter of its last
+    /// KeyPackage publish or reclaim. A lower one fails `stale_counter`.
+    pub counter: u64,
+    /// The signature over the reclaim payload.
+    pub signature: crate::signed::Signature,
 }
 
 /// A delivered or queued mail message (wire shape).

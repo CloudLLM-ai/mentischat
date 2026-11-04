@@ -7,21 +7,27 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{bus_with_clock, fresh_bus, name, reclaim, stats};
+use common::{bind_key, bus_with_clock, fresh_bus, name, proven_reclaim, stats};
 use mentischat::bus::{Bus, Registration, Retention};
 use mentischat::errors::MailboxError;
 use mentischat::names::AgentName;
 
+/// A proven reclaim of a registered, key-bound name refreshes the entry and
+/// keeps the mail queued for it.
 #[tokio::test]
 async fn reclaiming_a_registered_name_keeps_its_unread_mail() {
     let (_d, bus) = fresh_bus("idem");
     bus.register(&name("grok")).await.unwrap();
+    let keys = bind_key(&bus, "grok", 1).await;
     bus.register(&name("opencode")).await.unwrap();
     bus.send(&name("opencode"), &name("grok"), "hi".into())
         .await
         .unwrap();
 
-    let again = bus.register_with(&name("grok"), reclaim()).await.unwrap();
+    let again = bus
+        .register_with(&name("grok"), proven_reclaim(&keys, "grok", 1))
+        .await
+        .unwrap();
     assert!(!again.created);
 
     let page = bus.check_inbox(&name("grok"), 0).await.unwrap();
@@ -604,11 +610,6 @@ async fn overview_fails_once_the_bus_is_closed() {
 #[tokio::test]
 async fn description_and_provider_are_set_kept_and_cleared_by_register() {
     let (_d, bus) = fresh_bus("describe");
-    let set = |d: &str| Registration {
-        description: Some(d.into()),
-        reclaim: true,
-        ..Registration::default()
-    };
 
     let out = bus
         .register_with(
@@ -616,7 +617,7 @@ async fn description_and_provider_are_set_kept_and_cleared_by_register() {
             Registration {
                 description: Some("reviews PRs".into()),
                 provider: Some(mentischat::names::Provider::parse("Grok_Build").unwrap()),
-                reclaim: false,
+                ..Registration::default()
             },
         )
         .await
@@ -625,7 +626,16 @@ async fn description_and_provider_are_set_kept_and_cleared_by_register() {
     assert_eq!(out.description.as_deref(), Some("reviews PRs"));
     assert_eq!(out.provider.as_deref(), Some("grok_build"), "lowercased");
 
-    let kept = bus.register_with(&name("grok"), reclaim()).await.unwrap();
+    // Updating a registered name is a reclaim, so it needs the name's key.
+    let keys = bind_key(&bus, "grok", 2).await;
+    let set = |d: &str, counter: u64| Registration {
+        description: Some(d.into()),
+        ..proven_reclaim(&keys, "grok", counter)
+    };
+    let kept = bus
+        .register_with(&name("grok"), proven_reclaim(&keys, "grok", 1))
+        .await
+        .unwrap();
     assert_eq!(
         kept.description.as_deref(),
         Some("reviews PRs"),
@@ -633,14 +643,14 @@ async fn description_and_provider_are_set_kept_and_cleared_by_register() {
     );
     assert_eq!(kept.provider.as_deref(), Some("grok_build"));
 
-    bus.register_with(&name("grok"), set("writes docs"))
+    bus.register_with(&name("grok"), set("writes docs", 2))
         .await
         .unwrap();
     let roster = bus.list_agents().await.unwrap().agents;
     assert_eq!(roster[0].description.as_deref(), Some("writes docs"));
     assert_eq!(roster[0].provider.as_deref(), Some("grok_build"));
 
-    let cleared = bus.register_with(&name("grok"), set("")).await.unwrap();
+    let cleared = bus.register_with(&name("grok"), set("", 3)).await.unwrap();
     assert_eq!(cleared.description, None, "an empty description clears it");
     assert_eq!(bus.list_agents().await.unwrap().agents[0].description, None);
 }

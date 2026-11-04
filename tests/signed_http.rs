@@ -11,7 +11,7 @@ use tower::ServiceExt;
 
 use mentischat::bus::Bus;
 use mentischat::rest;
-use mentischat::signed::{register_key_payload, Envelope, Keypair, SignedOp};
+use mentischat::signed::{reclaim_payload, register_key_payload, Envelope, Keypair, SignedOp};
 
 fn app() -> (tempfile::TempDir, Router) {
     let dir = tempfile::tempdir().unwrap();
@@ -243,4 +243,70 @@ async fn malformed_signed_requests_are_client_errors() {
     assert_eq!((s, v["error"].as_str()), (404, Some("room_not_found")));
     let (s, _) = call(&app, "GET", "/signed/rooms/ops", None).await;
     assert_eq!(s, 400);
+}
+
+/// `POST /agents` takes back a key-bound name with `counter` and `signature`
+/// signed by its key, and maps each way the proof can fail to its status.
+#[tokio::test]
+async fn post_agents_reclaims_a_key_bound_name_with_a_signed_proof() {
+    let (_d, app) = app();
+    let owner = Keypair::from_seed([1; 32]);
+    enroll(&app, "Vega", &owner).await;
+    let body = |keys: &Keypair, counter: u64| {
+        let sig = keys.sign(&reclaim_payload("vega", counter));
+        json!({ "agent": "vega", "reclaim": true, "counter": counter, "signature": sig.to_hex() })
+    };
+
+    let (s, v) = call(
+        &app,
+        "POST",
+        "/agents",
+        Some(json!({"agent": "vega", "reclaim": true})),
+    )
+    .await;
+    assert_eq!((s, v["error"].as_str()), (409, Some("name_taken")), "{v}");
+
+    let stranger = Keypair::from_seed([9; 32]);
+    let (s, v) = call(&app, "POST", "/agents", Some(body(&stranger, 5))).await;
+    assert_eq!(
+        (s, v["error"].as_str()),
+        (401, Some("invalid_signature")),
+        "{v}"
+    );
+
+    let (s, v) = call(&app, "POST", "/agents", Some(body(&owner, 5))).await;
+    assert_eq!(
+        (s, v["agent"].as_str(), v["created"].as_bool()),
+        (200, Some("Vega"), Some(false)),
+        "{v}"
+    );
+
+    let (s, v) = call(&app, "POST", "/agents", Some(body(&owner, 5))).await;
+    assert_eq!(
+        (s, v["error"].as_str(), v["last"].as_u64()),
+        (409, Some("stale_counter"), Some(5)),
+        "{v}"
+    );
+
+    for (bad, error) in [
+        (
+            json!({"agent": "vega", "reclaim": true, "counter": 6}),
+            "invalid_body",
+        ),
+        (
+            json!({"agent": "vega", "reclaim": true, "signature": "00"}),
+            "invalid_body",
+        ),
+        (
+            json!({"agent": "vega", "reclaim": true, "counter": "x", "signature": "00"}),
+            "invalid_body",
+        ),
+        (
+            json!({"agent": "vega", "reclaim": true, "counter": 6, "signature": "zz"}),
+            "invalid_signature",
+        ),
+    ] {
+        let (s, v) = call(&app, "POST", "/agents", Some(bad.clone())).await;
+        assert_eq!(v["error"].as_str(), Some(error), "{bad} -> {s} {v}");
+    }
 }

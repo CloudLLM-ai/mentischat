@@ -253,3 +253,27 @@ async fn a_snapshot_with_invalid_names_or_repeated_agents_skips_them() {
     );
     assert!(bus.list_rooms(&name("ok")).await.unwrap().rooms.is_empty());
 }
+
+/// The numbered-name rule applies to new registrations only: a numbered name
+/// already on the roster comes back from a snapshot with its mail, stays
+/// taken, and can send and receive.
+#[tokio::test]
+async fn a_restored_numbered_name_keeps_its_registration_and_mail() {
+    let (_d, bus) = bus_from(snapshot(
+        &["vega_1", "orion"],
+        vec![msg_rec(1, "orion", "vega_1", 0)],
+        vec![],
+    ));
+    let roster = bus.list_agents().await.unwrap();
+    let names: Vec<&str> = roster.agents.iter().map(|a| a.name.as_str()).collect();
+    assert_eq!(names, ["orion", "vega_1"]);
+    let page = bus.check_inbox(&name("vega_1"), 0).await.unwrap();
+    assert_eq!(page.messages.len(), 1, "its mail survived the restart");
+    bus.send(&name("vega_1"), &name("orion"), "hi".into())
+        .await
+        .unwrap();
+    assert!(matches!(
+        bus.register(&name("Vega_1")).await,
+        Err(MailboxError::NameTaken { .. })
+    ));
+}

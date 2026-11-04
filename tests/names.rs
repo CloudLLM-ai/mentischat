@@ -173,7 +173,7 @@ async fn suggestions_skip_registered_and_held_names() {
         "nothing left to suggest"
     );
     // Names outside the list are still fine.
-    assert!(bus.register(&name("reviewer-2")).await.unwrap().created);
+    assert!(bus.register(&name("reviewer2")).await.unwrap().created);
 }
 
 #[tokio::test]
@@ -339,13 +339,13 @@ async fn a_full_roster_refuses_a_reclaimed_held_name() {
     bus.register(&name("Vega")).await.unwrap();
     bus.deregister(&name("Vega")).await.unwrap();
     for i in 0..mentischat::bus::MAX_ROSTER {
-        bus.register(&name(&format!("agent_{i}"))).await.unwrap();
+        bus.register(&name(&format!("agent{i}"))).await.unwrap();
     }
     assert!(matches!(
         bus.register_with(&name("Vega"), reclaim()).await,
         Err(MailboxError::RosterFull { .. })
     ));
-    bus.deregister(&name("agent_0")).await.unwrap();
+    bus.deregister(&name("agent0")).await.unwrap();
     assert!(
         bus.register_with(&name("Vega"), reclaim())
             .await
@@ -377,5 +377,35 @@ async fn too_many_waiters_names_the_roster_spelling() {
     }
     for t in parked {
         assert!(t.await.unwrap().unwrap().messages.is_empty());
+    }
+}
+
+/// A new registration of a name ending in a separator and digits fails
+/// `numbered_name` with free suggestions and registers nothing, in any case.
+#[tokio::test]
+async fn a_numbered_name_is_refused_with_suggestions() {
+    let (_d, bus) = fresh_bus("numbered");
+    bus.register(&name("Vega")).await.unwrap();
+    for numbered in ["Vega_2", "vega-2", "VEGA.10", "orion_0"] {
+        match bus.register(&name(numbered)).await {
+            Err(MailboxError::NumberedName { agent, suggestions }) => {
+                assert_eq!(agent, numbered);
+                assert_eq!(suggestions.len(), SUGGESTION_COUNT);
+                assert!(!folded(&suggestions).contains("vega"), "{suggestions:?}");
+            }
+            other => panic!("expected numbered_name for {numbered}, got {other:?}"),
+        }
+    }
+    let roster = bus.list_agents().await.unwrap().agents;
+    assert_eq!(roster.len(), 1, "nothing but Vega registered");
+}
+
+/// Digits elsewhere in a name are fine: only a separator followed by nothing
+/// but digits at the end makes a name numbered.
+#[tokio::test]
+async fn names_with_digits_that_are_not_numbered_register() {
+    let (_d, bus) = fresh_bus("digits");
+    for ok in ["vega2", "grok-review.v2", "build-2a", "2b", "r2-d2x"] {
+        assert!(bus.register(&name(ok)).await.unwrap().created, "{ok}");
     }
 }

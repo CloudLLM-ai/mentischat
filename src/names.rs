@@ -10,7 +10,10 @@ pub const MAX_NAME_LEN: usize = 63;
 /// A roster name: 1–63 chars, starting `[a-zA-Z0-9]`, then
 /// `[a-zA-Z0-9._-]`. The roster keeps the spelling it was registered with
 /// but compares names without regard to case, so `Vega` and `vega` are the
-/// same agent.
+/// same agent. A new registration must also not be numbered (see
+/// [`AgentName::is_numbered`]); that rule is the roster's, not the
+/// grammar's, so stored mail and existing registrations under such a name
+/// stay valid.
 ///
 /// Construct through [`AgentName::parse`] so every handler sees a validated
 /// value; the regex lives here, never in tool JSON schemas (local GGUF /
@@ -52,6 +55,30 @@ impl AgentName {
     /// The name lowercased: the form two spellings of one name share.
     pub fn folded(&self) -> String {
         self.0.to_ascii_lowercase()
+    }
+
+    /// Whether the name ends in `.`, `_` or `-` followed only by digits
+    /// (`vega_1`, `vega-2`, `vega.10`): the shape of a numbered copy of
+    /// another name. The roster refuses a new registration of such a name
+    /// with [`MailboxError::NumberedName`]; a name already registered keeps
+    /// working. `vega2` and `grok-review.v2` are not numbered.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mentischat::names::AgentName;
+    ///
+    /// let numbered = |n: &str| AgentName::parse(n).unwrap().is_numbered();
+    /// assert!(numbered("vega_1"));
+    /// assert!(numbered("Vega-02"));
+    /// assert!(numbered("vega.10"));
+    /// assert!(!numbered("vega2"));
+    /// assert!(!numbered("grok-review.v2"));
+    /// assert!(!numbered("vega"));
+    /// ```
+    pub fn is_numbered(&self) -> bool {
+        let stem = self.0.trim_end_matches(|c: char| c.is_ascii_digit());
+        stem.len() < self.0.len() && stem.ends_with(['.', '_', '-'])
     }
 }
 

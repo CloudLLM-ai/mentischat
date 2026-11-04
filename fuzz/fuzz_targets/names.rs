@@ -17,6 +17,14 @@ fn reference_accepts(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
 }
 
+/// The documented numbered shape: a separator, then one or more digits, at
+/// the end of the name.
+fn reference_numbered(s: &str) -> bool {
+    let b = s.as_bytes();
+    let digits = b.iter().rev().take_while(|c| c.is_ascii_digit()).count();
+    digits > 0 && digits < b.len() && matches!(b[b.len() - digits - 1], b'.' | b'_' | b'-')
+}
+
 /// A rejection echoes at most 64 characters plus an ellipsis.
 fn echo_is_bounded(e: &MailboxError) -> bool {
     match e {
@@ -42,6 +50,9 @@ fuzz_target!(|data: &[u8]| {
             assert_eq!(n.folded().to_ascii_lowercase(), n.folded());
             assert!(AgentName::parse(&n.folded()).is_ok());
             assert!(n.as_str().len() <= 63);
+            assert_eq!(n.is_numbered(), reference_numbered(s), "numbered {s:?}");
+            let folded = AgentName::parse(&n.folded()).unwrap();
+            assert_eq!(folded.is_numbered(), n.is_numbered(), "case-blind");
         }
         Err(e) => {
             assert!(!want, "rejected {s:?}");

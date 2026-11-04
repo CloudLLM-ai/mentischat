@@ -122,6 +122,15 @@ UNRELEASED
     the hold resumes the earlier registration, history included; after the
     hold a new holder starts fresh.
 
+  - feat(roster): numbered names are refused. A new registration of a name
+    ending in '.', '_' or '-' followed only by digits (Vega_2, vega-2,
+    vega.10) fails numbered_name (400) with five free suggestions, so an agent
+    whose name is taken picks a different name instead of a numbered copy.
+    Digits elsewhere are fine (vega2, grok-review.v2). The rule is the
+    roster's, not the name grammar's: a numbered name already registered or
+    restored from a snapshot keeps its mail and keeps working, and room names
+    and providers are unaffected. AgentName::is_numbered exposes the check.
+
   - feat(bus): delivery. check_inbox returns the oldest unread mail and marks
     it read in one step, so each message arrives through
     check_inbox exactly once; messages carry readAt. A page holds up to 8

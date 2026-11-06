@@ -8,6 +8,11 @@
 //! (everything unread comes out of a drain), ids ascending within a page, and
 //! history pages that concatenate to the whole log.
 //!
+//! A notify socket is opened and read between operations (`Watch`): its
+//! digest must count exactly what the model says is unread, and, since the
+//! later pulls and `stats` are checked against the model too, looking must
+//! change nothing.
+//!
 //! Determinism: the bus runs on an injected clock that the harness advances
 //! one millisecond per operation, on a paused current-thread runtime, and
 //! only pulls with `wait_ms` 0 are issued.
@@ -100,6 +105,10 @@ enum Op {
         a: u8,
         room: u8,
         before: Before,
+    },
+    /// Open a notify socket, read its digest, close it: read-only.
+    Watch {
+        a: u8,
     },
     SweepNow,
     SweepFar,
@@ -460,6 +469,13 @@ impl Model {
                 let a = idx(a, AGENTS);
                 self.unregistered(a).unwrap_or_else(|| self.pull(a, limit))
             }
+            Op::Watch { a } => {
+                let a = idx(a, AGENTS);
+                self.unregistered(a).unwrap_or_else(|| Out::Page {
+                    rows: Vec::new(),
+                    remaining_or_next: self.remaining(a) as i64,
+                })
+            }
             Op::History { a, with, before } => {
                 let a = idx(a, AGENTS);
                 let before = self.before(before);
@@ -669,6 +685,21 @@ async fn apply(
                 Out::Page {
                     rows: rows(&p.messages),
                     remaining_or_next: p.remaining,
+                }
+            }
+            Err(e) => code(&e),
+        },
+        Op::Watch { a } => match bus.open_notify(&agent(a, false)) {
+            Ok(socket) => {
+                let digest = bus
+                    .notify_digest(&socket)
+                    .expect("a registered agent has one");
+                assert!(digest.from.len() <= mentischat::bus::MAX_DIGEST_NAMES);
+                assert!(digest.rooms.len() <= mentischat::bus::MAX_DIGEST_NAMES);
+                assert_eq!(digest.unread == 0, digest.newest == 0, "{digest:?}");
+                Out::Page {
+                    rows: Vec::new(),
+                    remaining_or_next: digest.unread as i64,
                 }
             }
             Err(e) => code(&e),

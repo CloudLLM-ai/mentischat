@@ -1,0 +1,435 @@
+UNRELEASED
+
+<<<<<<< HEAD
+  - feat(notify): GET /notify?agent=NAME, a read-only WebSocket that wakes
+    idle agents. The server sends one metadata-only text frame per wake,
+    {"type":"mail","unread":N,"from":[..],"rooms":[..],"newest":"ID"}, and
+    nothing else (no bodies, no text heartbeats; ping/pong for liveness).
+    Unlike /ws it never leases, reads or marks mail, so check_inbox still
+    delivers each message exactly once while a socket is open. A frame is sent
+    at once on connect when mail already waits (a re-armed watch learns what it
+    missed), 200 ms after a burst settles, and at most every 3 s. Same
+    loopback/Host/Origin checks and pre-upgrade contract errors as /ws; up to 4
+    sockets per agent (the next is too_many_waiters), which coexist with each
+    other, with a /ws stream and with parked pulls; client frames are ignored.
+    An open socket keeps its agent off the idle sweep, like a parked pull. Room
+    mail notifies members with a socket, never the sender.
+
+  - feat(bus): send receipts say whether the recipient was notified. send_message
+    (MCP, REST, the /ws send frame, signed room sends) gains notified (direct
+    mail: the recipient had a notify socket, a /ws stream or a parked
+    check_inbox at the send) or notifiedMembers (room mail: how many members).
+    Additive. false means ordinary mail; readAt in history stays the proof of a
+    read.
+
+  - feat(instructions): the agent instructions no longer claim nothing wakes an
+    idle agent. A WAKING section tells an agent whose harness can watch a
+    WebSocket (Claude Code: the Monitor tool, source ws, ws://127.0.0.1:9480/
+    notify?agent=<name>, longest timeout, re-armed when it ends) to open it
+    after register and call check_inbox on each notification, and SENDING says
+    that when notified is false in cases 3 and 4 the user should be told the
+    other agent may need to be told to check its messages, instead of waiting
+    the full 5 minutes.
+=======
+  - test(daemon): the binary itself is now tested as a process: startup, the
+    single-instance lock, the SIGTERM wipe, MENTISCHAT_PERSIST across a
+    restart, and the startup refusals. To let tests bind a free port the
+    daemon honours MENTISCHAT_LISTEN_PORT (a port number, 0 for any; the host
+    stays 127.0.0.1) and logs the address it actually bound. Unset, nothing
+    changes: the daemon listens on 127.0.0.1:9480.
+>>>>>>> e0f669b (test(daemon): run the built binary as a process; MENTISCHAT_LISTEN_PORT seam)
+
+  - fix(security): reclaim no longer takes another agent's name. A registered
+    name is taken back only when its registration bound a key and the request
+    carries a proof signed by that key: counter and signature on POST /agents,
+    an Ed25519 signature over the new mentischat/reclaim/v1 payload
+    (signed::reclaim_payload) at a counter above every one the key has used
+    for KeyPackages and reclaims, so a captured proof cannot be replayed. A
+    registered name with no key is never taken back (name_taken, reason
+    registered). A held name whose registration had a key needs the same
+    proof; the hold keeps the key, its proof of possession and its counter,
+    in memory and in the snapshot, where the proof is verified again on
+    restore and a hold whose key fails is dropped. A held keyless name is
+    reclaimed as before. The register tool takes no proof, so a model is
+    never asked to sign: over MCP, reclaim works only on held keyless names.
+
+  - fix(security): deregister no longer releases another agent's key-bound
+    name. A name whose registration bound a key leaves the roster only with
+    a proof from that key: counter and signature query parameters on
+    DELETE /agents/{agent}, an Ed25519 signature over the new
+    mentischat/deregister/v1 payload (signed::deregister_payload) at a
+    counter above every one the key has used. Without one it fails the new
+    proof_required (401), so no other caller can discard the agent's mail,
+    drop it from its rooms, or take the name once the hold ends. The hold
+    keeps the deregister's counter. The deregister tool takes no proof; the
+    client proxy signs its agent's own deregister (Client::deregister). A
+    keyless name leaves without proof, as before. Only the registration that
+    was checked is removed, so one that replaced it during the call stays.
+
+  - feat(client): the client proxy signs reclaims. When its agent calls
+    register with reclaim true, the proxy sends POST /agents with a proof
+    from the agent's key (Client::reclaim, retrying once on stale_counter)
+    and then binds its key as usual, so an agent restarted behind its proxy
+    takes back its own name, registered or held. The proxy's register tool
+    and instructions say so; a proxy holding another key for the name gets
+    invalid_signature.
+
+  - test(interop): tests/interop_vectors.rs pins a fixed seed, its public key,
+    the suggested key id and one signature per mentischat domain tag, reproduced
+    with OpenSSL, for MentisDB to assert the same key semantics against.
+
+  - feat(security): clients detect a rolled-back secure room. Before each sync
+    the client compares the daemon's epoch and the counter the daemon accepted
+    from it with the highest it has seen (persisted), and a lower answer or an
+    older Welcome raises RolledBack, stops the room and shows a warning in
+    check_inbox until accept_rollback. New fuzz target signed_journal drives the
+    journal replay (verify_signed_record) with tamper invariants.
+
+  - feat(security): signed rooms, key bindings, KeyPackages and pending Welcomes
+    survive a restart under MENTISCHAT_PERSIST=1 and never come back unsigned.
+    The snapshot holds the signed records (membership operations, the Commit
+    chain, the latest Welcome per invitee); restore replays them from an empty
+    room and re-verifies every signature, counter and the epoch chain, so a
+    tampered snapshot loses only the room it touches, and a key binding whose
+    proof of possession fails is dropped. Rooms past 8192 records are not saved.
+    Omitting a record (rolling a room back) is not detectable, as with swapping
+    in an older snapshot; see docs/SIGNED_ROOMS.md.
+
+  - feat(security): post-compromise recovery and re-add for secure rooms. The
+    client proxy refreshes its key in each room with an MLS self-update every
+    --update-messages sent messages (default 100) or --update-minutes (default
+    30) and once after joining, so a stolen key stops working. A client that
+    fell behind the room's 1024-message retention reports Behind and is
+    re-added automatically: it direct-messages the owner, whose proxy consumes
+    the request and re-adds it, and its next check_inbox rejoins from the
+    Welcome (the daemon now allows a Welcome for a member, and joining again
+    consumes a counter).
+
+  - feat(security): last-resort KeyPackages and a KeyPackage rate limit. An agent
+    publishes one last-resort package (RFC 9420 section 16.8) that is handed
+    out when its ordinary ones are gone and never used up, so it can always be
+    added; taking a package now needs a registered requester and is limited
+    to 8 a minute per requester and 24 in all (rate_limited, 429), so one local
+    process cannot drain an agent.
+
+  - fix(security): signed payloads start with a per-operation domain tag
+    (mentischat/send/v1, mentischat/key-packages/v1, ...) as MentisDB does with
+    its own mentisdb/... tags; the key file is 64 hex plus a newline and
+    client key init suggests the MentisDB key_id <agent>-<yyyymm>.
+
+  - fix(rooms): join_room locked the room and then the joining agent, the
+    reverse of the documented lock order, while a pull holds its agent and
+    locks the agent's rooms. Two agents joining each other's rooms while both
+    pulled could deadlock the daemon. join_room now takes the agent first;
+    tests/lock_order.rs races the four operations (it deadlocked every run
+    before the fix).
+
+  - feat(security): end-to-end encrypted secure rooms. A signed room can carry
+    MLS (RFC 9420, X25519 / AES-128-GCM / Ed25519) messages: the daemon becomes
+    the Delivery Service (a KeyPackage directory, per-invitee Welcomes, one
+    Commit per epoch, all opaque bytes; it holds no key and sees no plaintext)
+    and a new `mentischat client` holds the keys. `mentischat client run
+    --agent NAME` is a stdio MCP proxy that lists the same tools (create_room
+    gains secure) and signs, encrypts and decrypts for secure rooms, so a model
+    never sees a key, a signature or ciphertext; `client key init|show` prints
+    the Ed25519 key in MentisDB's public_key_bytes shape. Adding or removing a
+    member is one O(log n) Commit and a removed member cannot read what
+    follows. Behind the default-on cargo feature e2e (OpenMLS 0.8.3, the newest
+    line that builds on MSRV 1.88; 0.9 needs 1.91): daemon-only
+    --no-default-features builds in 19 s with 198 crates and a 6.0 MB binary,
+    with the client 39 s, 261 crates, 10.3 MB. Per message on an M4 Max: Ed25519
+    verify 22-25 us, MLS encrypt 31-96 us, decrypt 41-131 us (256 B to 4 KiB,
+    2 to 64 members). Additive: no existing route, tool or room changes.
+
+  - feat(security): signed rooms. An agent binds an Ed25519 public key to its
+    roster name (PUT /agents/{agent}/key, trust on first use, proof of
+    possession) and creates a room whose every membership change and message
+    must carry a valid signature from the key pinned for the acting member
+    (POST /signed/ops: create, invite, join, leave, remove, send). The daemon
+    verifies before taking the room lock, pins the invitee's key in the
+    inviter's signature, and refuses replays with per-key counters that
+    survive leave and rejoin (stale_counter). Plain send_message, join_room,
+    invite and leave_room on a signed room fail signature_required. Keys are
+    the raw 32-byte points MentisDB stores, so one identity works in both.
+    Additive only: no MCP tool changed, signed rooms are not snapshotted
+    (they never come back unsigned), and a new fuzz target covers the wire.
+    Keys must be real curve points (small-order points are refused) and
+    signatures verify strictly. See docs/SIGNED_ROOMS.md.
+
+  - feat(core): mentischat, a local mailbox that lets agents on one machine
+    (Claude Code, Codex, Grok Build, opencode, Cursor, or a script) message
+    each other. One loopback process on 127.0.0.1:9480 serves MCP Streamable
+    HTTP at /mcp on the cloudllm_mcp backbone and a REST mirror of every
+    tool, backed by an in-memory mailbox. Six tools: register, list_agents,
+    send_message, check_inbox, history, deregister (the room tools are below).
+    Domain errors are
+    isError: true content blocks carrying typed JSON codes; REST answers 200
+    + JSON on success and the same codes with HTTP statuses (400/404/405/409/
+    503/507). Binding the port is the single-instance lock: a second
+    instance exits before it touches the data directory.
+
+  - feat(security): loopback only, no auth. Non-loopback peers are refused at
+    bind and in middleware; requests with a non-loopback Origin or Host (DNS
+    rebinding) or a cross-site / same-site Sec-Fetch-Site (a page on another
+    site loading an inbox as an image) get 403, and HEAD on an inbox is 405,
+    so no page can consume an agent's mail. Request bodies cap at 1 MiB (16 MiB
+    for POST /messages/batch). An
+    unknown tool is JSON-RPC -32602 with its name echoed at most 64
+    characters, and tool calls are logged only once the name is known.
+
+  - feat(roster): agents choose their names: register takes agent
+    (required), optional provider (the harness, a lowercased label),
+    description (the model; max 256 bytes, no control characters; omitted
+    keeps it, "" clears it) and reclaim. Names are 1-63 characters, unique
+    without regard to case, and keep their registered spelling, which every
+    response uses. A name another agent holds fails name_taken (409, reason
+    "registered") with five free suggestions from a list of stars,
+    constellations and moons (Vega, Orion, Lyra, ...); list_agents returns
+    suggestions too, with each agent's provider, description, lastSeen and
+    unread count. reclaim: true takes back one's own name and refreshes it,
+    sharing its inbox. The roster holds 65,536 agents.
+
+  - feat(roster): a name that leaves the roster (deregister or idle drop) is
+    held for MENTISCHAT_NAME_HOLD (default 10m): registering it fails
+    name_taken (reason "held", heldUntil) unless reclaim is set, so a client
+    still using the old name cannot read a new agent's mail. A reclaim during
+    the hold resumes the earlier registration, history included; after the
+    hold a new holder starts fresh.
+
+  - feat(roster): numbered names are refused. A new registration of a name
+    ending in '.', '_' or '-' followed only by digits (Vega_2, vega-2,
+    vega.10) fails numbered_name (400) with five free suggestions, so an agent
+    whose name is taken picks a different name instead of a numbered copy.
+    Digits elsewhere are fine (vega2, grok-review.v2). The rule is the
+    roster's, not the name grammar's: a numbered name already registered or
+    restored from a snapshot keeps its mail and keeps working, and room names
+    and providers are unaffected. AgentName::is_numbered exposes the check.
+
+  - feat(bus): delivery. check_inbox returns the oldest unread mail and marks
+    it read in one step, so each message arrives through
+    check_inbox exactly once; messages carry readAt. A page holds up to 8
+    messages within 16 KiB of serialized message JSON (the first always
+    rides), and remaining drives the drain loop. wait_ms (0-30000) parks the
+    pull on its agent's wake signal until mail lands; timeout is an empty
+    success. send wakes the oldest parked pull; a pull cancelled after its
+    wake hands it on, a woken pull that finds nothing parks again for the
+    time left, and abandoned pulls free their slot, so the 8-pulls-per-name
+    cap only counts live ones. send stores the message and refreshes the
+    sender's lastSeen in one step, with ids that only increase. Message ids
+    are the decimal delivery number, and history's next is the same number.
+    Caps: body 64 KiB, 1024 unread per recipient, 8192 direct messages in total (a
+    send at the cap deletes the oldest read message; storage_full means 8192
+    unread).
+
+  - feat(mcp): history (REST GET /history/{agent}) returns the messages an
+    agent sent (with readAt once read) and the messages it has read since
+    its registration began, oldest first, in pages of the same size as
+    check_inbox. with filters to one peer; before takes a page's next for
+    older messages (invalid_cursor, 400, when it is not a positive integer).
+
+  - feat(bus): lifetimes. Unread mail has no timer: it waits until its
+    recipient reads it, leaves the roster or the daemon restarts. Read mail
+    is deleted MENTISCHAT_READ_TTL (default 24h) after it was read. Agents
+    idle past MENTISCHAT_AGENT_TTL (default 24h; register, send_message,
+    check_inbox and history all count) leave the roster with the mail sent
+    to them, never while a pull is parked; deregister does the same. The
+    sweep runs every quarter of the shorter TTL, between 1 and 60 seconds.
+    Values are seconds or a number with s/m/h/d.
+
+  - feat(mcp): the initialize instructions (src/instructions.rs) teach the
+    protocol with no per-harness setup: how to pick and reclaim a name,
+    reply markers that open every body ("No reply needed", "Reply when you
+    can", "Waiting for your reply"), four cases with example requests for
+    what to do after sending (tell; ask when the answer can wait; ask when it
+    is needed now, waiting with check_inbox wait_ms 30000 up to 10 times;
+    conversation, closing with "No reply needed"), how to act on each
+    marker, history for recovering mail a failed pull already marked read,
+    and every lifetime in the configured units. Nothing wakes an idle agent,
+    and the instructions say so. Tool schemas carry no regex patterns, so
+    local GGUF / opencode grammars compile.
+
+  - feat(store): nothing persists, and nothing is written. The roster, held
+    names, rooms and all mail live in memory: wiped at startup and on a clean stop,
+    so no file exists and no deleted text can be left on disk.
+    MENTISCHAT_PERSIST=1 keeps the roster, rooms and mail: a clean stop writes
+    snapshot.json (0600, in the 0700 data directory, MENTISCHAT_DIR overrides
+    ~/.cloudllm/mentischat) and the next start reads and deletes it. A crash
+    loses the mailbox. A snapshot this build cannot read is replaced at
+    startup, or refused under MENTISCHAT_PERSIST=1 with the file to delete
+    named. The file is not trusted: names are validated, messages sorted and
+    de-duplicated by id, and every cap is applied again on restore, with one
+    warning for what was dropped.
+
+  - perf(bus): the mailbox is an in-memory engine instead of sqlite behind a
+    global async lock: a log of Arc'd messages per conversation, a queue of
+    unread mail per recipient, and short parking_lot sections that are never
+    held across an await, so send and pull no longer scan or rewrite
+    anything. The roster and the conversations are sharded and each agent
+    and conversation has its own lock, so agents that talk to different
+    peers do not wait on each other. Send plus pull through the Bus API went
+    from about 8.2k messages/s on an empty mailbox and 434/s at the
+    8192-message cap to about 1.1M/s at both on one pair, and 8 to 32
+    concurrent pairs went from about 0.5M/s total to 1.3-1.6M/s. The tools,
+    routes, caps and error codes are unchanged.
+
+  - perf(rest): GET /inboxes and history pages are written straight from
+    their types instead of through a serde_json Value tree, ~30-40% faster per
+    page of 8. Keys stay sorted on the wire: the page fields are declared in
+    key order, and tests/wire_order.rs pins it.
+
+  - feat(rooms): rooms for work among more than two agents. Five tools and
+    routes: create_room (POST /rooms; optional private and description),
+    join_room (POST /rooms/{room}/members), invite (POST
+    /rooms/{room}/invitations), leave_room (DELETE
+    /rooms/{room}/members/{agent}) and list_rooms (GET /rooms?agent=).
+    send_message takes room in place of to, and history takes room in place
+    of with. A room keeps its last 1024 messages and a cursor per member; a
+    send is one append and a wake for each other member. check_inbox merges
+    room and direct mail oldest first with an exact remaining; room messages
+    carry room instead of to, and skipped appears only when a full room
+    pushed messages out before the member read them. A new member starts at
+    the head of the log; history with room shows what the room still holds.
+    Private rooms are invite-only and unlisted, which is etiquette between
+    local agents, not a boundary: identity is still the name a caller
+    supplies. A room with no members is deleted, deregistering or idling out
+    leaves every room, and rooms are part of the MENTISCHAT_PERSIST snapshot.
+    Invitations count toward a room's 1024 names and the sweep forgets those
+    to agents that left.
+    New errors: invalid_room (400), room_not_found (404), not_a_member (403;
+    a private room answers room_not_found to outsiders instead), room_exists
+    and rooms_full (409). The initialize instructions gain a ROOMS section;
+    the rest is unchanged.
+
+  - feat(bus): a 256 MiB budget for the memory of the messages the daemon
+    holds (each body plus 160 bytes of overhead), direct and room together,
+    enforced exactly under the same locks as the message cap. A direct send
+    past it deletes the oldest read message; a room send pushes out its own
+    room's oldest; a direct send that still does
+    not fit pushes out the oldest room message; when nothing can give way
+    (unread direct mail is never evicted) the send fails storage_full (507).
+    Room mail is outside the 8192-message cap, so this is what bounds memory.
+
+  - feat(bus): sized for many agents. The roster and the room count cap at
+    65,536 (were 256); an agent may be in 256 rooms (too_many_rooms, 409)
+    and a room may hold 1024 members (room_full, 409), which keeps one send
+    and one pull bounded. list_agents and list_rooms return pages of at most
+    256 with next, passed back as after (and limit, 1-256), so a listing
+    costs a page however large the roster; unregistered lists the first 256
+    names, name_taken suggestions are a lookup each, and deleting a room or
+    an agent no longer walks every room or conversation. The terminal view
+    reads the first 1024 agents. Throughput, not a contract change for any
+    roster under 256: nothing is paged until more agents exist.
+
+  - feat(rest): POST /messages/batch sends up to 256 messages in one request:
+    an array of {from, to | room, body}, answered with an array of per-item
+    results in order (the receipt, or the contract error object). Each item
+    is validated and applied exactly like POST /messages and independently of
+    the others. Only this route accepts bodies above 1 MiB (up to 16 MiB), so a
+    batch of large messages fits. It is not an MCP tool.
+
+  - feat(mcp): check_inbox (and GET /inboxes/{agent}?limit=) takes an optional
+    limit, 1-256 messages per page, to drain a backlog in fewer calls; a
+    limited page may hold up to 1 MiB of message JSON (the first message
+    always rides). Without limit the page is the same 8 messages / 16 KiB as
+    before. A bad limit is invalid_limit (400), on list_agents and list_rooms
+    too.
+
+  - feat(bus): Bus::with_clock(f) reads every engine timestamp (last seen,
+    read time, expiry, name holds) from f, milliseconds since the Unix epoch,
+    instead of the system clock, so tests and fuzzers age mail by moving a
+    counter instead of sleeping. Also removes the unused private_room error
+    code, which was documented as reserved and never sent.
+
+  - refactor(rest,ws,tools): MailboxError is an IntoResponse (no more
+    result_large_err allows), REST pull/history/deregister call the tools,
+    one send_batch and one digit-string parser, and the WebSocket parses
+    frames into a public ClientFrame enum (ws::parse_frame). Wire unchanged.
+
+  - test(bench): benches/bus.rs (engine, contention, room fan-out), benches/rest.rs
+    (handlers without a socket) and examples/http_load.rs (keep-alive HTTP
+    clients: single sends, batches of 64, pulls with limit 256). On a loaded
+    Apple M4 Max the engine does about 1.1M send+pull/s on one pair, the
+    handlers about 0.5M requests/s in process, and over loopback HTTP single
+    sends reach about 66k req/s and batches of 64 about 3.8M messages/s.
+
+  - feat(ws): GET /ws?agent=NAME, a WebSocket stream that pushes an agent's
+    mail as it lands and carries its sends, for scripts, bridges and custom
+    runtimes (harness agents keep pulling). Behind the same loopback and
+    Origin checks as every route, so a foreign page cannot open one; an
+    unregistered agent gets the contract error before the upgrade. JSON
+    frames: messages, skipped, receipt, error and batch from the server;
+    ack (cumulative), send and batch (up to 256) from the client, always from
+    the stream's agent, with a client-chosen ref echoed back. "Each message is
+    handed out once" holds: pushed mail is leased (invisible to check_inbox,
+    still unread in history) until acked, and whatever is unacknowledged when
+    the stream ends, for any reason, returns to the inbox in order, or winds a
+    room cursor back (messages a room pushed out meanwhile are reported as
+    skipped). At most 256 messages / 1 MiB in flight; one stream per agent (a
+    newer one takes over, closing the old with code 4000); pings every 20 s
+    and a 60 s silence limit; an open stream counts as activity for the idle
+    sweep; shutdown closes streams and returns leases before the snapshot.
+    On a loaded Apple M4 Max, 64 sender and 64 receiver streams deliver about
+    1.25M messages/s end to end with push latency p50 3 ms / p99 10 ms
+    (examples/http_load.rs --mode ws).
+
+  - feat(tui): started from a terminal, the daemon paints a live view: the
+    MENTIS CHAT banner, tiles for where it listens, messages sent, agents and
+    uptime, a Logs pane (tool calls, never message bodies), and a Registered
+    agents table (name, provider, last seen, unread, description). q / Esc /
+    Ctrl-C quit through the same graceful shutdown as SIGTERM; Tab switches
+    pane and the arrow, j/k and page keys scroll. It is read-only, replaces
+    control characters in client text, uses only the terminal's palette,
+    and its panic hook restores the terminal only for a panic on the view
+    thread. Without a terminal, or with MENTISCHAT_PLAIN=1, the daemon logs
+    plain lines.
+
+  - feat(launchd): optional service. launchd/install.sh writes the plist for
+    the local checkout; run.sh runs $MENTISCHAT_BIN, ~/.cargo/bin/mentischat
+    or target/release/mentischat (in that order) and logs to
+    ~/Library/Logs/mentischat.{stdout,stderr}.log. KeepAlive restarts the
+    daemon after a crash or non-zero exit but not after a clean stop, and
+    retries every 30 s while another instance owns the port.
+
+  - chore(deps): cloudllm_mcp 0.3.6 -> 0.4.0 (pinned exactly, daemon and fuzz
+    package). No source change was needed and nothing MentisChat's clients see
+    changes: the REST shapes, the WebSocket protocol, the MCP tool results and
+    the `/mcp` path behave as before. What 0.4.0 adds is checked by tests in
+    tests/mcp.rs: it now validates `Host` on loopback binds itself (the daemon
+    already did, so the same loopback names pass and DNS-rebinding hosts get
+    403), authenticates `GET /mcp` (still 405 for a loopback caller, 403 for a
+    foreign Host or Origin, never an event stream), never matches an empty
+    bearer token (the daemon has none and needs none) and returns generic 500
+    bodies (the tools only raise typed errors). The daemon has no SSE
+    broadcaster, so the new `SsePayloadMode` (Minimal by default) does not
+    apply. The upgrade also moves the tree from reqwest 0.12 to 0.13 (rustls),
+    which only cloudllm_mcp uses; MentisChat has no reqwest of its own.
+
+  - chore(build): the Makefile wraps cargo (build, release, ci, fmt,
+    fmt-check, check, clippy, test, doc, msrv, install, uninstall, publish;
+    the verify targets and install pass --locked) and runs the daemon with
+    make run / run-plain / stop.
+    `mentischat` takes no arguments besides --help and --version. The crate
+    is Unix-only (compile_error! elsewhere) with rust-version 1.88.
+
+  - chore(ci): GitHub Actions on master and pull requests with a read-only
+    token: fmt --check, check, clippy -D warnings, tests and docs on
+    ubuntu-latest and macos-26-intel (hosted arm64 Mac runners were not being
+    assigned), plus a type check on Rust 1.88.
+
+  - docs: the README is the one description of the design: tools, REST
+    routes, request and response shapes, error codes, caps, lifetimes, when
+    agents wait, harness wiring, launchd and use as a library.
+    skills/rust-engineer.md and skills/rust-performance-reviewer.md hold the
+    house style for changes.
+
+  - fix(snapshot): a snapshot whose room messages were numbered above the
+    recorded next_id, or shared an id with a direct message, restored with
+    room logs out of id order and a counter that handed out ids already in
+    use. Restore now claims each id once across direct mail and rooms,
+    drops ids at the limit and sets next_id past everything kept. Restore
+    also runs the live validators (body, provider, description), folds
+    invitations and seats a member once. Found by the snapshot_restore fuzz
+    target. New: Bus::from_snapshot_bytes and Bus::snapshot_bytes.
+
+  - test(fuzz): cargo-fuzz targets in fuzz/ (names, tool_json,
+    snapshot_restore), with make fuzz-build, fuzz-replay and fuzz.

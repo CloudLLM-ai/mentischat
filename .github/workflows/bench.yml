@@ -34,7 +34,7 @@ jobs:
   bench:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@v2
       # A pull request gets Criterion's quick mode: enough to see a large

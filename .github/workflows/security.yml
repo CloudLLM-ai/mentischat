@@ -24,7 +24,7 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny@0.20.2,cargo-audit
@@ -39,7 +39,7 @@ jobs:
   lints:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install stable --profile minimal --component clippy
       - uses: Swatinem/rust-cache@v2
       - run: make clippy-security
@@ -52,7 +52,7 @@ jobs:
   unsafe:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@v2
       - name: Cache cargo-geiger

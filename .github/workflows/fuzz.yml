@@ -31,7 +31,7 @@ jobs:
     outputs:
       list: ${{ steps.list.outputs.list }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-fuzz
       - id: list
         run: echo "list=$(make --no-print-directory fuzz-targets)" >> "$GITHUB_OUTPUT"
@@ -44,7 +44,7 @@ jobs:
       matrix:
         target: ${{ fromJSON(needs.targets.outputs.list) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-fuzz
       - name: Fuzz ${{ matrix.target }}
         run: make fuzz TARGET=${{ matrix.target }} FUZZ_SECONDS=${{ inputs.seconds || 300 }}

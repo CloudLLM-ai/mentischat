@@ -1,0 +1,69 @@
+name: bench
+
+# Criterion benchmarks: weekly on master (the baseline history), on demand, and
+# advisory on pull requests that touch code the benches measure. Shared runners
+# are noisy, so a regression is judged against a wide threshold (25% on
+# medians, BENCH_THRESHOLD in the Makefile) and a pull request never fails on
+# it. The baseline is the previous scheduled run's `bench-results` artifact;
+# the artifacts, kept 90 days, are the history. docs/ENGINEERING.md, "Benchmarks".
+on:
+  schedule:
+    - cron: "41 3 * * 0"
+  workflow_dispatch:
+    inputs:
+      advisory:
+        description: Report regressions without failing the run
+        type: boolean
+        default: true
+  pull_request:
+    paths:
+      - "src/**"
+      - "benches/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  CARGO_TERM_COLOR: always
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      # A pull request gets Criterion's quick mode: enough to see a large
+      # regression, cheap enough to run on every push to the branch.
+      - name: Benchmarks
+        run: make bench BENCH_ARGS="${{ github.event_name == 'pull_request' && '--quick' || '' }}"
+      - run: make bench-json
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: target/bench/current.json
+          retention-days: 90
+      - name: Fetch the baseline
+        id: baseline
+        continue-on-error: true
+        run: make bench-baseline
+      - name: Compare with the baseline
+        if: steps.baseline.outcome == 'success'
+        env:
+          # Only a scheduled run can fail on a regression.
+          BENCH_ADVISORY: ${{ (github.event_name != 'schedule' && (github.event_name == 'pull_request' || inputs.advisory)) && '1' || '' }}
+        run: make bench-compare
+      - name: Job summary
+        if: always()
+        run: |
+          echo "### Benchmarks" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f target/bench/compare.md ]; then
+            grep -v '^::' target/bench/compare.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No baseline yet (the first scheduled run creates it); medians are in the bench-results artifact." >> "$GITHUB_STEP_SUMMARY"
+          fi

@@ -1,5 +1,11 @@
 name: ci
 
+# The gates every change passes: formatting, type check, lints, tests, docs,
+# the MSRV, coverage and the fuzz corpus replay. Each step is one Makefile
+# target, so `make <target>` reproduces it locally; docs/ENGINEERING.md lists
+# them with their thresholds. Dependency policy is audit.yml, benchmarks are
+# bench.yml, longer fuzzing is fuzz.yml, the weekly review is security.yml and
+# the soak test is soak.yml.
 on:
   push:
     branches: [master]
@@ -12,6 +18,10 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   verify:
@@ -27,28 +37,14 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-
       - name: Install toolchain
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
-
       - uses: Swatinem/rust-cache@v2
-
-      - name: Formatting
-        run: cargo fmt --check
-
-      - name: Check
-        run: cargo check --all-targets --all-features --locked
-
-      - name: Clippy
-        run: cargo clippy --all-targets --all-features --locked -- -D warnings
-
-      - name: Tests
-        run: cargo test --all-features --locked
-
-      - name: Docs
-        env:
-          RUSTDOCFLAGS: -D warnings
-        run: cargo doc --all-features --no-deps --locked
+      - run: make fmt-check
+      - run: make check
+      - run: make clippy
+      - run: make test
+      - run: make doc
 
   msrv:
     # Guards the rust-version claim in Cargo.toml.
@@ -57,7 +53,34 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup toolchain install 1.88 --profile minimal
       - uses: Swatinem/rust-cache@v2
-      - run: cargo +1.88 check --all-targets --all-features --locked
+      - run: make msrv
+
+  coverage:
+    # Tests under instrumentation, then the gate in scripts/coverage_gate.py:
+    # at least 90% of regions, functions and lines. The HTML report and the
+    # lcov file are the artifact; the table is the job summary.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal --component llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - run: make coverage
+      - name: Job summary
+        if: always()
+        run: cat target/coverage/summary.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            target/coverage/html
+            target/coverage/lcov.info
+            target/coverage/summary.json
+          if-no-files-found: ignore
 
   fuzz:
     # Builds every fuzz target and replays the committed corpora: seconds, and
@@ -70,18 +93,6 @@ jobs:
       RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@v4
-      - run: rustup toolchain install nightly --profile minimal
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: fuzz
-      - name: Cache cargo-fuzz
-        id: cargo-fuzz
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/cargo-fuzz
-          key: cargo-fuzz-${{ runner.os }}-0.13.2
-      - name: Install cargo-fuzz
-        if: steps.cargo-fuzz.outputs.cache-hit != 'true'
-        run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - uses: ./.github/actions/setup-fuzz
       - run: make fuzz-build
       - run: make fuzz-replay

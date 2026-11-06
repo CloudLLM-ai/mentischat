@@ -1,0 +1,24 @@
+name: setup-fuzz
+description: >
+  Nightly Rust, a cache for the fuzz crate's build, and a pinned cargo-fuzz.
+  Every workflow that fuzzes (ci.yml, fuzz.yml, security.yml) starts here, so
+  the toolchain and the cargo-fuzz version change in one place.
+
+runs:
+  using: composite
+  steps:
+    - run: rustup toolchain install nightly --profile minimal
+      shell: bash
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: fuzz
+    - name: Cache cargo-fuzz
+      id: cargo-fuzz
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/bin/cargo-fuzz
+        key: cargo-fuzz-${{ runner.os }}-0.13.2
+    - name: Install cargo-fuzz
+      if: steps.cargo-fuzz.outputs.cache-hit != 'true'
+      run: cargo install cargo-fuzz --version 0.13.2 --locked
+      shell: bash

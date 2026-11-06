@@ -1,0 +1,33 @@
+name: soak
+
+# The soak test (tests/soak.rs): the real daemon under mixed mail and room
+# traffic for an hour, restarted halfway under MENTISCHAT_PERSIST=1, checked
+# for lost or duplicated messages and for memory and file-descriptor growth.
+# Weekly on Saturday and on demand; never per push. `make soak` is the same
+# test locally. docs/ENGINEERING.md, "Soak test", lists what it asserts.
+on:
+  schedule:
+    - cron: "0 2 * * 6"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Length of the run in seconds (at least 120)
+        default: "3600"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    # The run, the build and the slack of a shared runner.
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - name: Soak
+        run: make soak SOAK_SECONDS=${{ inputs.seconds || 3600 }}

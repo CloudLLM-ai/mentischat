@@ -1,5 +1,6 @@
 # Makefile
-.PHONY: build release clean fmt fmt-check check test doc help tasks clippy publish publish-dry-run install uninstall run run-plain stop ci msrv deny fuzz-build fuzz-replay fuzz
+# Sections below: build and verify, dependencies and coverage, fuzzing, benchmarks, soak, run.
+.PHONY: build release clean fmt fmt-check check test doc help tasks clippy publish publish-dry-run install uninstall run run-plain stop ci msrv deny clippy-security coverage coverage-open bench bench-json bench-baseline bench-compare soak fuzz-build fuzz-targets fuzz-replay fuzz fuzz-cmin
 
 default: help
 CARGO_CMD=/usr/bin/env cargo
@@ -11,6 +12,22 @@ MSRV?=1.88
 FUZZ_SECONDS?=60
 # The crate has no `unsafe`, so AddressSanitizer would only slow the fuzzers down (about 2x); skip it.
 FUZZ_FLAGS=-s none
+# Coverage gate: percent required of each metric (docs/ENGINEERING.md, "Coverage").
+COVERAGE_MIN?=90
+# The one file the gate leaves out: the interactive TTY painter, which needs a terminal.
+COVERAGE_IGNORE=src/tui/painter\.rs
+COVERAGE_DIR=target/coverage
+# Security-relevant clippy lints on shipped code (lib and bins, not tests). SECURITY_DENY is
+# clean today and gates; SECURITY_REPORT has findings and is only reported (docs/ENGINEERING.md).
+SECURITY_DENY=-D clippy::unwrap_used -D clippy::todo -D clippy::unimplemented -D clippy::dbg_macro -D clippy::mem_forget
+SECURITY_REPORT=-W clippy::expect_used -W clippy::panic -W clippy::indexing_slicing -W clippy::arithmetic_side_effects
+# Benchmarks: where results go, the regression threshold in percent (shared CI runners are
+# noisy, so it is wide; docs/ENGINEERING.md, "Benchmarks"), and extra Criterion arguments.
+BENCH_DIR=target/bench
+BENCH_THRESHOLD?=25
+BENCH_ARGS?=
+# Soak test length in seconds (at least 120; CI runs an hour weekly).
+SOAK_SECONDS?=600
 
 # ----------------------------------------------------------------------------------------------------------------------
 # Targets
@@ -36,12 +53,61 @@ msrv: ## Type-check on the minimum supported Rust version (MSRV, default 1.88)
 deny: ## Check dependencies against deny.toml (advisories, licenses, bans, sources)
 	cargo deny --locked check
 
+# RUSTFLAGS is cleared so CI's `-D warnings` does not turn the report lints into errors.
+clippy-security: ## Gate on unwrap/todo/dbg lints in shipped code; report panics, indexing, arithmetic
+	RUSTFLAGS= ${CARGO_CMD} clippy --release --lib --bins --all-features --locked -- $(SECURITY_DENY)
+	mkdir -p target
+	RUSTFLAGS= ${CARGO_CMD} clippy --release --lib --bins --all-features --locked --message-format=json -- $(SECURITY_REPORT) > target/clippy-report.json
+	python3 scripts/clippy_report.py target/clippy-report.json --markdown target/clippy-report.md
+
+# Tests under instrumentation once, then three reports from the same profile data (needs
+# cargo install cargo-llvm-cov and `rustup component add llvm-tools-preview`).
+coverage: ## Coverage with HTML + lcov reports, failing under COVERAGE_MIN% (regions, functions, lines)
+	mkdir -p $(COVERAGE_DIR)
+	cargo llvm-cov clean --workspace
+	cargo llvm-cov --no-report --all-features --locked
+	cargo llvm-cov report --ignore-filename-regex '$(COVERAGE_IGNORE)' --html --output-dir $(COVERAGE_DIR)
+	cargo llvm-cov report --ignore-filename-regex '$(COVERAGE_IGNORE)' --lcov --output-path $(COVERAGE_DIR)/lcov.info
+	cargo llvm-cov report --ignore-filename-regex '$(COVERAGE_IGNORE)' --json --summary-only --output-path $(COVERAGE_DIR)/summary.json
+	python3 scripts/coverage_gate.py $(COVERAGE_DIR)/summary.json --min regions=$(COVERAGE_MIN) --min functions=$(COVERAGE_MIN) --min lines=$(COVERAGE_MIN) --markdown $(COVERAGE_DIR)/summary.md
+
+coverage-open: coverage ## Open the HTML coverage report (macOS)
+	open $(COVERAGE_DIR)/html/index.html
+
+# Criterion benches (benches/*.rs). BENCH_ARGS=--quick gives a fast, rougher pass.
+bench: ## Run every Criterion bench (BENCH_ARGS=--quick for a fast pass)
+	${CARGO_CMD} bench --all-features --locked -- $(BENCH_ARGS)
+
+bench-json: ## Collect the medians of the last `make bench` into target/bench/current.json
+	python3 scripts/bench.py collect --out $(BENCH_DIR)/current.json
+
+# Needs the GitHub CLI logged in. Takes the newest successful scheduled run of bench.yml on master.
+bench-baseline: ## Download the last scheduled run's results as target/bench/baseline/current.json
+	rm -rf $(BENCH_DIR)/baseline
+	id=$$(gh run list --workflow bench.yml --branch master --event schedule --status success --limit 1 --json databaseId --jq '.[0].databaseId'); \
+	test -n "$$id" || { echo "no successful scheduled bench run to compare against yet"; exit 1; }; \
+	gh run download "$$id" --name bench-results --dir $(BENCH_DIR)/baseline
+
+bench-compare: ## Compare current.json with the baseline; fails past BENCH_THRESHOLD% (BENCH_ADVISORY=1 never fails)
+	python3 scripts/bench.py compare $(BENCH_DIR)/current.json $(BENCH_DIR)/baseline/current.json --threshold $(BENCH_THRESHOLD) --markdown $(BENCH_DIR)/compare.md $(if $(BENCH_ADVISORY),--advisory)
+
+# The daemon binary under sustained traffic with a restart halfway (tests/soak.rs).
+soak: ## Soak test: SOAK_SECONDS (default 600) of mixed traffic, a restart, leak and delivery checks
+	SOAK_SECONDS=$(SOAK_SECONDS) ${CARGO_CMD} test --release --all-features --locked --test soak -- --ignored --nocapture soak_long
+
 # Fuzzing needs nightly and cargo-fuzz (cargo install cargo-fuzz); it is not part of `make ci`.
 fuzz-build: ## Build every fuzz target (needs nightly and cargo-fuzz)
 	${CARGO_CMD} +nightly fuzz build $(FUZZ_FLAGS)
 
+fuzz-targets: ## List the fuzz targets as a JSON array (the CI matrix reads this)
+	@${CARGO_CMD} +nightly fuzz list | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().split()))'
+
 fuzz-replay: ## Replay each committed fuzz corpus once (fast regression pass)
 	for t in $$(${CARGO_CMD} +nightly fuzz list); do ${CARGO_CMD} +nightly fuzz run $(FUZZ_FLAGS) $$t fuzz/corpus/$$t -- -runs=0 || exit 1; done
+
+fuzz-cmin: ## Minimize one target's corpus in place before committing it: make fuzz-cmin TARGET=names
+	@test -n "$(TARGET)" || { echo "usage: make fuzz-cmin TARGET=<name>"; exit 1; }
+	${CARGO_CMD} +nightly fuzz cmin $(FUZZ_FLAGS) $(TARGET) fuzz/corpus/$(TARGET)
 
 fuzz: ## Fuzz one target: make fuzz TARGET=names FUZZ_SECONDS=60
 	@test -n "$(TARGET)" || { echo "usage: make fuzz TARGET=<name> [FUZZ_SECONDS=60]"; exit 1; }

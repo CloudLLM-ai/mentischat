@@ -1,0 +1,81 @@
+name: security
+
+# The weekly security review, one run with four parts:
+#   audit   dependency policy plus a full-lockfile `cargo audit` report
+#   lints   unwrap/todo/dbg gate and the report-only panic, indexing and
+#           arithmetic lints on shipped code (`make clippy-security`)
+#   unsafe  an inventory of `unsafe` in the dependency tree (cargo geiger);
+#           our own crate is `#![forbid(unsafe_code)]`, enforced by the compiler
+#   fuzz    a longer pass over every fuzz target (fuzz.yml)
+# Findings land in the job summaries. docs/ENGINEERING.md, "Weekly security
+# audit", says how to read them.
+on:
+  schedule:
+    - cron: "11 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.2,cargo-audit
+      - name: Dependency policy (gate)
+        run: make deny
+      # cargo-audit reads the whole lockfile, including entries cargo never
+      # builds, so it reports more than cargo-deny; it is a report here.
+      - name: cargo audit (report)
+        continue-on-error: true
+        run: cargo audit
+
+  lints:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal --component clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: make clippy-security
+      - name: Job summary
+        if: always()
+        run: |
+          echo "### Security lints (report)" >> "$GITHUB_STEP_SUMMARY"
+          cat target/clippy-report.md >> "$GITHUB_STEP_SUMMARY"
+
+  unsafe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache cargo-geiger
+        id: geiger
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-geiger
+          key: cargo-geiger-${{ runner.os }}-0.14.0
+      - name: Install cargo-geiger
+        if: steps.geiger.outputs.cache-hit != 'true'
+        run: cargo install cargo-geiger --version 0.14.0 --locked
+      - name: Unsafe inventory (report)
+        continue-on-error: true
+        run: cargo geiger --all-features --locked --output-format Ratio > geiger.txt
+      - name: Job summary
+        if: always()
+        run: |
+          echo "### Unsafe inventory (cargo geiger)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat geiger.txt >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  fuzz:
+    uses: ./.github/workflows/fuzz.yml
+    with:
+      seconds: "900"

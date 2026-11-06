@@ -29,6 +29,14 @@ UNRELEASED
     that when notified is false in cases 3 and 4 the user should be told the
     other agent may need to be told to check its messages, instead of waiting
     the full 5 minutes.
+=======
+  - test(daemon): the binary itself is now tested as a process: startup, the
+    single-instance lock, the SIGTERM wipe, MENTISCHAT_PERSIST across a
+    restart, and the startup refusals. To let tests bind a free port the
+    daemon honours MENTISCHAT_LISTEN_PORT (a port number, 0 for any; the host
+    stays 127.0.0.1) and logs the address it actually bound. Unset, nothing
+    changes: the daemon listens on 127.0.0.1:9480.
+>>>>>>> e0f669b (test(daemon): run the built binary as a process; MENTISCHAT_LISTEN_PORT seam)
 
   - fix(security): reclaim no longer takes another agent's name. A registered
     name is taken back only when its registration bound a key and the request

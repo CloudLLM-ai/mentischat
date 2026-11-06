@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use mentischat::bus::{Bus, Retention, SnapshotError};
+use mentischat::listen_addr;
 use mentischat::tui::{self, LogBuffer};
-use mentischat::BIND_ADDR;
 use tokio::sync::Notify;
 
 /// Set when graceful shutdown could not wipe the mailbox on disk.
@@ -124,22 +124,30 @@ async fn run_daemon() -> ExitCode {
         },
     };
 
+    let bind_addr = match listen_addr(|var| std::env::var(var).ok()) {
+        Ok(addr) => addr,
+        Err(e) => {
+            eprintln!("mentischat: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
     // Bind first: the port is the single-instance lock, so a second instance
     // exits here before it reads the live instance's snapshot.
-    let listener = match tokio::net::TcpListener::bind(BIND_ADDR).await {
+    let listener = match tokio::net::TcpListener::bind(bind_addr).await {
         Ok(l) => l,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            eprintln!(
-                "mentischat: {} already in use; another instance owns it",
-                BIND_ADDR
-            );
+            eprintln!("mentischat: {bind_addr} already in use; another instance owns it");
             return ExitCode::FAILURE;
         }
         Err(e) => {
-            eprintln!("mentischat: bind {BIND_ADDR} failed: {e}");
+            eprintln!("mentischat: bind {bind_addr} failed: {e}");
             return ExitCode::FAILURE;
         }
     };
+
+    // With port 0 the OS picked the port, so report the one actually bound.
+    let bound_addr = listener.local_addr().unwrap_or(bind_addr);
 
     let opened = match Bus::with_retention(&data_dir, retention) {
         // A snapshot this build cannot read would be wiped at startup
@@ -183,7 +191,7 @@ async fn run_daemon() -> ExitCode {
     let quit = Arc::new(Notify::new());
 
     tracing::info!(
-        addr = %BIND_ADDR,
+        addr = %bound_addr,
         data = %data_dir.display(),
         "serving MCP at /mcp and REST"
     );
@@ -194,7 +202,7 @@ async fn run_daemon() -> ExitCode {
         let handle = tokio::runtime::Handle::current();
         let info = tui::Info {
             version: env!("CARGO_PKG_VERSION").into(),
-            url: format!("http://{BIND_ADDR}"),
+            url: format!("http://{bound_addr}"),
             data_path: data_dir.display().to_string(),
         };
         // The view runs on its own OS thread, so it may block on the bus.

@@ -58,6 +58,63 @@ pub const MCP_ENDPOINT_PATH: &str = "/mcp";
 /// Loopback listener the process binds. Also the single-instance lock.
 pub const BIND_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9480);
 
+/// Environment variable that moves the listener to another loopback port.
+///
+/// The documented contract is the fixed [`BIND_ADDR`], and agents and clients
+/// look for the daemon there, so the variable is for process-level tests and
+/// embedding only: it never changes the host, which stays `127.0.0.1`, and `0`
+/// asks the OS for a free port (the daemon logs the address it got).
+pub const LISTEN_PORT_VAR: &str = "MENTISCHAT_LISTEN_PORT";
+
+/// Why [`listen_addr`] refused the value of [`LISTEN_PORT_VAR`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenPortError(pub String);
+
+impl std::fmt::Display for ListenPortError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{LISTEN_PORT_VAR} must be a port number from 0 to 65535, got '{}'",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for ListenPortError {}
+
+/// The address the daemon binds: [`BIND_ADDR`], or the same loopback host on
+/// the port named by [`LISTEN_PORT_VAR`] when `var` returns it.
+///
+/// `var` is the environment lookup (`|name| std::env::var(name).ok()` in the
+/// daemon), injected so the rule is testable without touching the process
+/// environment.
+///
+/// # Errors
+///
+/// [`ListenPortError`] when the variable is set to anything but a `u16`; an
+/// empty value counts as unset.
+///
+/// # Examples
+///
+/// ```
+/// use mentischat::{listen_addr, BIND_ADDR};
+///
+/// assert_eq!(listen_addr(|_| None).unwrap(), BIND_ADDR);
+/// let moved = listen_addr(|_| Some("0".to_string())).unwrap();
+/// assert_eq!(moved.port(), 0);
+/// assert!(moved.ip().is_loopback());
+/// assert!(listen_addr(|_| Some("http".to_string())).is_err());
+/// ```
+pub fn listen_addr(var: impl Fn(&str) -> Option<String>) -> Result<SocketAddr, ListenPortError> {
+    match var(LISTEN_PORT_VAR).filter(|v| !v.is_empty()) {
+        None => Ok(BIND_ADDR),
+        Some(raw) => raw
+            .parse::<u16>()
+            .map(|port| SocketAddr::new(BIND_ADDR.ip(), port))
+            .map_err(|_| ListenPortError(raw)),
+    }
+}
+
 /// Compose the full application [`axum::Router`]: REST on the outer router
 /// with the upstream MCP router nested at [`MCP_ENDPOINT_PATH`].
 ///

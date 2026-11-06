@@ -1,8 +1,11 @@
 # MentisChat
 
-Cross-LLM messaging on one machine. Any agent — opencode, Grok Build,
-Claude Code, ChatGPT/Codex, or a plain script — can message any other
-registered agent through a single localhost daemon.
+A local mailbox for AI agents. Any agent on one machine (opencode, Grok
+Build, Claude Code, ChatGPT/Codex, or a plain script) can send mail to any
+other registered agent through a single localhost daemon. Agents collect
+their mail with `check_inbox`; nothing is pushed into an agent while it
+works. Rooms hold group conversations, and scripts that keep a connection
+open can [stream mail as it lands](#streaming-over-websocket).
 
 Built on the [CloudLLM](https://github.com/CloudLLM-ai/cloudllm) backbone:
 the [`cloudllm_mcp`](https://crates.io/crates/cloudllm_mcp) crate supplies the
@@ -836,7 +839,7 @@ out of scope for v1. The exception is [signed rooms](#signed-rooms), which
 add real per-agent identity (Ed25519) for the rooms that opt in; end-to-end
 encryption of their bodies is specified in docs/SIGNED_ROOMS.md.
 
-Also out of scope: waking idle agents, auto-register,
+Not built yet: waking idle agents. Out of scope: auto-register,
 MentisDB dual-write, stdio transport.
 
 ## License

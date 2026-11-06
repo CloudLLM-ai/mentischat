@@ -1,5 +1,7 @@
 //! Process entry: the mailbox daemon.
 
+#![forbid(unsafe_code)]
+
 use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::PathBuf;

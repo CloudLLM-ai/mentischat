@@ -17,6 +17,7 @@
 //! this crate owns mailbox semantics: roster, held names, caps, read
 //! marking, history, expiry, and blocking pulls.
 
+#![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 // The data directory permissions (0700/0600) and SIGTERM handling use

@@ -40,6 +40,7 @@ mod convos;
 mod delivery;
 mod log;
 mod model;
+mod notify;
 mod ownership;
 mod park;
 mod rooms;
@@ -53,18 +54,21 @@ mod stream;
 pub use clock::{now_rfc3339, rfc3339};
 pub use model::{
     parse_duration, AgentOverview, DiscardOutcome, HistoryPage, InboxPage, KeyProof, Message,
-    Overview, RegisterOutcome, Registration, Retention, RosterEntry, RosterListing, SendReceipt,
-    Stats, SweepOutcome, MAX_BATCH, MAX_BODY_BYTES, MAX_DESCRIPTION_BYTES, MAX_PENDING_PER_AGENT,
-    MAX_RETURN_BYTES, MAX_ROSTER, MAX_TOTAL_MESSAGES, MAX_WAITERS_PER_AGENT, MAX_WAIT_MS,
+    Overview, Reach, RegisterOutcome, Registration, Retention, RosterEntry, RosterListing,
+    SendReceipt, Stats, SweepOutcome, MAX_BATCH, MAX_BODY_BYTES, MAX_DESCRIPTION_BYTES,
+    MAX_PENDING_PER_AGENT, MAX_RETURN_BYTES, MAX_ROSTER, MAX_TOTAL_MESSAGES, MAX_WAITERS_PER_AGENT,
+    MAX_WAIT_MS,
 };
 pub use model::{
     LeaveOutcome, RoomEntry, RoomInfo, RoomListing, DEFAULT_ROOM_CAPACITY, MAX_RETAINED_BYTES,
     MAX_ROOMS, MESSAGE_OVERHEAD_BYTES,
 };
+pub use model::{MAX_DIGEST_NAMES, MAX_NOTIFY_PER_AGENT};
 pub use model::{
     MAX_LIMITED_PAGE_BYTES, MAX_OVERVIEW_AGENTS, MAX_PAGE, MAX_ROOMS_PER_AGENT, MAX_ROOM_MEMBERS,
     MAX_STREAM_BYTES, MAX_STREAM_IN_FLIGHT,
 };
+pub use notify::{MailDigest, NotifySession};
 pub use signed::{
     KeyBinding, KeyPackageOffer, KeyPackageStock, SignedMember, SignedOutcome, SignedRequest,
     SignedRoomInfo, MAX_KEY_PACKAGES, MAX_KEY_PACKAGE_BYTES, MAX_WELCOME_BYTES, TAKES_PER_MINUTE,
@@ -497,14 +501,14 @@ impl Bus {
     ) -> Result<SendReceipt, MailErr> {
         let body_json_len = validate_body(&body)?;
         let body = body.into_boxed_str();
-        let msg = self.open()?.send(
+        let (msg, heard) = self.open()?.send(
             from.as_str(),
             to.as_str(),
             body,
             body_json_len,
             self.now_ms(),
         )?;
-        Ok(SendReceipt::from(&*msg))
+        Ok(SendReceipt::new(&msg, Reach::Direct(heard)))
     }
 
     /// Pull (and optionally block for) the next batch of unread mail for
@@ -780,7 +784,7 @@ impl Bus {
     ) -> Result<SendReceipt, MailErr> {
         let body_json_len = validate_body(&body)?;
         let (state, sender) = self.active(from)?;
-        let msg = state.send_room(
+        let (msg, heard) = state.send_room(
             &sender,
             room,
             body.into_boxed_str(),
@@ -788,7 +792,7 @@ impl Bus {
             self.now_ms(),
             signed::SendGate::Unsigned,
         )?;
-        Ok(SendReceipt::from(&*msg))
+        Ok(SendReceipt::new(&msg, Reach::Room(heard)))
     }
 
     /// One page of what `room` still holds, for a member: the newest
@@ -838,8 +842,8 @@ impl Bus {
 
     /// [`sweep`](Self::sweep) as of `now` (injectable for tests).
     ///
-    /// An agent with a pull parked right now is never dropped, however old
-    /// its `last_seen`. A dropped agent's name is held for
+    /// An agent with a pull parked, a stream or a notify socket open right now
+    /// is never dropped, however old its `last_seen`. A dropped agent's name is held for
     /// [`Retention::name_hold`] from `now`, and holds that ended by `now`
     /// are forgotten.
     pub async fn sweep_at(&self, now: SystemTime) -> Result<SweepOutcome, MailErr> {
@@ -852,7 +856,11 @@ impl Bus {
             .roster
             .entries()
             .into_iter()
-            .filter(|(_, a)| a.signal.parked() == 0 && a.inner.lock().last_seen_ms < idle_since)
+            .filter(|(_, a)| {
+                a.signal.parked() == 0
+                    && a.signal.watching() == 0
+                    && a.inner.lock().last_seen_ms < idle_since
+            })
             .map(|(key, _)| key)
             .collect();
         stale.sort_unstable();

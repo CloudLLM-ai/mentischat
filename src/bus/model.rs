@@ -46,6 +46,14 @@ pub const MAX_RETAINED_BYTES: usize = 256 * 1024 * 1024;
 pub const MESSAGE_OVERHEAD_BYTES: usize = 160;
 /// Most messages a stream may have pushed and not yet acknowledged.
 pub const MAX_STREAM_IN_FLIGHT: usize = 256;
+/// Notify sockets one agent may hold open at once (`GET /notify`); one more
+/// is refused `too_many_waiters`. A harness re-arms its watch before the old
+/// one is gone and a few tools may watch the same name, so more than one is
+/// normal; the cap only bounds a runaway.
+pub const MAX_NOTIFY_PER_AGENT: usize = 4;
+/// Most sender names and room names one notify frame lists; `unread` is exact
+/// regardless, so a frame stays small however much mail waits.
+pub const MAX_DIGEST_NAMES: usize = 8;
 /// Most message-JSON bytes a stream may have in flight (the first message of a
 /// push always fits).
 pub const MAX_STREAM_BYTES: usize = 1024 * 1024;
@@ -171,17 +179,48 @@ pub struct SendReceipt {
     pub room: Option<String>,
     /// UTC RFC 3339 creation timestamp.
     pub created_at: String,
+    /// Direct mail only: true when, at the moment of the send, the recipient
+    /// had at least one open notify socket, a stream, or a pull parked in
+    /// `check_inbox`, so something is attending to its mail and will tell it
+    /// now. False means ordinary mail: the recipient sees it when it next
+    /// checks. It is a delivery hint, not a read receipt: `readAt` in
+    /// `history` remains the proof the recipient acted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notified: Option<bool>,
+    /// Room mail only: how many members (never the sender) were attended to
+    /// as described under [`notified`](Self::notified) at the moment of the
+    /// send. Zero means nobody in the room will hear of it before they next
+    /// check.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notified_members: Option<usize>,
 }
 
-impl From<&Msg> for SendReceipt {
-    /// The receipt for a message just sent; a room message has no `to`.
-    fn from(msg: &Msg) -> Self {
+/// Who was attending to the recipients of a send when it landed; what a
+/// [`SendReceipt`] reports as `notified` or `notifiedMembers`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// Direct mail: whether the one recipient was attended to.
+    Direct(bool),
+    /// Room mail: how many members were attended to.
+    Room(usize),
+}
+
+impl SendReceipt {
+    /// The receipt for a message just sent, with how far it reached; a room
+    /// message has no `to`.
+    pub(super) fn new(msg: &Msg, reach: Reach) -> Self {
+        let (notified, notified_members) = match reach {
+            Reach::Direct(heard) => (Some(heard), None),
+            Reach::Room(heard) => (None, Some(heard)),
+        };
         Self {
             id: msg.id.to_string(),
             from: msg.from.to_string(),
             to: msg.to.to_string(),
             room: msg.room.as_ref().map(ToString::to_string),
             created_at: rfc3339_ms(msg.created_ms),
+            notified,
+            notified_members,
         }
     }
 }

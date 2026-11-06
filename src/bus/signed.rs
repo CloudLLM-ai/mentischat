@@ -22,7 +22,7 @@ use super::rooms::{not_in_room, Room, RoomState};
 use super::signed_persist::OpRec;
 use super::state::{Agent, Key, State};
 use super::{
-    validate_body, validate_description, Bus, LeaveOutcome, MailErr, RoomInfo, SendReceipt,
+    validate_body, validate_description, Bus, LeaveOutcome, MailErr, Reach, RoomInfo, SendReceipt,
     MAX_ROOMS_PER_AGENT, MAX_ROOM_MEMBERS,
 };
 use crate::names::{AgentName, RoomName};
@@ -495,7 +495,7 @@ impl Bus {
                 let envelope = Envelope::encode(counter, &key, &req.signature, &body);
                 let json_len = super::log::json_len(&envelope);
                 let commit_epoch = crate::signed::mls_commit_epoch(&body);
-                let msg = state.send_room(
+                let (msg, heard) = state.send_room(
                     &agent,
                     room,
                     envelope.into_boxed_str(),
@@ -508,7 +508,10 @@ impl Bus {
                         entry: entry.clone().map(Box::new),
                     },
                 )?;
-                Ok(SignedOutcome::Sent(SendReceipt::from(&*msg)))
+                Ok(SignedOutcome::Sent(SendReceipt::new(
+                    &msg,
+                    Reach::Room(heard),
+                )))
             }
         }
     }

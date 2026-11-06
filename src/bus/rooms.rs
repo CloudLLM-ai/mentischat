@@ -33,7 +33,8 @@ use super::park::Signal;
 use super::signed::{SendGate, SignedState};
 use super::state::{page_from_newest, Agent, Key, State};
 use super::{
-    MailErr, RoomEntry, RoomInfo, MAX_BATCH, MAX_ROOMS, MAX_ROOMS_PER_AGENT, MAX_ROOM_MEMBERS,
+    MailErr, RoomEntry, RoomInfo, MAX_BATCH, MAX_DIGEST_NAMES, MAX_ROOMS, MAX_ROOMS_PER_AGENT,
+    MAX_ROOM_MEMBERS,
 };
 use crate::names::RoomName;
 
@@ -52,6 +53,17 @@ pub(super) struct Member {
     /// Messages pushed out of the room before this member took them, not yet
     /// reported.
     pub skipped: u64,
+}
+
+/// What [`Room::digest`] saw: one member's unread mail in one room.
+#[derive(Debug)]
+pub(super) struct RoomDigest {
+    /// Unread room messages past the member's cursor.
+    pub unread: usize,
+    /// The first distinct senders among them, oldest message first.
+    pub senders: Vec<Arc<str>>,
+    /// Id of the newest of them.
+    pub newest: u64,
 }
 
 /// What changes about a room.
@@ -147,8 +159,11 @@ impl RoomState {
 
     /// Append `msg` (its id exceeds every id in the log; the caller has made
     /// room), and count it unread for every member but its sender, waking a
-    /// pull parked on each.
-    fn append(&mut self, msg: Arc<Msg>, room: &Arc<str>) {
+    /// pull parked on each and ringing the notify sockets. Returns how many
+    /// members were listening (a parked pull, a stream or a notify socket),
+    /// the `notified` count of the sender's receipt.
+    fn append(&mut self, msg: Arc<Msg>, room: &Arc<str>) -> usize {
+        let mut heard = 0;
         for member in self.members.values_mut() {
             if msg.from.eq_ignore_ascii_case(&member.name) {
                 continue;
@@ -157,12 +172,15 @@ impl RoomState {
                 member.signal.mark_room(room);
             }
             member.unread += 1;
+            heard += usize::from(member.signal.listening());
             if member.signal.parked() > 0 {
                 member.signal.notify.notify_one();
             }
+            member.signal.ring();
         }
         self.log.push_back(msg);
         self.publish_oldest();
+        heard
     }
 
     /// The room as it goes on the wire.
@@ -224,6 +242,35 @@ impl Room {
             messages,
             unread: member.unread,
             skipped: member.skipped,
+        })
+    }
+
+    /// What `me` has unread in this room, without taking or marking anything:
+    /// the count, the first [`MAX_DIGEST_NAMES`] distinct senders (oldest
+    /// message first) and the newest id. `None` when it is not a member or
+    /// has nothing unread. Costs one pass over the room's retained log.
+    pub(super) fn digest(&self, me: &Agent) -> Option<RoomDigest> {
+        let st = self.inner.lock();
+        let key = Key::fold(&me.name);
+        let member = st.members.get(key.as_str())?;
+        let start = st.log.partition_point(|m| m.id <= member.cursor);
+        let mine = st
+            .log
+            .range(start..)
+            .filter(|m| !m.from.eq_ignore_ascii_case(&me.name));
+        let (mut senders, mut newest): (Vec<Arc<str>>, u64) = (Vec::new(), 0);
+        for msg in mine {
+            newest = msg.id;
+            if senders.len() < MAX_DIGEST_NAMES
+                && !senders.iter().any(|s| s.eq_ignore_ascii_case(&msg.from))
+            {
+                senders.push(msg.from.clone());
+            }
+        }
+        (member.unread > 0 && newest > 0).then_some(RoomDigest {
+            unread: member.unread,
+            senders,
+            newest,
         })
     }
 
@@ -610,9 +657,9 @@ impl State {
         body_json_len: usize,
         now_ms: u64,
         gate: SendGate<'_>,
-    ) -> Result<Arc<Msg>, MailErr> {
+    ) -> Result<(Arc<Msg>, usize), MailErr> {
         let found = self.live_room(room)?;
-        let msg = {
+        let (msg, heard) = {
             let mut st = found.inner.lock();
             if st.retired || st.member(sender).is_none() {
                 return Err(not_in_room(&found, &st, sender, room));
@@ -634,11 +681,11 @@ impl State {
                 body_json_len,
                 now_ms,
             ));
-            st.append(msg.clone(), &found.name);
-            msg
+            let heard = st.append(msg.clone(), &found.name);
+            (msg, heard)
         };
         self.note_sent(sender, now_ms);
-        Ok(msg)
+        Ok((msg, heard))
     }
 
     /// The rooms `agent` can see: every public room, and the private ones it

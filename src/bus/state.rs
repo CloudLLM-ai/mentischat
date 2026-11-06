@@ -603,13 +603,13 @@ impl State {
         body: Box<str>,
         body_json_len: usize,
         now_ms: u64,
-    ) -> Result<Arc<Msg>, MailErr> {
+    ) -> Result<(Arc<Msg>, bool), MailErr> {
         let (from_key, to_key) = (Key::fold(from), Key::fold(to));
         let sender = self.agent(from, from_key.as_str())?;
         let recipient = self.agent(to, to_key.as_str())?;
         let key = convo_key(&from_key, &to_key);
         let mut body = Some(body);
-        let (msg, at_cap) = loop {
+        let (msg, at_cap, heard) = loop {
             let delivered = {
                 let mut to_state = recipient.inner.lock();
                 if to_state.removed {
@@ -648,7 +648,7 @@ impl State {
         // Sending is activity: an agent that only sends must not age off the
         // roster.
         self.note_sent(&sender, now_ms);
-        Ok(msg)
+        Ok((msg, heard))
     }
 
     /// Count a send against `sender` and mark it seen: sending is activity.
@@ -673,7 +673,7 @@ impl State {
         sender: &Agent,
         recipient: &Agent,
         out: Outgoing<'_>,
-    ) -> Result<(Arc<Msg>, bool), Refused> {
+    ) -> Result<(Arc<Msg>, bool, bool), Refused> {
         let pending = to_state.unread.len() + to_state.leased_direct();
         if pending >= MAX_PENDING_PER_AGENT as usize {
             return Err(Refused::Error(MailErr::QueueFull {
@@ -694,10 +694,12 @@ impl State {
         })?;
         let msg = self.file(out, sender, recipient);
         to_state.unread.push_back(msg.clone());
+        let heard = recipient.signal.listening();
         if recipient.signal.parked() > 0 {
             recipient.signal.notify.notify_one();
         }
-        Ok((msg, at_cap))
+        recipient.signal.ring();
+        Ok((msg, at_cap, heard))
     }
 
     /// Count one more unread and one more live message, failing
@@ -1081,6 +1083,7 @@ impl State {
         let discarded = self.discard_mail_to(key, agent.gen);
         self.total.0.fetch_sub(discarded, Relaxed);
         agent.signal.notify.notify_waiters();
+        agent.signal.ring();
         Some((agent, discarded as i64))
     }
 
@@ -1122,8 +1125,10 @@ impl State {
 
     /// Wake every parked pull: the agents are gone, or the bus closed.
     pub(super) fn wake_all(&self) {
-        self.roster
-            .for_each(|agent| agent.signal.notify.notify_waiters());
+        self.roster.for_each(|agent| {
+            agent.signal.notify.notify_waiters();
+            agent.signal.ring();
+        });
     }
 
     /// Drop everything: roster, mail, holds. Wakes every parked pull (they
@@ -1142,6 +1147,7 @@ impl State {
             self.sent_by_gone.fetch_add(st.sent, Relaxed);
             drop(st);
             agent.signal.notify.notify_waiters();
+            agent.signal.ring();
         }
         holds.clear();
         for convo in self.convos.drain() {

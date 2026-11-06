@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use tokio::sync::Notify;
+use tokio::sync::{watch, Notify};
 
 /// The rooms an agent may have unread or skipped mail in, so a pull looks at
 /// those instead of every room the agent is in.
@@ -35,7 +35,7 @@ impl Default for Hot {
 
 /// What a send wakes. Lives as long as its agent is on the roster; a pull
 /// holds an [`Arc`] to it so it can wait without holding the bus lock.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct Signal {
     /// Woken with `notify_one` per send (the oldest parked pull only) and
     /// with `notify_waiters` when the agent leaves or the bus closes. A pull
@@ -48,6 +48,27 @@ pub(super) struct Signal {
     parked: AtomicUsize,
     /// See [`Hot`]. A leaf lock: nothing is locked while it is held.
     hot: Mutex<Hot>,
+    /// Notify sockets open right now (see [`WatchGuard`]). Raised and
+    /// lowered only by a [`WatchGuard`].
+    watchers: AtomicUsize,
+    /// A counter bumped once per event a notify socket should look at: mail
+    /// landed for the agent, or the agent left or the bus closed. A socket
+    /// keeps its own receiver, so any number of sockets each see every bump
+    /// (or the latest, when several land between two looks), and none takes
+    /// a wake away from a parked pull, which has its own [`Notify`].
+    mail: watch::Sender<u64>,
+}
+
+impl Default for Signal {
+    fn default() -> Self {
+        Self {
+            notify: Notify::new(),
+            parked: AtomicUsize::new(0),
+            hot: Mutex::new(Hot::default()),
+            watchers: AtomicUsize::new(0),
+            mail: watch::channel(0).0,
+        }
+    }
 }
 
 impl Signal {
@@ -70,6 +91,69 @@ impl Signal {
     /// Pulls parked right now.
     pub(super) fn parked(&self) -> usize {
         self.parked.load(Relaxed)
+    }
+
+    /// Notify sockets open right now.
+    pub(super) fn watching(&self) -> usize {
+        self.watchers.load(Relaxed)
+    }
+
+    /// True when something is attending to this agent's mail right now: a
+    /// parked pull, a stream (which counts as parked) or a notify socket.
+    /// This is what a send reports as `notified`.
+    pub(super) fn listening(&self) -> bool {
+        self.parked() > 0 || self.watching() > 0
+    }
+
+    /// Tell the notify sockets something happened (mail landed, the agent
+    /// left, the bus closed). A no-op, and no lock taken, when none is open.
+    pub(super) fn ring(&self) {
+        if self.watching() > 0 {
+            self.mail.send_modify(|n| *n = n.wrapping_add(1));
+        }
+    }
+
+    /// A receiver that has already seen everything rung so far, for a new
+    /// notify socket.
+    pub(super) fn subscribe(&self) -> watch::Receiver<u64> {
+        self.mail.subscribe()
+    }
+}
+
+/// One open notify socket. Dropping it, however the socket ends, frees its
+/// slot toward `MAX_NOTIFY_PER_AGENT` and stops it counting as attending to
+/// the agent's mail (for the idle sweep and for `notified` receipts).
+#[derive(Debug)]
+pub(super) struct WatchGuard {
+    signal: Arc<Signal>,
+}
+
+impl WatchGuard {
+    /// Count a notify socket on `signal`, unless `max` are open already (then
+    /// the number that were). Unlike a pull's slot, a refused socket never
+    /// counts, not even for an instant, so a flood of refused sockets cannot
+    /// make sends report `notified` or hold the sweep off.
+    pub(super) fn try_new(signal: Arc<Signal>, max: usize) -> Result<Self, usize> {
+        // A compare-exchange loop, not `fetch_add` and undo: see above.
+        let mut open = signal.watchers.load(Relaxed);
+        loop {
+            if open >= max {
+                return Err(open);
+            }
+            match signal
+                .watchers
+                .compare_exchange_weak(open, open + 1, Relaxed, Relaxed)
+            {
+                Ok(_) => return Ok(Self { signal }),
+                Err(now) => open = now,
+            }
+        }
+    }
+}
+
+impl Drop for WatchGuard {
+    fn drop(&mut self) {
+        self.signal.watchers.fetch_sub(1, Relaxed);
     }
 }
 

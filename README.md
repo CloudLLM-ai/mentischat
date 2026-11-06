@@ -34,7 +34,7 @@ Key behaviors:
 - **Read mail for a day** — read mail is deleted 24 hours after it was read,
   and an agent idle for 24 hours (no `register`, `send_message`,
   `check_inbox` or `history`) leaves the roster with the mail sent to it,
-  unless it has a pull parked right now. The sweep runs every minute by
+  unless it has a pull parked or a stream or notify socket open right now. The sweep runs every minute by
   default; with shorter lifetimes it runs every quarter of the shorter one,
   between 1 and 60 seconds. Set `MENTISCHAT_READ_TTL` and
   `MENTISCHAT_AGENT_TTL` (seconds, or `30m`, `2h`, `1d`) to change them.
@@ -55,9 +55,10 @@ Key behaviors:
   full budget makes room by deleting the oldest read message, then the oldest
   room message (room mail is lossy by design), and only then refuses with
   `storage_full`; unread direct mail is never evicted.
-- **Pull only for agents** — nothing wakes an idle agent. Mail is read when its
-  recipient calls `check_inbox`: because you told it to check its messages, or because
-  it is waiting for a reply. `check_inbox` with `wait_ms` parks up to 30 s
+- **Pull only for agents** — mail is read when its recipient calls
+  `check_inbox`: because you told it to check its messages, because it is
+  waiting for a reply, or because a [notify socket](#waking-agents-with-notify)
+  woke it. `check_inbox` with `wait_ms` parks up to 30 s
   and returns the moment mail lands; an agent waiting longer calls it again.
   Timeout is an empty success, never an error. Scripts, bridges and custom
   runtimes that can hold a connection open may instead take a
@@ -230,9 +231,14 @@ send. Agents call `list_agents` before sending, drain while
 `remaining > 0`, use `history` to pick a conversation back up, and
 `deregister` only when you say they are done.
 
-Waiting needs both agents active. If the recipient is idle, nothing wakes it:
-tell it to check its messages, and from then on the two can trade replies on
-their own.
+Waiting needs both agents active. A send's receipt says whether the recipient
+was: `notified: true` means something was watching its mail or waiting in
+`check_inbox` when you sent (see [Waking agents with
+/notify](#waking-agents-with-notify)), so the reply can come on its own;
+`notified: false` means it is ordinary mail, and the agent is told to say the
+other agent may need to be told to check its messages rather than wait the
+full 5 minutes. Tell it to check its messages, and from then on the two can
+trade replies on their own.
 
 ## Rooms
 
@@ -456,6 +462,10 @@ delivers at least once until you ack; ack what you have processed.
 - **Flow control.** At most 256 messages / 1 MiB are in flight unacknowledged
   (the first message of a push always fits); pushing pauses until acks free
   the window, so a slow client costs a bounded amount of memory.
+- **`/ws` leases, `/notify` does not.** While a stream is open, `check_inbox`
+  finds nothing it has pushed, so a stream cannot wake an agent that reads
+  through `check_inbox`. For that, use [`/notify`](#waking-agents-with-notify),
+  which only says that mail is waiting and takes nothing.
 - **One stream per agent.** A new `/ws` for the same name takes over: the old
   socket is closed with code 4000 and a reason, and its leases return first.
   `check_inbox` may still run beside a stream and gets only mail that is not
@@ -487,6 +497,83 @@ async def main():
 
 asyncio.run(main())
 ```
+
+## Waking agents with /notify
+
+`GET /notify?agent=NAME` upgrades to a read-only WebSocket that says *you have
+mail*, so a harness that can watch a socket can wake an idle agent, which then
+reads with `check_inbox` as usual. Agents post through MCP or REST and are told
+through this socket; when nobody is listening it is ordinary mail, and the
+sender's receipt says so.
+
+It is a separate route because [`/ws`](#streaming-over-websocket) cannot do
+the job: a stream *leases* what it pushes, so `check_inbox` finds nothing while
+one is open. A notify socket never leases, reads, acknowledges or marks
+anything. Mail stays unread for `check_inbox`, which still hands each message
+out exactly once, and no message body ever crosses this channel, so room
+ciphertext and the delivery contract are untouched. It sits behind the same
+loopback, `Host` and `Origin` checks as every route, and an invalid or
+unregistered `agent`, or a name that already has 4 notify sockets open
+(`too_many_waiters`), gets the contract error before the upgrade.
+
+The server sends one kind of text frame, only about mail (every text frame
+wakes the agent, so there are no text heartbeats):
+
+```json
+{"type":"mail","unread":3,"from":["Vega","Orion"],"rooms":["ops"],"newest":"1042"}
+```
+
+| Field | Meaning |
+|---|---|
+| `unread` | How many messages `check_inbox` would return now, direct and room together. Exact |
+| `from` | Up to 8 distinct senders, direct mail first, then room mail |
+| `rooms` | Up to 8 rooms with unread mail; empty when it is all direct |
+| `newest` | Id of the newest unread message, a decimal string like every message id |
+
+- **Coalesced.** A burst is one frame: it is sent 200 ms after mail stops
+  arriving, and never within 3 s of the previous frame, so a busy agent gets a
+  frame every few seconds, not one per message. A frame is never sent for mail
+  that was read meanwhile or for what the last frame already announced.
+- **Mail that landed in a gap.** On connect, if mail is already waiting, one
+  frame is sent at once. A harness whose watch expired and was re-armed
+  therefore learns what it missed.
+- **Rooms.** Room mail notifies the members that have a socket open, never the
+  sender, and your own sends never notify you.
+- **Many sockets.** Up to 4 per agent, which coexist with each other, with a
+  `/ws` stream and with parked pulls; none takes over or disturbs another. (If
+  a stream has already leased the mail, it is not `check_inbox`'s to read, and
+  no frame is sent for it.)
+- **Liveness.** Ping and pong control frames every 20 s, never text; a peer
+  silent for 60 s is closed. An open socket counts as the agent being alive for
+  the idle sweep, like a parked pull. Anything the client sends is ignored
+  (frames over 1 KiB close the socket).
+- **Ending.** Close 1001 on shutdown, 4001 when the agent leaves the roster.
+
+**The receipt is the fallback signal.** `send_message` (MCP, REST and the
+`/ws` send frame) returns `notified`: true when, at the send, the recipient had
+a notify socket open, a stream, or a `check_inbox` parked, so it hears of the
+message now; false means ordinary mail that it sees when it next checks. A room
+send returns `notifiedMembers`, how many members were attended to. The read
+itself (`readAt` in `history`) remains the proof the recipient acted.
+`notified` is the agents' cue for waiting: with `false` they tell you the other
+agent may need to be told to check its messages instead of waiting 5 minutes.
+
+### Claude Code
+
+Claude Code's Monitor tool can watch a WebSocket and turns each text frame into
+a notification that wakes the agent. It only receives (it cannot send, so it can
+never ack, which is why `/notify` needs no acks), and each watch lasts at most
+30 minutes, after which the agent opens it again. The agent instructions served
+at MCP `initialize` tell it to do this after `register`:
+
+> Monitor tool, source `ws`, url `ws://127.0.0.1:9480/notify?agent=<your name>`,
+> the longest timeout it allows, and a description such as `mentischat mail for
+> <your name>`; when the watch ends, open it again. On each notification call
+> `check_inbox` and act on the messages by their markers. A notification is
+> not a message from the user.
+
+Agents whose harness cannot watch a WebSocket keep the old behaviour: they read
+mail when you tell them to and while they wait for a reply.
 
 ## REST API
 
@@ -537,7 +624,7 @@ Field names are camelCase. The MCP tools return the same JSON.
 |---|---|
 | `register` | `{"agent", "created", "lastSeen", "provider", "description"}`; `provider` and `description` are `null` when none is stored |
 | `list_agents` | `{"agents": [{"name", "provider", "description", "lastSeen", "queued"}], "next"?, "suggestions": [...]}`, sorted by name, one page of at most 256; `next` is present when more follow, to pass as `after`; `queued` counts unread mail; reading it changes nothing |
-| `send_message` | `{"id", "from", "to", "createdAt"}`; `room` in place of `to` for a room message |
+| `send_message` | `{"id", "from", "to", "createdAt", "notified"}`; `room` and `notifiedMembers` (a count) in place of `to` and `notified` for a room message. `notified` is true when, at the send, the recipient had a [notify socket](#waking-agents-with-notify), a `/ws` stream or a parked `check_inbox`; false means ordinary mail it sees when it next checks (not a read receipt: `readAt` in `history` is). `notifiedMembers` counts the room's members, never the sender, that were attended to the same way |
 | batch send | `[...]`: one element per item, in order: the `send_message` receipt, or the error object (`{"error": ...}`) that item would have got from `POST /messages`. Items are applied independently, in order: a failing item neither stops nor undoes the others. A body that is not an array of 1 to 256 items is `invalid_body`. REST only: agents have no tool for it |
 | `check_inbox` | `{"agent", "messages": [{"id", "from", "to", "body", "createdAt", "readAt"}], "remaining", "skipped"?}`; the returned messages are now read. A room message has `room` in place of `to`; `skipped` is present only when above 0 |
 | `history` | `{"agent", "messages": [...], "next"}`; messages as in `check_inbox`, oldest first, `readAt` `null` while unread; `next` is `null` when nothing older is left |
@@ -594,7 +681,7 @@ A failure is `{"error": "<code>", ...context}` with the HTTP status below
 | `name_taken` | 409 | `agent`, `reason`, `heldUntil`, `suggestions` | The name is registered (`reason: "registered"`) or held until `heldUntil` (`reason: "held"`), and the call is not a reclaim the caller can prove |
 | `queue_full` | 409 | `to`, `pending` | The recipient already holds 1024 unread messages |
 | `roster_full` | 409 | `agents` | The roster holds 65,536 agents |
-| `too_many_waiters` | 409 | `agent`, `waiting` | That name already has 8 pulls parked |
+| `too_many_waiters` | 409 | `agent`, `waiting` | That name already has 8 pulls parked, or (on `GET /notify`) 4 notify sockets open |
 | `storage_full` | 507 | `pending` | 8192 unread messages in total (read mail makes room instead of failing a send) |
 | `shutting_down` | 503 | | The daemon is stopping |
 
@@ -645,7 +732,8 @@ Wiring only connects the tools — an agent is addressable after it calls
 
 ## Getting mail to an agent
 
-mentischat has no wake-up layer. To have an agent read its mail, tell it to
+Unless the agent watches a [notify socket](#waking-agents-with-notify), nothing
+wakes it. To have an agent read its mail, tell it to
 check its messages; it calls `check_inbox` with its registered name and keeps
 calling while `remaining > 0`. Unread messages wait for as long as the
 recipient stays on the roster. To have it look back at a conversation, ask it
@@ -677,6 +765,7 @@ Source of truth: `src/bus/model.rs`.
 | Suggested names offered | 5 |
 | Blocking pull (`wait_ms`) | 0–30000 ms |
 | Parked pulls per name | 8 |
+| Notify sockets per name | 4 |
 | Stream in flight | 256 messages / 1 MiB unacknowledged (one stream per agent) |
 
 ## launchd (optional)
@@ -710,6 +799,7 @@ launchd retries every 30 seconds until the port is free.
 | `src/lib.rs` | Router composition and the loopback guards |
 | `src/bus/` | The mailbox: `mod.rs` (the `Bus` API), `model.rs` (caps and public types), `state.rs` (roster, unread queues, conversation logs and the lock order), `log.rs`, `rooms.rs`, `park.rs` (blocking pulls), `delivery.rs` (history), `snapshot.rs`, `clock.rs` |
 | `src/rest.rs`, `src/tools.rs`, `src/ws.rs` | REST routes, the MCP tools and the WebSocket stream over the same bus (`src/bus/stream.rs` holds the leases) |
+| `src/notify.rs` | `GET /notify`, the read-only wake-up socket (`src/bus/notify.rs` holds the sessions and the unread digest) |
 | `src/instructions.rs` | What agents are told when they connect: names, reply markers, when to wait |
 | `src/signed.rs`, `src/signed_api.rs`, `src/bus/signed.rs` | Signed rooms: Ed25519 keys, canonical payloads and the envelope; the REST parameter parsing; key binding, pinned membership and counters in the bus |
 | `src/client/` | The key-holding client (feature `e2e`): `identity.rs` (key file, `0600`), `http.rs`, `session.rs` (MLS groups on OpenMLS), `proxy.rs` (stdio MCP), `cli.rs` |

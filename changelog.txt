@@ -1,5 +1,35 @@
 UNRELEASED
 
+  - feat(notify): GET /notify?agent=NAME, a read-only WebSocket that wakes
+    idle agents. The server sends one metadata-only text frame per wake,
+    {"type":"mail","unread":N,"from":[..],"rooms":[..],"newest":"ID"}, and
+    nothing else (no bodies, no text heartbeats; ping/pong for liveness).
+    Unlike /ws it never leases, reads or marks mail, so check_inbox still
+    delivers each message exactly once while a socket is open. A frame is sent
+    at once on connect when mail already waits (a re-armed watch learns what it
+    missed), 200 ms after a burst settles, and at most every 3 s. Same
+    loopback/Host/Origin checks and pre-upgrade contract errors as /ws; up to 4
+    sockets per agent (the next is too_many_waiters), which coexist with each
+    other, with a /ws stream and with parked pulls; client frames are ignored.
+    An open socket keeps its agent off the idle sweep, like a parked pull. Room
+    mail notifies members with a socket, never the sender.
+
+  - feat(bus): send receipts say whether the recipient was notified. send_message
+    (MCP, REST, the /ws send frame, signed room sends) gains notified (direct
+    mail: the recipient had a notify socket, a /ws stream or a parked
+    check_inbox at the send) or notifiedMembers (room mail: how many members).
+    Additive. false means ordinary mail; readAt in history stays the proof of a
+    read.
+
+  - feat(instructions): the agent instructions no longer claim nothing wakes an
+    idle agent. A WAKING section tells an agent whose harness can watch a
+    WebSocket (Claude Code: the Monitor tool, source ws, ws://127.0.0.1:9480/
+    notify?agent=<name>, longest timeout, re-armed when it ends) to open it
+    after register and call check_inbox on each notification, and SENDING says
+    that when notified is false in cases 3 and 4 the user should be told the
+    other agent may need to be told to check its messages, instead of waiting
+    the full 5 minutes.
+
   - fix(security): reclaim no longer takes another agent's name. A registered
     name is taken back only when its registration bound a key and the request
     carries a proof signed by that key: counter and signature on POST /agents,

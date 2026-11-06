@@ -11,10 +11,13 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt", "time", "test-util"] }
+tokio = { version = "1", features = ["rt", "time", "test-util", "io-util", "net"] }
 # Same pin as the main crate; the lib is named `mcp`.
 cloudllm_mcp = { version = "=0.4.0", features = ["server"] }
 mentischat = { path = ".." }
+axum = "0.8"
+tower = { version = "0.5", features = ["util"] }
+tempfile = "3"
 
 # Its own workspace: keeps the fuzz crate out of the parent package's builds,
 # clippy runs, MSRV check and published tarball.
@@ -73,6 +76,27 @@ bench = false
 [[bin]]
 name = "signed_journal"
 path = "fuzz_targets/signed_journal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rest_http"
+path = "fuzz_targets/rest_http.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proxy_stdio"
+path = "fuzz_targets/proxy_stdio.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "client_files"
+path = "fuzz_targets/client_files.rs"
 test = false
 doc = false
 bench = false

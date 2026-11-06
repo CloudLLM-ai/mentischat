@@ -1,0 +1,1 @@
+{"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "chee_*room", "arg-uments": {"agent": "fuzz", "roohod":"tfuzz"}}}

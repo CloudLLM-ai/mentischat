@@ -1,0 +1,5 @@
+{"jsonrpc":st"}
+{"jsonrpc":"2.0","id":3,"methos":{"protocolVersion":"2025-06-18"}}
+{"jsonrpc":"2.0","method":"notificatIons/initialized"}
+{"jsonrpc":"2.0","id":2,"method":"tools/list"}
+{"jsonrpc":"2.0","id":3,"method":"ping"}

@@ -1,0 +1,5 @@
+{"jsonrpc":"2.0","id":1,"mets/initialized"}
+{"jsonrpc":"2.0","id":2,"method":"tools/list"}
+{"jsonrpc!:"2.0","id":3,"motifications/initialized"}
+{"jsonrpc":"2.0","id":2,"method":"tools/list"}
+{"jsonrpc!:"2.0","id":3,"met2od":"ping"}

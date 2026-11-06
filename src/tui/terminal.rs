@@ -10,7 +10,7 @@ use tokio::sync::Notify;
 pub type PanicHook = dyn Fn(&PanicHookInfo<'_>) + Sync + Send + 'static;
 
 /// A panic hook that runs `on_view` for panics on thread `view` and
-/// `elsewhere` for every other thread. [`run`] installs one so only a panic in
+/// `elsewhere` for every other thread. [`super::run`] installs one so only a panic in
 /// the terminal view restores the terminal.
 pub fn scoped_panic_hook(
     view: ThreadId,

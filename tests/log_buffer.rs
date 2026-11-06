@@ -21,7 +21,7 @@ fn test_lines_complete_on_newline_across_writes() {
     assert!(lines[0].ends_with("INFO first half"), "{lines:?}");
     assert!(lines[1].ends_with("INFO second"), "{lines:?}");
     logs.flush().unwrap();
-    write!(logs, "rd\n").unwrap();
+    logs.write_all(b"rd\n").unwrap();
     assert!(logs.lines()[2].ends_with("INFO third"));
 }
 

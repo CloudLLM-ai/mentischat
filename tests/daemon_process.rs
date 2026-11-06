@@ -3,169 +3,17 @@
 //! restart, and the refusals at startup. Everything else tests the library in
 //! process; this is the only suite that runs `main`.
 //!
-//! Every daemon here binds `127.0.0.1:0` through `MENTISCHAT_LISTEN_PORT=0`
-//! (never the real 9480, which may belong to a running daemon) and reads the
-//! address it got from its own "serving" log line.
+//! Daemons run through `common::process`, which binds port 0 (never the real
+//! 9480) and reads the address from the daemon's own log line.
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpStream};
+mod common;
+
+use std::io::{Read, Write};
+use std::net::SocketAddr;
 use std::path::Path;
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, Receiver};
-use std::time::{Duration, Instant};
+use std::process::{Command, Stdio};
 
-const BIN: &str = env!("CARGO_BIN_EXE_mentischat");
-const STARTUP: Duration = Duration::from_secs(30);
-
-/// A command for the daemon with the test environment: plain logs without
-/// colour, a private data directory, an OS-chosen port, no inherited knobs.
-fn command(data_dir: &Path) -> Command {
-    let mut cmd = Command::new(BIN);
-    for var in [
-        "MENTISCHAT_PERSIST",
-        "MENTISCHAT_READ_TTL",
-        "MENTISCHAT_AGENT_TTL",
-        "MENTISCHAT_NAME_HOLD",
-    ] {
-        cmd.env_remove(var);
-    }
-    cmd.env("MENTISCHAT_PLAIN", "1")
-        .env("NO_COLOR", "1")
-        .env("MENTISCHAT_DIR", data_dir)
-        .env("MENTISCHAT_LISTEN_PORT", "0")
-        .stdin(Stdio::null());
-    cmd
-}
-
-/// A running daemon: its child process, the address it reported, the lines it
-/// logged before it reported it, and the channel carrying the later ones.
-struct Running {
-    child: Child,
-    addr: SocketAddr,
-    startup_log: Vec<String>,
-    lines: Receiver<String>,
-}
-
-impl Running {
-    /// Start the daemon from `cmd` and wait for its "serving" line.
-    fn start(mut cmd: Command) -> Self {
-        let mut child = cmd
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn mentischat");
-        let stdout = child.stdout.take().expect("piped stdout");
-        let (tx, lines) = mpsc::channel();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if tx.send(line).is_err() {
-                    break;
-                }
-            }
-        });
-        // Owned by a `Running` from here on, so `Drop` reaps it on any panic.
-        let mut running = Self {
-            child,
-            addr: SocketAddr::from(([127, 0, 0, 1], 0)),
-            startup_log: Vec::new(),
-            lines,
-        };
-        let deadline = Instant::now() + STARTUP;
-        loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            let line = running
-                .lines
-                .recv_timeout(left)
-                .expect("the daemon never logged that it is serving");
-            let served = served_addr(&line);
-            running.startup_log.push(line);
-            if let Some(addr) = served {
-                running.addr = addr;
-                return running;
-            }
-        }
-    }
-
-    /// Send SIGTERM and wait for the process to exit.
-    fn terminate(mut self) -> ExitStatus {
-        let status = Command::new("kill")
-            .args(["-TERM", &self.child.id().to_string()])
-            .status()
-            .expect("run kill");
-        assert!(status.success(), "kill -TERM failed");
-        wait_exit(&mut self.child)
-    }
-
-    /// Block until a logged line (at startup or later) contains `needle`.
-    fn wait_for_log(&self, needle: &str) {
-        if self.startup_log.iter().any(|l| l.contains(needle)) {
-            return;
-        }
-        let deadline = Instant::now() + STARTUP;
-        loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            let line = self
-                .lines
-                .recv_timeout(left)
-                .unwrap_or_else(|_| panic!("the daemon never logged '{needle}'"));
-            if line.contains(needle) {
-                return;
-            }
-        }
-    }
-}
-
-impl Drop for Running {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-/// The `addr=` field of the daemon's "serving MCP" line, if `line` is that line.
-fn served_addr(line: &str) -> Option<SocketAddr> {
-    if !line.contains("serving MCP") {
-        return None;
-    }
-    let rest = line.split("addr=").nth(1)?;
-    rest.split_whitespace().next()?.parse().ok()
-}
-
-/// Wait for `child` to exit on its own, failing the test after [`STARTUP`].
-fn wait_exit(child: &mut Child) -> ExitStatus {
-    let deadline = Instant::now() + STARTUP;
-    loop {
-        if let Some(status) = child.try_wait().expect("poll child") {
-            return status;
-        }
-        assert!(Instant::now() < deadline, "the daemon did not exit in time");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
-/// One HTTP/1.1 request with `Connection: close`: `(status, body)`.
-fn http(addr: SocketAddr, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
-    let mut stream = TcpStream::connect(addr).expect("connect to the daemon");
-    stream
-        .set_read_timeout(Some(STARTUP))
-        .expect("read timeout");
-    let body = body.unwrap_or("");
-    write!(
-        stream,
-        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    )
-    .expect("write request");
-    let mut raw = String::new();
-    stream.read_to_string(&mut raw).expect("read reply");
-    let (head, body) = raw.split_once("\r\n\r\n").expect("a complete reply");
-    let status = head
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .expect("status code");
-    (status, body.to_string())
-}
+use common::process::{command, http, wait_exit, Running, BIN};
 
 /// Run `mentischat <args>` to completion: `(exit code, stdout, stderr)`.
 fn run_args(args: &[&str]) -> (Option<i32>, String, String) {

@@ -3,6 +3,8 @@
 //! about.
 #![allow(dead_code)]
 
+pub mod process;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

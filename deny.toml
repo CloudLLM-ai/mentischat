@@ -1,0 +1,60 @@
+# cargo-deny policy for mentischat. Run locally with `make deny`; CI runs the
+# same command in .github/workflows/audit.yml. docs/ENGINEERING.md explains
+# every section and how to change it.
+
+[graph]
+# Check every platform and every feature: a dependency that only builds on
+# macOS, or only behind `e2e`, still ships.
+all-features = true
+
+[advisories]
+# RustSec database, fetched at run time. A new advisory against a locked
+# dependency fails the job, which is the point of the daily schedule.
+version = 2
+yanked = "deny"
+# Unmaintained crates are reported for every dependency, direct or transitive.
+unmaintained = "all"
+# Each ignore carries the advisory ID and the reason it cannot hurt us. Remove
+# an entry the day the dependency is upgraded past the advisory.
+ignore = [
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5 timing issue, reached only through p256/ecdsa inside openmls_rust_crypto. mentischat's one MLS ciphersuite is X25519 + AES-128-GCM + Ed25519 (src/client/session.rs, SUITE), so no P-256 operation ever runs. The fix needs crypto-bigint 0.7, which p256 0.13 does not allow; openmls 0.9 moves on but needs Rust 1.91 and our MSRV is 1.88." },
+    { id = "RUSTSEC-2026-0207", reason = "libcrux-sha3 0.0.8 incremental SHAKE bug. hpke-rs 0.6.1 calls libcrux_sha3::shake256 only to derive X-Wing / ML-KEM keys (hpke-rs src/kem.rs); the X25519 suite never reaches it. hpke-rs pins libcrux-sha3 to exactly 0.0.8." },
+    { id = "RUSTSEC-2026-0208", reason = "libcrux-sha3 0.0.8 AVX2 SHAKE-256 panic. Same reachability as RUSTSEC-2026-0207: only X-Wing / ML-KEM, which mentischat does not use." },
+    { id = "RUSTSEC-2026-0212", reason = "libcrux-secrets 0.0.5 constant-time select on aarch64. Only libcrux-sha3 uses it, so it is as unreachable as RUSTSEC-2026-0207; libcrux-traits pins it to exactly 0.0.5." },
+    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 is unmaintained. It is a compile-time proc-macro dependency of ratatui's macro stack; it never runs in the shipped binary. Revisit when ratatui drops it." },
+]
+
+[licenses]
+version = 2
+# Everything the dependency tree uses today, nothing more. Adding a license is
+# a decision for a human: copyleft needs a look at what linking it implies.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Two versions of one crate bloat the binary and double the audit surface, but
+# most are forced by upstream pins. Warn, so a new duplicate is visible in the
+# job log without blocking; `multiple-versions = "deny"` once the list is short.
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+# Crates come from crates.io only. A git or alternate-registry dependency has
+# to be added here on purpose.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

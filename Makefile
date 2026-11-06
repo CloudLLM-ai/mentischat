@@ -1,5 +1,5 @@
 # Makefile
-.PHONY: build release clean fmt fmt-check check test doc help tasks clippy publish publish-dry-run install uninstall run run-plain stop ci msrv fuzz-build fuzz-replay fuzz
+.PHONY: build release clean fmt fmt-check check test doc help tasks clippy publish publish-dry-run install uninstall run run-plain stop ci msrv deny fuzz-build fuzz-replay fuzz
 
 default: help
 CARGO_CMD=/usr/bin/env cargo
@@ -31,6 +31,10 @@ ci: fmt-check check clippy test doc ## Verification-only pipeline (no source rew
 # Check the rust-version claim in Cargo.toml (needs rustup and the toolchain)
 msrv: ## Type-check on the minimum supported Rust version (MSRV, default 1.88)
 	${CARGO_CMD} +$(MSRV) check --release --all-targets --all-features --locked
+
+# Dependency policy from deny.toml: advisories, licenses, bans, sources (cargo install cargo-deny).
+deny: ## Check dependencies against deny.toml (advisories, licenses, bans, sources)
+	cargo deny --locked check
 
 # Fuzzing needs nightly and cargo-fuzz (cargo install cargo-fuzz); it is not part of `make ci`.
 fuzz-build: ## Build every fuzz target (needs nightly and cargo-fuzz)

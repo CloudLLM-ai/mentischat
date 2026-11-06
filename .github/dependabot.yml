@@ -1,0 +1,33 @@
+# Weekly pull requests for Cargo dependencies and for the actions used by the
+# workflows. Updates arrive as pull requests and run the full CI before anyone
+# merges them. See docs/ENGINEERING.md.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    # Patch and minor updates arrive as one pull request; majors stay separate
+    # because they are the ones that need reading.
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+    ignore:
+      # Pinned on purpose: cloudllm_mcp is `=0.4.0` (unstable API between minors)
+      # and the openmls 0.9 line needs Rust 1.91 while the MSRV is 1.88.
+      - dependency-name: cloudllm_mcp
+      - dependency-name: openmls
+        update-types: [version-update:semver-minor]
+      - dependency-name: openmls_*
+        update-types: [version-update:semver-minor]
+  - package-ecosystem: cargo
+    directory: /fuzz
+    schedule:
+      interval: weekly
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

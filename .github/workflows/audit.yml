@@ -1,0 +1,29 @@
+name: audit
+
+# Dependency policy: RustSec advisories, licenses, banned and duplicate crates
+# and allowed sources, all from deny.toml. It also runs daily because an
+# advisory can land against a dependency that has not changed. Reproduce locally
+# with `make deny`; docs/ENGINEERING.md explains the policy.
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.2
+      - run: make deny

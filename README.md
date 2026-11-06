@@ -831,6 +831,24 @@ let sent = bus.history(&vega, Some(&orion), None).await?;
 assert!(sent.messages[0].read_at.is_some());
 ```
 
+## Engineering
+
+[![ci](https://github.com/CloudLLM-ai/mentischat/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/CloudLLM-ai/mentischat/actions/workflows/ci.yml)
+[![audit](https://github.com/CloudLLM-ai/mentischat/actions/workflows/audit.yml/badge.svg?branch=master)](https://github.com/CloudLLM-ai/mentischat/actions/workflows/audit.yml)
+[![fuzz](https://github.com/CloudLLM-ai/mentischat/actions/workflows/fuzz.yml/badge.svg?branch=master)](https://github.com/CloudLLM-ai/mentischat/actions/workflows/fuzz.yml)
+[![bench](https://github.com/CloudLLM-ai/mentischat/actions/workflows/bench.yml/badge.svg?branch=master)](https://github.com/CloudLLM-ai/mentischat/actions/workflows/bench.yml)
+[![soak](https://github.com/CloudLLM-ai/mentischat/actions/workflows/soak.yml/badge.svg?branch=master)](https://github.com/CloudLLM-ai/mentischat/actions/workflows/soak.yml)
+[![security](https://github.com/CloudLLM-ai/mentischat/actions/workflows/security.yml/badge.svg?branch=master)](https://github.com/CloudLLM-ai/mentischat/actions/workflows/security.yml)
+[![coverage gate](https://img.shields.io/badge/coverage%20gate-%E2%89%A590%25-brightgreen)](docs/ENGINEERING.md#coverage)
+
+Every change passes formatting, clippy, tests on Linux and macOS, rustdoc, the
+MSRV, a 90% coverage gate (regions, functions, lines) and a fuzz corpus replay.
+Dependencies are checked against a policy daily, every fuzz target runs weekly,
+benchmarks and a soak test (mail and room traffic with a mid-run restart) run
+weekly, and a weekly security review adds lints and an unsafe inventory.
+[docs/ENGINEERING.md](docs/ENGINEERING.md) explains each job, its threshold and
+the `make` target that reproduces it.
+
 ## Tests
 
 ```bash
@@ -854,7 +872,7 @@ of `make ci`:
 make fuzz-build                              # build every target
 make fuzz-replay                             # replay the committed corpora (what CI runs)
 make fuzz TARGET=bus_ops FUZZ_SECONDS=300    # fuzz one target for five minutes
-cargo +nightly fuzz list                     # names, tool_json, snapshot_restore, ws_frame, bus_ops, signed_wire, signed_journal, client_wire
+cargo +nightly fuzz list                     # names, tool_json, snapshot_restore, ws_frame, bus_ops, signed_wire, signed_journal, client_wire, rest_http, proxy_stdio, client_files
 ```
 
 | Target | Checks |
@@ -866,12 +884,16 @@ cargo +nightly fuzz list                     # names, tool_json, snapshot_restor
 | `signed_wire` | signed-room envelopes, keys and signatures: parse and re-encode agree, and a correctly signed send lands as a verifiable envelope or fails with a documented code |
 | `signed_journal` | a signed room's journal and retained envelopes through `verify_signed_record`: deterministic; a valid record rejects any changed signature, repeated record or edited signed field; every prefix verifies and the epoch never exceeds the whole's. Seeded from real and tampered journals |
 | `client_wire` | the client's inputs: daemon HTTP replies (chunked included) parse to a status and JSON or a typed error, and a command line that parses names a valid agent and a loopback daemon |
+| `rest_http` | arbitrary requests through the whole router: no panic, no 5xx but 503/507, the loopback guards refuse exactly what the documented rule says, every REST error is JSON with a documented code |
+| `proxy_stdio` | the client's stdio MCP proxy fed arbitrary lines: one JSON-RPC reply per request, none per notification, `result` xor `error` |
+| `client_files` | damaged `identity.key` and `state.json`: a typed storage error, never a panic or a replaced key |
 | `bus_ops` | 128 operations against a naive reference model: results, error codes, delivery, history pages, stats |
 
 A crash lands in `fuzz/artifacts/`. Minimize it with `cargo +nightly fuzz tmin`,
 turn it into a named regression test in `tests/` (see `tests/snapshot_fuzz.rs`),
 fix it, and commit the input under `fuzz/corpus/<target>/`. CI replays the
-corpora on every push; `fuzz.yml` runs each target for five minutes every week.
+corpora on every push; `fuzz.yml` runs each target for five minutes every week
+(see [docs/ENGINEERING.md](docs/ENGINEERING.md#fuzzing)).
 
 ## Performance
 

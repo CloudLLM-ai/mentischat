@@ -1,6 +1,6 @@
 # Makefile
 # Sections below: build and verify, dependencies and coverage, fuzzing, benchmarks, soak, run.
-.PHONY: build release clean fmt fmt-check check test doc help tasks clippy publish publish-dry-run install uninstall run run-plain stop ci msrv deny clippy-security coverage coverage-open bench bench-json bench-baseline bench-compare soak fuzz-build fuzz-targets fuzz-replay fuzz fuzz-cmin
+.PHONY: build release clean fmt fmt-check check test doc help tasks clippy publish publish-dry-run install uninstall run run-plain stop ci msrv deny clippy-security coverage coverage-branch coverage-open bench bench-json bench-baseline bench-compare soak fuzz-build fuzz-targets fuzz-replay fuzz fuzz-cmin
 
 default: help
 CARGO_CMD=/usr/bin/env cargo
@@ -70,6 +70,10 @@ coverage: ## Coverage with HTML + lcov reports, failing under COVERAGE_MIN% (reg
 	cargo llvm-cov report --ignore-filename-regex '$(COVERAGE_IGNORE)' --lcov --output-path $(COVERAGE_DIR)/lcov.info
 	cargo llvm-cov report --ignore-filename-regex '$(COVERAGE_IGNORE)' --json --summary-only --output-path $(COVERAGE_DIR)/summary.json
 	python3 scripts/coverage_gate.py $(COVERAGE_DIR)/summary.json --min regions=$(COVERAGE_MIN) --min functions=$(COVERAGE_MIN) --min lines=$(COVERAGE_MIN) --markdown $(COVERAGE_DIR)/summary.md
+
+# Report only: needs nightly with llvm-tools-preview; the flag is unstable (docs/ENGINEERING.md).
+coverage-branch: ## Branch coverage summary on nightly (not gated)
+	CARGO_TARGET_DIR=target/branch ${CARGO_CMD} +nightly llvm-cov --branch --all-features --locked --ignore-filename-regex '$(COVERAGE_IGNORE)' --summary-only
 
 coverage-open: coverage ## Open the HTML coverage report (macOS)
 	open $(COVERAGE_DIR)/html/index.html

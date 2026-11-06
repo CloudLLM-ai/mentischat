@@ -59,11 +59,11 @@ use crate::names::AgentName;
 use crate::rest::MAX_BATCH_BODY_BYTES;
 
 /// How often the server pings.
-const PING_EVERY: Duration = Duration::from_secs(20);
+pub(crate) const PING_EVERY: Duration = Duration::from_secs(20);
 /// How long a connection may be silent before it is closed.
-const SILENCE_LIMIT: Duration = Duration::from_secs(60);
+pub(crate) const SILENCE_LIMIT: Duration = Duration::from_secs(60);
 /// How long one frame may take to send before the connection is given up on.
-const SEND_LIMIT: Duration = Duration::from_secs(30);
+pub(crate) const SEND_LIMIT: Duration = Duration::from_secs(30);
 
 /// Upgrade to a stream for `?agent=`.
 pub async fn upgrade(
@@ -86,8 +86,8 @@ pub async fn upgrade(
         .into_response()
 }
 
-/// Why a stream's loop ended.
-enum Ending {
+/// Why a socket's loop ended; shared with the notify route.
+pub(crate) enum Ending {
     /// The peer is gone or stopped answering: nothing to say.
     Dropped,
     /// Close with this code and reason.
@@ -108,7 +108,7 @@ async fn run(bus: Arc<Bus>, agent: AgentName, mut socket: WebSocket) {
     close(socket, ending).await;
 }
 
-async fn close(mut socket: WebSocket, ending: Ending) {
+pub(crate) async fn close(mut socket: WebSocket, ending: Ending) {
     if let Ending::Close(code, reason) = ending {
         let frame = CloseFrame {
             code,
@@ -230,7 +230,7 @@ async fn on_frame(
 }
 
 /// Send one frame, giving up on a peer that will not take it.
-async fn send_frame(socket: &mut WebSocket, frame: Frame) -> Result<(), ()> {
+pub(crate) async fn send_frame(socket: &mut WebSocket, frame: Frame) -> Result<(), ()> {
     match tokio::time::timeout(SEND_LIMIT, socket.send(frame)).await {
         Ok(Ok(())) => Ok(()),
         _ => Err(()),

@@ -56,6 +56,7 @@ pub fn router(bus: Ctx) -> Router {
         .route("/signed/rooms/{room}", get(signed_room))
         .route("/signed/rooms/{room}/welcome", get(signed_welcome))
         .route("/ws", get(crate::ws::upgrade))
+        .route("/notify", get(crate::notify::upgrade))
         .route("/health", get(health))
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)

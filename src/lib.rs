@@ -30,6 +30,7 @@ pub mod client;
 pub mod errors;
 pub mod instructions;
 pub mod names;
+pub mod notify;
 pub mod rest;
 pub mod signed;
 pub mod signed_api;

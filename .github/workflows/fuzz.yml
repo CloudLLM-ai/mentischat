@@ -1,7 +1,16 @@
 name: fuzz
 
-# Time-boxed fuzzing, weekly and on demand: not on every push.
+# Time-boxed fuzzing of every target, weekly and on demand: not on every push
+# (ci.yml replays the committed corpora on every push, in seconds). The matrix
+# is read from `cargo fuzz list`, so a new target is fuzzed without editing
+# this file. docs/ENGINEERING.md says what to do with a crash or a grown corpus.
 on:
+  # security.yml calls this workflow with a longer run.
+  workflow_call:
+    inputs:
+      seconds:
+        type: string
+        default: "300"
   schedule:
     - cron: "17 4 * * 1"
   workflow_dispatch:
@@ -17,33 +26,42 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  targets:
+    runs-on: ubuntu-latest
+    outputs:
+      list: ${{ steps.list.outputs.list }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-fuzz
+      - id: list
+        run: echo "list=$(make --no-print-directory fuzz-targets)" >> "$GITHUB_OUTPUT"
+
   fuzz:
+    needs: targets
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        target: [names, tool_json, snapshot_restore, ws_frame, bus_ops]
+        target: ${{ fromJSON(needs.targets.outputs.list) }}
     steps:
       - uses: actions/checkout@v4
-      - run: rustup toolchain install nightly --profile minimal
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: fuzz
-      - name: Cache cargo-fuzz
-        id: cargo-fuzz
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/cargo-fuzz
-          key: cargo-fuzz-${{ runner.os }}-0.13.2
-      - name: Install cargo-fuzz
-        if: steps.cargo-fuzz.outputs.cache-hit != 'true'
-        run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - uses: ./.github/actions/setup-fuzz
       - name: Fuzz ${{ matrix.target }}
         run: make fuzz TARGET=${{ matrix.target }} FUZZ_SECONDS=${{ inputs.seconds || 300 }}
       - name: Upload crashes
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: fuzz-artifacts-${{ matrix.target }}
-          path: fuzz/artifacts
+          name: fuzz-crashes-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
+      # The corpus the run grew. A human downloads it, runs `make fuzz-cmin`
+      # and commits what is new; CI never pushes to the repository.
+      - name: Upload grown corpus
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus-${{ matrix.target }}
+          path: fuzz/corpus/${{ matrix.target }}
+          retention-days: 30
           if-no-files-found: ignore

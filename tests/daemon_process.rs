@@ -424,3 +424,112 @@ fn test_listen_addr_rules() {
         assert!(err.to_string().contains(bad), "{err}");
     }
 }
+
+/// Run `mentischat client <args>` with its key directory in `keys`, feeding
+/// `stdin`: `(exit code, stdout, stderr)`.
+#[cfg(feature = "e2e")]
+fn run_client(keys: &Path, args: &[&str], stdin: &str) -> (Option<i32>, String, String) {
+    let mut child = Command::new(BIN)
+        .arg("client")
+        .args(args)
+        .env("MENTISCHAT_CLIENT_DIR", keys)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mentischat client");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(stdin.as_bytes())
+        .expect("write stdin");
+    let out = child.wait_with_output().expect("client output");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// `client key init` creates an identity and prints its public key; `key show`
+/// prints the same one; `key show` for an agent with no identity exits 1 with
+/// the command that creates one, and an invalid agent name is a usage error.
+#[cfg(feature = "e2e")]
+#[test]
+fn test_client_key_init_and_show() {
+    let keys = tempfile::tempdir().expect("tempdir");
+    let (code, init, _) = run_client(keys.path(), &["key", "init", "--agent", "Vega"], "");
+    assert_eq!(code, Some(0));
+    assert!(init.contains("agent: Vega"), "{init}");
+    assert!(init.contains("public key (hex): "), "{init}");
+    assert!(keys.path().join("vega/identity.key").exists());
+
+    let (code, shown, _) = run_client(keys.path(), &["key", "show", "--agent", "Vega"], "");
+    assert_eq!(code, Some(0));
+    let key_line = |text: &str| {
+        text.lines()
+            .find(|l| l.starts_with("public key (hex):"))
+            .map(str::to_string)
+    };
+    assert_eq!(key_line(&init), key_line(&shown));
+
+    let (code, _, err) = run_client(keys.path(), &["key", "show", "--agent", "Orion"], "");
+    assert_eq!(code, Some(1));
+    assert!(err.contains("key init --agent Orion"), "{err}");
+
+    let (code, _, err) = run_client(keys.path(), &["key", "init", "--agent", "no spaces"], "");
+    assert_eq!(code, Some(2));
+    assert!(err.contains("--agent is not a valid agent name"), "{err}");
+}
+
+/// `client run` is the stdio MCP proxy: against a live daemon it answers
+/// `initialize` and `tools/list` on stdout and exits 0 when stdin closes.
+#[cfg(feature = "e2e")]
+#[test]
+fn test_client_run_serves_mcp_over_stdio() {
+    let data = tempfile::tempdir().expect("tempdir");
+    let keys = tempfile::tempdir().expect("tempdir");
+    let daemon = Running::start(command(data.path()));
+    let addr = daemon.addr.to_string();
+
+    let requests = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+        "\n",
+    );
+    let (code, out, err) = run_client(
+        keys.path(),
+        &["run", "--agent", "Vega", "--addr", &addr],
+        requests,
+    );
+    assert_eq!(code, Some(0), "{err}");
+    let replies: Vec<serde_json::Value> = out
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("one JSON reply per line"))
+        .collect();
+    assert_eq!(replies.len(), 2, "{out}");
+    assert_eq!(replies[0]["id"], 1);
+    assert!(replies[0]["result"]["serverInfo"].is_object(), "{out}");
+    assert!(
+        replies[1]["result"]["tools"]
+            .as_array()
+            .is_some_and(|t| !t.is_empty()),
+        "{out}"
+    );
+}
+
+/// A `--addr` that is not loopback is refused before anything connects.
+#[cfg(feature = "e2e")]
+#[test]
+fn test_client_run_refuses_a_non_loopback_daemon() {
+    let keys = tempfile::tempdir().expect("tempdir");
+    let (code, _, err) = run_client(
+        keys.path(),
+        &["run", "--agent", "Vega", "--addr", "10.0.0.5:9480"],
+        "",
+    );
+    assert_eq!(code, Some(2));
+    assert!(err.contains("loopback"), "{err}");
+}

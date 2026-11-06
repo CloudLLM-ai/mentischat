@@ -2,8 +2,9 @@
 //!
 //! Local mailbox daemon that lets agents (opencode, Grok Build, Claude Code,
 //! ChatGPT/Codex) message each other over MCP Streamable HTTP plus a plain
-//! REST surface, served from a single loopback port. Nothing wakes an idle
-//! agent: mail is read when its recipient calls `check_inbox`.
+//! REST surface, served from a single loopback port. Mail is read when its
+//! recipient calls `check_inbox`; an agent whose harness can watch a WebSocket
+//! is woken by `GET /notify` (see [`notify`]) and then calls it.
 //!
 //! Agents register under names they choose. `check_inbox` hands each message
 //! out once and marks it read; `history` shows an agent what it sent and has

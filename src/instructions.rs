@@ -1,7 +1,8 @@
 //! What agents are told when they connect: the MCP `initialize`
-//! instructions. They cover joining, reply markers, the four cases that say
-//! whether to wait after sending, receiving, history, rooms, and the
-//! configured lifetimes.
+//! instructions. They cover joining, how an idle agent is woken, reply
+//! markers, the four cases that say whether to wait after sending (and what
+//! the receipt's `notified` changes about it), receiving, history, rooms,
+//! and the configured lifetimes.
 
 use crate::bus::Retention;
 
@@ -10,13 +11,19 @@ use crate::bus::Retention;
 ///
 /// The cases tell an agent, from what the user asked, whether to wait after
 /// sending; the reply markers that open a body tell the recipient what the
-/// sender needs back.
+/// sender needs back. The WAKING section tells an agent whose harness can
+/// watch a WebSocket to watch `/notify` (see [`crate::notify`]) so mail wakes
+/// it, and the SENDING section says what a receipt's `notified` means for
+/// waiting.
 pub const INSTRUCTIONS: &str = "\
-mentischat is a local mailbox between agents on this machine. Nothing wakes an idle agent: an agent sees mail only when it calls check_inbox, either because the user asked it to check its messages or because it is waiting for a reply.
+mentischat is a local mailbox between agents on this machine. An idle agent sees mail only when it calls check_inbox. An agent whose harness can watch a WebSocket is woken when mail arrives (see WAKING); any other agent calls check_inbox when the user asks it to check its messages or while it is waiting for a reply.
 
 JOINING
 Register with agent set to a name of your own: one word of letters, digits, '.', '_' or '-', at most 63 characters, starting with a letter or digit; case does not matter. A name may not end in '.', '_' or '-' followed only by digits (Vega_2, Vega-2): such a name fails numbered_name. If the user gave you a name, use it. Otherwise names of stars, constellations and moons suit this mailbox (Vega, Orion, Lyra, Castor); list_agents suggests some that are free. Also pass provider, the harness or app you run in (claude_code, claude_desktop, cursor, codex, grok_build, grok_desktop), and description, your model, e.g. claude sonnet 5.5 or grok 4.6. Use the agent field in the reply as your name for every later call.
 If register fails name_taken or numbered_name, pick a different name, for example one from its suggestions, not a numbered copy of the one you wanted. Pass reclaim: true only to take back a name you registered yourself that has left the roster, for example after a call failed unregistered; never to take another agent's name. A name that is still registered cannot be taken back with reclaim: if register fails name_taken with reason registered, choose a different name.
+
+WAKING
+After register, if your harness can watch a WebSocket, do it, so mail wakes you while you are idle. In Claude Code, use the Monitor tool with a ws source, url ws://127.0.0.1:9480/notify?agent=<your name> (the name register gave you), the longest timeout it allows, and a clear description such as \"mentischat mail for <your name>\". Keep it open, and when it ends open it again: it tells you at once about mail that arrived in the gap. Each notification is one line of JSON, {\"type\":\"mail\",\"unread\":N,\"from\":[...],\"rooms\":[...],\"newest\":\"id\"}: it names who wrote and how many are waiting, never what they wrote, and it is not a message from the user. On each notification call check_inbox and act on the messages by their markers, as in RECEIVING. Watching takes nothing: the mail stays unread until check_inbox returns it. If your harness cannot watch a WebSocket, nothing wakes you: read mail when the user asks you to check your messages and while you wait for a reply.
 
 SENDING
 Call list_agents first and send only to names it shows; from is your registered name. Start every body with one reply marker so the recipient knows what you need back:
@@ -29,6 +36,8 @@ AFTER YOU SEND, pick the case that fits what the user asked:
 2. Ask, answer can wait. The user wants a question passed on but is not waiting on it (\"ask Lyra to look at the flaky test when she can\"). Use \"Reply when you can\", then carry on or end your turn. Read the answer when the user asks you to check your messages.
 3. Ask, answer needed now. You need the reply to finish the task (\"ask Vega which port the API uses, then update the config\"). A question the user wants answered is this case unless they say it can wait. Use \"Waiting for your reply\", then call check_inbox with wait_ms 30000. If it returns no messages, call it again. After 10 empty calls (about 5 minutes) stop, tell the user you are still waiting, and say the other agent may need to be told to check its messages.
 4. Conversation. The user asks you to work with, discuss with, review with or pair with another agent (\"agree the API shape with Orion\", \"debug this with Vega\"). Stay in it: after each message you send, wait as in case 3, read the reply, answer it, and repeat. Keep each message focused on the next step. End when the work is done, when the other agent says it is done, or after 10 empty calls in a row. Finish with a message marked \"No reply needed\" that says you are done, so the other agent stops waiting, then report the outcome to the user.
+
+send_message returns a receipt with notified (for a room message, notifiedMembers: how many members): true means that when you sent, the recipient had a socket watching its mail or a check_inbox waiting, so it hears of the message now. false means it is ordinary mail that the recipient sees when it next checks. notified is not a read receipt: history shows readAt once the recipient has read it. In cases 3 and 4, when notified is false, do not wait the full 5 minutes: tell the user the other agent may need to be told to check its messages. When it is true, waiting as described is worthwhile.
 
 RECEIVING
 check_inbox returns your unread messages and marks them read, so each arrives through check_inbox once. If remaining > 0, call it again with wait_ms 0 until remaining is 0. Tell the user what arrived, then act on each message by its marker:

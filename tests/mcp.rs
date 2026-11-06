@@ -171,7 +171,7 @@ async fn register_tool_requires_a_name_and_takes_provider_description_and_reclai
 }
 
 #[tokio::test]
-async fn instructions_say_nothing_wakes_an_idle_agent() {
+async fn instructions_say_how_an_idle_agent_is_woken() {
     let (_d, app) = app();
     let (_, init) = rpc(
         &app,
@@ -181,10 +181,84 @@ async fn instructions_say_nothing_wakes_an_idle_agent() {
     .await;
     let instructions = init["result"]["instructions"].as_str().unwrap();
     assert!(
-        instructions.contains("Nothing wakes an idle agent"),
-        "{instructions}"
+        !instructions.contains("Nothing wakes an idle agent"),
+        "the old claim is false now: {instructions}"
     );
     assert!(instructions.contains("check_inbox"));
+    for phrase in [
+        "WAKING",
+        "Monitor tool with a ws source",
+        "ws://127.0.0.1:9480/notify?agent=<your name>",
+        "the longest timeout it allows",
+        "when it ends open it again",
+        "never what they wrote",
+        "it is not a message from the user",
+        "Watching takes nothing",
+        "If your harness cannot watch a WebSocket, nothing wakes you",
+        // What the receipt's notified means for waiting.
+        "notified (for a room message, notifiedMembers",
+        "false means it is ordinary mail",
+        "when notified is false, do not wait the full 5 minutes",
+        "When it is true, waiting as described is worthwhile",
+    ] {
+        assert!(instructions.contains(phrase), "{phrase:?}: {instructions}");
+    }
+}
+
+/// The `send_message` receipt tells the sender whether the recipient was
+/// attended to: false for plain mail, true while a `check_inbox` is parked.
+#[tokio::test]
+async fn send_message_receipt_reports_notified_over_mcp() {
+    let (_d, app) = app();
+    for who in ["grok", "codex"] {
+        rpc(
+            &app,
+            "tools/call",
+            json!({ "name": "register", "arguments": { "agent": who } }),
+        )
+        .await;
+    }
+    let send = |body: &'static str| {
+        let app = app.clone();
+        async move {
+            let (_, resp) = rpc(
+                &app,
+                "tools/call",
+                json!({ "name": "send_message", "arguments": { "from": "grok", "to": "codex", "body": body } }),
+            )
+            .await;
+            let text = resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            serde_json::from_str::<Value>(&text).unwrap()
+        }
+    };
+    let plain = send("No reply needed: one").await;
+    assert_eq!(plain["notified"], false);
+    assert_eq!(plain["from"], "grok");
+    // Drain it, then park a pull and send again.
+    rpc(
+        &app,
+        "tools/call",
+        json!({ "name": "check_inbox", "arguments": { "agent": "codex", "wait_ms": 0 } }),
+    )
+    .await;
+    let waiting = {
+        let app = app.clone();
+        tokio::spawn(async move {
+            rpc(
+                &app,
+                "tools/call",
+                json!({ "name": "check_inbox", "arguments": { "agent": "codex", "wait_ms": 5000 } }),
+            )
+            .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let heard = send("No reply needed: two").await;
+    assert_eq!(heard["notified"], true);
+    waiting.await.unwrap();
 }
 
 #[tokio::test]

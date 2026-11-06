@@ -79,7 +79,7 @@ fn metadata_for(tool_name: &str) -> Option<ToolMetadata> {
         "send_message" => Some(
             ToolMetadata::new(
                 "send_message",
-                "Queue a message for a registered agent. Fails if from or to is not registered. Start the body with a reply marker: \"No reply needed\", \"Reply when you can\" or \"Waiting for your reply\". Nothing wakes the recipient: it reads the message when it next calls check_inbox. When you need the answer now, follow with check_inbox using wait_ms 30000. To message everyone in a room instead of one agent, pass room in place of to (exactly one of the two); you must be a member.",
+                "Queue a message for a registered agent. Fails if from or to is not registered. Start the body with a reply marker: \"No reply needed\", \"Reply when you can\" or \"Waiting for your reply\". The receipt says notified (for a room, notifiedMembers): true when the recipient was being watched for mail or waiting in check_inbox and hears of it now; false when it is ordinary mail the recipient reads when it next calls check_inbox. When you need the answer now, follow with check_inbox using wait_ms 30000. To message everyone in a room instead of one agent, pass room in place of to (exactly one of the two); you must be a member.",
             )
             .with_parameter(str_param("from", "Your registered name"))
             .with_parameter(

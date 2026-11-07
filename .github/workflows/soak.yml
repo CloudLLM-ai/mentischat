@@ -26,7 +26,7 @@ jobs:
     # The run, the build and the slack of a shared runner.
     timeout-minutes: 150
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@v2
       - name: Soak

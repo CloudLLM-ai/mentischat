@@ -50,7 +50,7 @@ jobs:
         run: make fuzz TARGET=${{ matrix.target }} FUZZ_SECONDS=${{ inputs.seconds || 300 }}
       - name: Upload crashes
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-crashes-${{ matrix.target }}
           path: fuzz/artifacts/${{ matrix.target }}
@@ -59,7 +59,7 @@ jobs:
       # and commits what is new; CI never pushes to the repository.
       - name: Upload grown corpus
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-corpus-${{ matrix.target }}
           path: fuzz/corpus/${{ matrix.target }}

@@ -11,7 +11,8 @@
 //!   is visible afterwards);
 //! - every other REST failure is a JSON object whose `error` is a documented
 //!   code (axum's own plain-text rejections must not leak through), except
-//!   `/mcp` and `/ws`, which have their own framing.
+//!   `/mcp`, `/ws` and `/notify`, which have their own framing
+//!   (a request that is not a WebSocket upgrade gets axum's plain-text 400).
 //!
 //! Input: byte 0 picks the method, byte 1 the peer and header flavour, then
 //! the request target up to the first NUL, then the body. The seeds are the
@@ -189,7 +190,7 @@ fuzz_target!(|data: &[u8]| {
             !status.is_server_error() || matches!(status.as_u16(), 503 | 507),
             "{status} for {path}"
         );
-        let framed_elsewhere = path == "/mcp" || path.starts_with("/mcp/") || path == "/ws";
+        let framed_elsewhere = path == "/mcp" || path.starts_with("/mcp/") || path == "/ws" || path == "/notify";
         if status.as_u16() >= 400 && !framed_elsewhere && !bytes.is_empty() {
             assert!(is_json, "{status} for {path} is not JSON: {bytes:?}");
             let value: serde_json::Value = serde_json::from_slice(&bytes).expect("error body is JSON");

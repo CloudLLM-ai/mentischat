@@ -20,6 +20,12 @@ updates:
         update-types: [version-update:semver-minor]
       - dependency-name: openmls_*
         update-types: [version-update:semver-minor]
+      # Held at the newest releases that support Rust 1.88: uuid 1.27 needs
+      # 1.89 and parking_lot 0.13 needs 1.95.
+      - dependency-name: uuid
+        versions: [">=1.27.0"]
+      - dependency-name: parking_lot
+        versions: [">=0.13.0"]
   - package-ecosystem: cargo
     directory: /fuzz
     schedule:

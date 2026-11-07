@@ -80,7 +80,7 @@ coverage-open: coverage ## Open the HTML coverage report (macOS)
 
 # Criterion benches (benches/*.rs). BENCH_ARGS=--quick gives a fast, rougher pass.
 bench: ## Run every Criterion bench (BENCH_ARGS=--quick for a fast pass)
-	${CARGO_CMD} bench --all-features --locked -- $(BENCH_ARGS)
+	${CARGO_CMD} bench --all-features --locked --bench '*' -- $(BENCH_ARGS)
 
 bench-json: ## Collect the medians of the last `make bench` into target/bench/current.json
 	python3 scripts/bench.py collect --out $(BENCH_DIR)/current.json

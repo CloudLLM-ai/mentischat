@@ -107,6 +107,30 @@ impl OpRec {
         rec
     }
 
+    /// Whether every optional field set on this record belongs to `kind`.
+    ///
+    /// [`OpRec::new`] sets only the fields its operation signs, so a record
+    /// carrying another one was not written by this daemon. It is refused
+    /// rather than ignored: a stray field is not covered by the signature, and
+    /// a journal that verifies should have exactly the bytes that were signed.
+    fn has_only_fields_of(&self, kind: OpKind) -> bool {
+        let (description, invitee, target, welcome, body) = match kind {
+            OpKind::Create => (true, false, false, false, false),
+            OpKind::Invite => (false, true, false, false, false),
+            OpKind::Remove => (false, false, true, false, false),
+            OpKind::Welcome => (false, false, true, true, false),
+            OpKind::Send => (false, false, false, false, true),
+            _ => (false, false, false, false, false),
+        };
+        let invitee_key = matches!(kind, OpKind::Invite);
+        (description || self.description.is_none())
+            && (invitee || self.invitee.is_none())
+            && (invitee_key || self.invitee_key.is_none())
+            && (target || self.target.is_none())
+            && (welcome || self.welcome.is_none())
+            && (body || self.body.is_none())
+    }
+
     /// The operation, key and signature this record holds, or `None` when a
     /// field is missing or malformed.
     fn decode(&self) -> Option<(SignedOp, PublicKey, Signature)> {
@@ -114,6 +138,9 @@ impl OpRec {
         let signature = self.signature.parse().ok()?;
         let kind: OpKind = self.kind.parse().ok()?;
         let text = |f: &Option<String>| f.clone();
+        if !self.has_only_fields_of(kind) {
+            return None;
+        }
         let op = match kind {
             OpKind::Create => SignedOp::Create {
                 description: text(&self.description)?,

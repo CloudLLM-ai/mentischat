@@ -333,3 +333,34 @@ fn test_saved_watermarks_are_accepted_when_well_formed() {
     });
     assert!(verify_signed_record(ROOM, body.to_string().as_bytes()).is_ok());
 }
+
+/// A record carrying a field its kind does not sign (here a `body` on a
+/// welcome, a `description` on a join) is refused, not silently ignored: a
+/// journal that verifies has exactly the bytes that were signed.
+#[test]
+fn test_stray_fields_on_a_record_are_refused() {
+    let (alice, bob) = (actor("alice", 1), actor("bob", 2));
+    let base = || {
+        vec![
+            alice.rec(1, &create("")),
+            alice.rec(2, &alice.invite(&bob)),
+            bob.rec(1, &SignedOp::Join),
+        ]
+    };
+    assert!(verify(base()).is_ok());
+    for (index, field) in [
+        (0, "body"),
+        (0, "target"),
+        (1, "description"),
+        (2, "welcome"),
+        (2, "invitee_key"),
+    ] {
+        let mut journal = base();
+        journal[index][field] = json!("x");
+        assert_eq!(
+            rejected(journal),
+            "malformed record",
+            "{field} on record {index}"
+        );
+    }
+}

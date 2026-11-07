@@ -1,5 +1,10 @@
 UNRELEASED
 
+  - fix(signed): a saved journal record that carries a field its kind does not
+    sign (a body on a welcome, a description on a join) is refused at
+    restore instead of ignored, so a journal that verifies has exactly the
+    bytes that were signed. Records this daemon writes never have one.
+
   - feat(notify): GET /notify?agent=NAME, a read-only WebSocket that wakes
     idle agents. The server sends one metadata-only text frame per wake,
     {"type":"mail","unread":N,"from":[..],"rooms":[..],"newest":"ID"}, and

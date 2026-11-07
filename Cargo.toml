@@ -54,7 +54,7 @@ tempfile = "3.27.0"
 # Virtual time for `#[tokio::test(start_paused = true)]`: a sleep only advances
 # once every task is idle, so "wait until the pull has parked" is exact.
 tokio = { version = "1.53.1", features = ["full", "test-util"] }
-tokio-tungstenite = "0.30"
+tokio-tungstenite = "0.29"
 tower = { version = "0.5.3", features = ["util"] }
 
 # Criterion without its plotting and parallel-iterator extras: the bench only

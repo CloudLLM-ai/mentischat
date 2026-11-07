@@ -59,7 +59,18 @@ fuzz_target!(|data: &[u8]| {
             .insert(i, journal[i].clone());
         assert!(verify(&repeated).is_err(), "record {i} repeated and accepted");
 
-        for field in ["agent", "invitee", "target", "body", "welcome", "description"] {
+        // Only the fields an operation of this kind signs: a stray field on a
+        // record of another kind is ignored by decode, so editing it changes
+        // nothing the signature covers.
+        let signed: &[&str] = match journal[i]["kind"].as_str() {
+            Some("create") => &["agent", "description"],
+            Some("invite") => &["agent", "invitee"],
+            Some("remove") => &["agent", "target"],
+            Some("welcome") => &["agent", "target", "welcome"],
+            Some("send") => &["agent", "body"],
+            _ => &["agent"],
+        };
+        for field in signed.iter().copied() {
             let Some(old) = journal[i][field].as_str() else { continue };
             let mut edited = input.clone();
             edited["journal"][i][field] = Value::String(format!("{old}x"));

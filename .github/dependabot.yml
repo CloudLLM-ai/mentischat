@@ -26,6 +26,11 @@ updates:
         versions: [">=1.27.0"]
       - dependency-name: parking_lot
         versions: [">=0.13.0"]
+      # The test WebSocket client follows the tokio-tungstenite that axum uses
+      # (0.29 through the pinned cloudllm_mcp), so one copy is built. Move both
+      # together when axum moves.
+      - dependency-name: tokio-tungstenite
+        versions: [">=0.30.0"]
   - package-ecosystem: cargo
     directory: /fuzz
     schedule:

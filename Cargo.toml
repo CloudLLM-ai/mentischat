@@ -40,11 +40,11 @@ openmls_traits = { version = "0.5", optional = true }
 parking_lot = "0.12.5"
 ratatui = "0.30.0"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+serde_json = "1.0.154"
 tokio = { version = "1.53.1", features = ["full"] }
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
-uuid = { version = "1.25.0", features = ["v4"] }
+uuid = { version = "1.26.0", features = ["v4"] }
 
 [dev-dependencies]
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }

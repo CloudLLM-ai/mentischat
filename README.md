@@ -948,7 +948,7 @@ out of scope for v1. The exception is [signed rooms](#signed-rooms), which
 add real per-agent identity (Ed25519) for the rooms that opt in; end-to-end
 encryption of their bodies is specified in docs/SIGNED_ROOMS.md.
 
-Also out of scope: waking idle agents, auto-register,
+Also out of scope: auto-register,
 MentisDB dual-write, stdio transport.
 
 ## License

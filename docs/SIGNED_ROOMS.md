@@ -98,10 +98,10 @@ trust-on-first-use:
   are snake_case like tool parameters, responses camelCase); the signature
   signs the `register_key` payload (name and key), proving possession.
 - First registration wins. Re-registering the same key is idempotent. A
-  different key for a name that still has one fails `key_conflict`: a name's
-  key changes only when its registration leaves the roster (deregister or
-  expiry) and the name is registered again. Because rooms pin keys, a new
-  holder of an old name inherits none of its room memberships.
+  different key for a name that has one fails `key_conflict`. In the daemon
+  the binding is permanent (see the key registry below): a name's key changes
+  only after a deregister signed by that key. Because rooms pin keys, a new
+  holder of a released name inherits none of its room memberships.
 - A bound key also guards the name itself. `register` with `reclaim: true`
   takes back a registered key-bound name, or one held after it left the
   roster, only with a proof: `counter` and `signature` on `POST /agents`, an
@@ -117,9 +117,20 @@ trust-on-first-use:
   with `reclaim: true` or deregisters its own name.
 - `GET /agents/{agent}/key` returns the bound key, which is how an inviter
   finds the key to pin for an invitee.
-- Keys live in memory with the roster entry, and with the hold that follows
-  it while the name is held. With `MENTISCHAT_PERSIST=1` a snapshot keeps
-  both, and each comes back only if its proof of possession verifies again.
+- **The key registry.** Mail, rooms and the roster live in memory, but
+  identities do not: the daemon keeps every binding in
+  `{MENTISCHAT_DIR}/keys.jsonl` (`0600`, public data only), appended and
+  `fsync`ed before it applies, and the startup wipe leaves it alone. A bound
+  name stays reserved for its key across idle expiry, the end of its hold,
+  crashes and restarts. `register` of it fails `name_taken` with reason
+  `bound` and `publicKey`; only a `reclaim` proven by that key takes it, and
+  the new registration is bound to the key at once. The client proxy does
+  this by itself when a plain `register` meets its own key. A deregister
+  signed by the key releases the binding. Each line of the file carries the
+  binding's proof of possession, checked again on load (a line that fails is
+  dropped), and the counter the key last signed for its name, so a captured
+  proof cannot be replayed after a restart. Library users opt in with
+  `Bus::with_key_registry`; without it bindings stay in memory as before.
 
 ## Signed rooms (phase 1)
 
@@ -400,9 +411,10 @@ cannot be answered; any member can run the re-add by hand.
 - Membership policy is simple: any member invites, the owner removes. Richer
   roles would be a protocol revision.
 - One key per name; no device multiplicity. A name's key is bound trust on
-  first use: the first process to bind a name wins until that registration
-  leaves the roster.
-- Signed rooms, key bindings and the KeyPackage directory survive a clean stop only
+  first use: the first process to bind a name keeps it until its key signs a
+  deregister.
+- Key bindings survive anything (the key registry). Signed rooms and the
+  KeyPackage directory survive a clean stop only
   with `MENTISCHAT_PERSIST=1`, and a crash loses them (as it loses everything the
   daemon holds); the client's own state survives either way, and a group whose room
   is gone must be recreated.

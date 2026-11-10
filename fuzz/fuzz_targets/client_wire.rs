@@ -26,6 +26,16 @@ fuzz_target!(|data: &[u8]| {
         Ok(Command::KeyInit { agent } | Command::KeyShow { agent }) => {
             assert!(AgentName::parse(&agent).is_ok());
         }
+        Ok(Command::KeyImport {
+            agent, seed_file, ..
+        }) => {
+            // `key import` parses only with a valid agent, and the seed file
+            // is the value that followed `--seed-file` on the command line.
+            assert!(AgentName::parse(&agent).is_ok());
+            assert!(args
+                .windows(2)
+                .any(|w| w[0] == "--seed-file" && std::path::Path::new(&w[1]) == seed_file));
+        }
         Err(_) => {}
     }
 });

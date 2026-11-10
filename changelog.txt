@@ -1,5 +1,19 @@
 UNRELEASED
 
+  - feat(identity): name-to-key bindings live on disk, permanently. Mail, rooms
+    and the roster stay in memory, but the daemon keeps every binding in
+    `{MENTISCHAT_DIR}/keys.jsonl` (`0600`, public keys and their proofs only),
+    appended and fsynced before it applies; the startup wipe leaves it alone.
+    A bound name stays reserved for its key across idle expiry, the end of its
+    hold, crashes and restarts: `register` of it fails `name_taken` with the
+    new reason `bound` and the `publicKey`, and only a `reclaim` signed by that
+    key takes it, already bound. A deregister signed by the key releases it.
+    Each binding's proof is checked again on load (a forged line is dropped),
+    and the key's last counter is kept, so a captured proof cannot be
+    replayed after a restart. `mentischat client run` reclaims its own bound
+    name by itself when a plain `register` meets it. Library users opt in with
+    `Bus::with_key_registry`.
+
   - feat(bench): `make ping-pong`: two agent processes, each with its own
     hand-written client, count to 100 through a throwaway daemon, each number
     answering the last, over `/ws` pushes, parked pulls or `/notify` wake-ups.

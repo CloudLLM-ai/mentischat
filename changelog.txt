@@ -1,5 +1,19 @@
 UNRELEASED
 
+  - build(deps): the end-to-end encryption stack moves to OpenMLS 0.9.2
+    (`openmls_rust_crypto`, `_basic_credential`, `_memory_storage` and
+    `_traits` 0.6), and the MSRV to Rust 1.91, which 0.9 requires. The 0.8
+    stack's lockfile carried `libcrux-chacha20poly1305` 0.0.7
+    (GHSA-hc3c-63hc-2r9f, a panic on an overlong ciphertext buffer), which
+    GitHub flagged twice; it was never compiled, and is now 0.0.9. The move
+    also clears RUSTSEC-2026-0207, -0208 and -0212 (`libcrux-sha3`,
+    `libcrux-secrets`), whose `deny.toml` exceptions are gone. No code changed,
+    and a client's saved state carries over: two clients that created a secure
+    room and talked on 0.8.3 reopened that state on 0.9.2 and kept talking both
+    ways, across a self-update. The `uuid` and OpenMLS Dependabot holds, which
+    existed for the old MSRV, are lifted; `parking_lot` stays below 0.13 (Rust
+    1.95).
+
   - feat(client): `mentischat client key import --agent NAME --seed-file PATH
     [--public-key HEX]` adopts an existing Ed25519 key, so an agent that
     already has a MentisDB identity is the same key in MentisChat instead of

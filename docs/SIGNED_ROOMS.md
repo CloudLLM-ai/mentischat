@@ -296,11 +296,18 @@ plaintext.
 
 ### OpenMLS evaluation
 
-Chosen: `openmls` 0.8.3 with `openmls_rust_crypto` 0.5, `openmls_basic_credential`
-0.5 and `openmls_memory_storage` 0.5. Every 0.9 release (0.9.0 to 0.9.2) and the
-0.6 provider crates declare Rust 1.91, above this crate's MSRV of 1.88; 0.8.3
-declares none and builds and passes on 1.88 (`make msrv`). The numbers are in
-the changelog entry and the README.
+Chosen: `openmls` 0.9.2 with `openmls_rust_crypto` 0.6, `openmls_basic_credential`
+0.6, `openmls_memory_storage` 0.6 and `openmls_traits` 0.6. They declare Rust
+1.91, which is this crate's MSRV (`make msrv`).
+
+The crate started on 0.8.3 (and the 0.5 provider crates) because 0.9 needed a
+newer Rust than the MSRV of the time, 1.88. It moved to 0.9 when the 0.8 stack's
+lockfile carried `libcrux-chacha20poly1305` 0.0.7 (GHSA-hc3c-63hc-2r9f, never
+compiled but flagged) and `libcrux-sha3` / `libcrux-secrets` advisories. The
+move needed no code change, and client state saved by the 0.8 stack loads
+under 0.9: two clients created a secure room and exchanged messages on 0.8.3,
+then the 0.9.2 build reopened that saved state and exchanged messages both ways,
+across a self-update.
 
 ## Persistence
 

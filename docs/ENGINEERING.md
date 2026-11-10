@@ -38,7 +38,7 @@ Rules the workflows follow:
 | Job | Command | Needs |
 |---|---|---|
 | Format, check, clippy, tests, docs | `make ci` (or one of `make fmt-check`, `check`, `clippy`, `test`, `doc`) | stable Rust |
-| MSRV | `make msrv` | `rustup toolchain install 1.88` |
+| MSRV | `make msrv` | `rustup toolchain install 1.91` |
 | Dependency policy | `make deny` | `cargo install cargo-deny` |
 | Coverage | `make coverage` (`make coverage-open` to view) | `cargo install cargo-llvm-cov`, `rustup component add llvm-tools-preview` |
 | Security lints | `make clippy-security` | stable Rust |
@@ -69,19 +69,22 @@ not change):
   added to `deny.toml` on purpose.
 
 Every `ignore` in `deny.toml` carries its advisory id and the reason it cannot
-hurt us. Today there are five:
+hurt us. Today there are two:
 
 | Advisory | Crate | Why it is ignored |
 |---|---|---|
-| RUSTSEC-2026-0387 | `crypto-bigint 0.5.5` (timing) | Reached only through `p256` inside `openmls_rust_crypto`. The one MLS ciphersuite mentischat uses is X25519, AES-128-GCM, SHA-256, Ed25519 (`src/client/session.rs`, `SUITE`), so no P-256 operation ever runs. The fix is `crypto-bigint 0.7`, which `p256 0.13` does not allow; OpenMLS 0.9 moves on but needs Rust 1.91 and the MSRV is 1.88. |
-| RUSTSEC-2026-0207, -0208 | `libcrux-sha3 0.0.8` | `hpke-rs 0.6.1` calls it only to derive X-Wing / ML-KEM keys (`hpke-rs` `src/kem.rs`); the X25519 suite never gets there. `hpke-rs` pins the exact version. |
-| RUSTSEC-2026-0212 | `libcrux-secrets 0.0.5` | Used only by `libcrux-sha3`, so as unreachable as the two above. |
+| RUSTSEC-2026-0387 | `crypto-bigint 0.5.5` (timing) | Reached only through `p256` inside `openmls_rust_crypto`. The one MLS ciphersuite mentischat uses is X25519, AES-128-GCM, SHA-256, Ed25519 (`src/client/session.rs`, `SUITE`), so no P-256 operation ever runs. The fix is `crypto-bigint 0.7`, which `p256 0.13` does not allow, and `openmls_rust_crypto 0.6` (the OpenMLS 0.9 line) still uses `p256 0.13`. |
 | RUSTSEC-2026-0173 | `proc-macro-error2` | Unmaintained, and a compile-time proc-macro dependency of ratatui's macros; it is not in the shipped binary. |
 
-`cargo audit` reports nine vulnerabilities where `cargo deny` reports none.
-The difference is not a weaker check: `cargo audit` reads every entry of
-`Cargo.lock`, including `hpke-rs-libcrux`, `libcrux-aesgcm`, `libcrux-kem`
-and friends, which are `dev-dependencies` of `hpke-rs` that Cargo records in
+The move to OpenMLS 0.9 cleared RUSTSEC-2026-0207, -0208 and -0212
+(`libcrux-sha3` and `libcrux-secrets`), which the 0.8 stack had to ignore, and
+GHSA-hc3c-63hc-2r9f (`libcrux-chacha20poly1305` 0.0.7, which GitHub's
+Dependabot alerts flagged from the lockfile).
+
+`cargo audit` reports three vulnerabilities where `cargo deny` reports none:
+the `crypto-bigint` one above and two in `libcrux-kem`. The difference is not
+a weaker check: `cargo audit` reads every entry of `Cargo.lock`, including
+`hpke-rs-libcrux`, `libcrux-kem` and friends, which are `dev-dependencies` of `hpke-rs` that Cargo records in
 the lockfile but never builds (`cargo tree --all-features --target all` does
 not contain them). `cargo deny` checks the graph that is actually built. The
 weekly security run still runs `cargo audit` as a report so the difference stays
@@ -89,8 +92,9 @@ visible.
 
 **Dependabot** (`.github/dependabot.yml`) opens weekly pull requests for Cargo
 (the crate and `fuzz/`) and for GitHub Actions, grouping minor and patch
-updates. `cloudllm_mcp` (pinned `=0.4.0`, unstable between minors) and the
-OpenMLS minor line (needs Rust 1.91) are excluded on purpose. Every Dependabot
+updates. `cloudllm_mcp` (pinned `=0.4.0`, unstable between minors) is excluded
+on purpose, `parking_lot` is held below 0.13 (it needs Rust 1.95, above the
+1.91 MSRV) and `tokio-tungstenite` follows the version axum uses. Every Dependabot
 pull request runs the full CI before anyone merges it.
 
 ## Coverage

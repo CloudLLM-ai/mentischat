@@ -224,7 +224,7 @@ async fn run_daemon() -> ExitCode {
     });
 
     let served = axum::serve(
-        listener,
+        mentischat::low_latency_listener(listener),
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown_signal(shutdown_bus, quit, persist))

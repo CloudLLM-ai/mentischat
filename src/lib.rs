@@ -116,6 +116,48 @@ pub fn listen_addr(var: impl Fn(&str) -> Option<String>) -> Result<SocketAddr, L
     }
 }
 
+/// A [`tokio::net::TcpListener`] whose accepted connections have Nagle's
+/// algorithm switched off; what [`low_latency_listener`] returns.
+pub type LowLatencyListener =
+    axum::serve::TapIo<tokio::net::TcpListener, fn(&mut tokio::net::TcpStream)>;
+
+/// Wrap `listener` so every accepted connection sets `TCP_NODELAY`.
+///
+/// Serve the daemon through this. Its traffic is small frames that someone
+/// is waiting on: a `/ws` push, a `/notify` wake-up, a receipt. With Nagle's
+/// algorithm on, the kernel holds a small write while an earlier one is still
+/// unacknowledged, and the peer's delayed ACK releases it about 40 ms later
+/// on Linux, so a push that the bus delivers in microseconds reached the
+/// client in 41 ms. Batching bulk transfers is what Nagle is for, and the
+/// daemon has none to batch.
+///
+/// A connection on which `set_nodelay` fails is still served, only slower;
+/// the failure is logged to stderr.
+///
+/// ```no_run
+/// # async fn demo(bus: std::sync::Arc<mentischat::bus::Bus>) {
+/// use std::net::SocketAddr;
+///
+/// let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+/// let app = mentischat::build_router(bus);
+/// axum::serve(
+///     mentischat::low_latency_listener(listener),
+///     app.into_make_service_with_connect_info::<SocketAddr>(),
+/// )
+/// .await
+/// .unwrap();
+/// # }
+/// ```
+pub fn low_latency_listener(listener: tokio::net::TcpListener) -> LowLatencyListener {
+    use axum::serve::ListenerExt;
+    fn no_delay(stream: &mut tokio::net::TcpStream) {
+        if let Err(e) = stream.set_nodelay(true) {
+            eprintln!("mentischat: TCP_NODELAY on an accepted connection failed: {e}");
+        }
+    }
+    listener.tap_io(no_delay as fn(&mut tokio::net::TcpStream))
+}
+
 /// Compose the full application [`axum::Router`]: REST on the outer router
 /// with the upstream MCP router nested at [`MCP_ENDPOINT_PATH`].
 ///
@@ -126,8 +168,9 @@ pub fn listen_addr(var: impl Fn(&str) -> Option<String>) -> Result<SocketAddr, L
 /// This is also where the request body limit lives, so it covers REST and
 /// `/mcp` alike; `rest::router` deliberately carries none of its own.
 ///
-/// The caller is responsible for binding the listener and serving the router
-/// with `into_make_service_with_connect_info::<SocketAddr>()`, which both
+/// The caller is responsible for binding the listener (wrapped in
+/// [`low_latency_listener`]) and serving the router with
+/// `into_make_service_with_connect_info::<SocketAddr>()`, which both
 /// the loopback middleware and the upstream MCP handlers need for IP checks.
 pub fn build_router(bus: Arc<bus::Bus>) -> axum::Router {
     let transport = StreamableHttpConfig::new(SERVER_NAME, SERVER_VERSION)

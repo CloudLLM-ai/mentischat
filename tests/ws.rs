@@ -491,3 +491,88 @@ fn parse_frame_refuses_with_a_typed_error_and_the_ref() {
         MailboxError::InvalidBody
     );
 }
+
+/// The next `messages` frame, skipping receipts and pings.
+async fn next_messages(ws: &mut Client) -> Value {
+    loop {
+        let frame = next(ws).await.expect("stream open");
+        if frame["type"] == "messages" {
+            return frame;
+        }
+    }
+}
+
+/// A pushed message reaches the other agent in well under a millisecond on
+/// loopback, not after a delayed ACK.
+///
+/// Regression: the daemon served on a plain `TcpListener`, so Nagle's
+/// algorithm held each small push until the client's delayed ACK released
+/// it, and every `/ws` push took about 41 ms on Linux (measured on a server:
+/// 20 ping-pongs, one-way p50 41.0 ms). `low_latency_listener` sets
+/// `TCP_NODELAY` on every accepted connection. Both clients here set it too,
+/// as any latency-sensitive client should, so the only Nagle left to catch
+/// is the server's. 20 ms is half the delayed-ACK floor and far above what a
+/// loopback round trip costs, so the bound fails only on the bug.
+#[tokio::test]
+async fn ws_push_round_trip_is_not_held_by_nagle() {
+    let dir = tempfile::tempdir().unwrap();
+    let bus = Arc::new(Bus::new(&dir.path().join("ws")).unwrap());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = mentischat::build_router(bus.clone());
+    tokio::spawn(async move {
+        axum::serve(
+            mentischat::low_latency_listener(listener),
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    for who in ["a", "b"] {
+        bus.register(&name(who)).await.unwrap();
+    }
+    let open = |agent: &str| {
+        let url = format!("ws://{addr}/ws?agent={agent}");
+        async move {
+            tokio_tungstenite::connect_async_with_config(url, None, true)
+                .await
+                .expect("upgrade")
+                .0
+        }
+    };
+    let (mut a, mut b) = (open("a").await, open("b").await);
+
+    let mut round_trips = Vec::new();
+    for i in 0..21 {
+        let started = std::time::Instant::now();
+        say(
+            &mut a,
+            json!({"type": "send", "ref": i, "to": "b", "body": "ping"}),
+        )
+        .await;
+        let ping = next_messages(&mut b).await;
+        say(
+            &mut b,
+            json!({"type": "ack", "upTo": ping["messages"][0]["id"]}),
+        )
+        .await;
+        say(
+            &mut b,
+            json!({"type": "send", "ref": i, "to": "a", "body": "pong"}),
+        )
+        .await;
+        let pong = next_messages(&mut a).await;
+        round_trips.push(started.elapsed());
+        say(
+            &mut a,
+            json!({"type": "ack", "upTo": pong["messages"][0]["id"]}),
+        )
+        .await;
+    }
+    round_trips.sort();
+    let median = round_trips[10];
+    assert!(
+        median < Duration::from_millis(20),
+        "median push round trip {median:?}; Nagle is holding small frames (all: {round_trips:?})"
+    );
+}

@@ -472,6 +472,10 @@ pub(super) struct State {
     pub sent_by_gone: AtomicU64,
     /// Set once the bus is closed; nothing is accepted after.
     pub closed: AtomicBool,
+    /// The on-disk key registry, when one is attached
+    /// ([`Bus::with_key_registry`](super::Bus::with_key_registry)): names it
+    /// holds stay reserved for their keys while off the roster.
+    pub keyring: Option<super::keyring::KeyRing>,
 }
 
 impl State {
@@ -495,6 +499,7 @@ impl State {
             next_gen: AtomicU64::new(1),
             sent_by_gone: AtomicU64::new(0),
             closed: AtomicBool::new(false),
+            keyring: None,
         }
     }
 
@@ -565,7 +570,9 @@ impl State {
     ) -> Vec<String> {
         crate::names::suggestions(|n| {
             let key = n.to_ascii_lowercase();
-            self.roster.get(&key).is_some() || holds.get(&key).is_some_and(|h| h.until_ms > now_ms)
+            self.roster.get(&key).is_some()
+                || holds.get(&key).is_some_and(|h| h.until_ms > now_ms)
+                || self.keyring.as_ref().is_some_and(|k| k.contains(&key))
         })
     }
 

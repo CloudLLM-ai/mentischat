@@ -260,6 +260,24 @@ fn test_name_taken_held_reports_the_hold_expiry() {
     assert_eq!(body["suggestions"], json!([]));
 }
 
+/// A name reserved by the key registry says so and names the key that owns it,
+/// with no expiry: it stays reserved until that key releases it.
+#[test]
+fn test_name_taken_bound_names_the_owning_key() {
+    let body = MailboxError::NameTaken {
+        agent: s("Vega"),
+        reason: TakenReason::Bound {
+            public_key: "ab".repeat(32),
+        },
+        suggestions: vec![s("Orion")],
+    }
+    .to_json();
+    assert_eq!(body["error"], "name_taken");
+    assert_eq!(body["reason"], "bound");
+    assert_eq!(body["publicKey"], "ab".repeat(32));
+    assert!(body.get("heldUntil").is_none());
+}
+
 /// A registered-name conflict names the reason and has no expiry.
 #[test]
 fn test_name_taken_registered_has_no_hold_expiry() {

@@ -162,13 +162,33 @@ async fn run_daemon() -> ExitCode {
         }
         other => other,
     };
-    let bus = Arc::new(match opened {
+    let bus = match opened {
         Ok(bus) => bus,
         Err(e) => {
             eprintln!("mentischat: failed to open {}: {e}", data_dir.display());
             return ExitCode::FAILURE;
         }
-    });
+    };
+    // Identities outlive the in-memory mailbox: name-to-key bindings live in
+    // the key registry, which the startup clear below leaves alone.
+    let registry = data_dir.join(mentischat::bus::KEY_REGISTRY_FILE);
+    let bus = match bus.with_key_registry(&registry) {
+        Ok((bus, load)) => {
+            if load.bound > 0 || load.dropped > 0 {
+                tracing::info!(
+                    bound = load.bound,
+                    dropped = load.dropped,
+                    file = %registry.display(),
+                    "key registry loaded"
+                );
+            }
+            Arc::new(bus)
+        }
+        Err(e) => {
+            eprintln!("mentischat: key registry {}: {e}", registry.display());
+            return ExitCode::FAILURE;
+        }
+    };
 
     // Clearing at startup also covers a previous run that crashed or was
     // killed before its shutdown wipe.

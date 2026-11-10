@@ -358,6 +358,11 @@ impl Bus {
     /// Bind `key` to `agent` (trust on first use). `signature` signs
     /// [`register_key_payload`], proving the caller holds the key.
     ///
+    /// With a key registry attached ([`Bus::with_key_registry`]) the binding
+    /// is recorded there before it applies, and a name the registry already
+    /// binds to another key fails `key_conflict` even if this registration
+    /// has none yet.
+    ///
     /// # Errors
     ///
     /// `unregistered`; `invalid_signature`; `key_conflict` when the name is
@@ -369,14 +374,27 @@ impl Bus {
         key: PublicKey,
         signature: &Signature,
     ) -> Result<KeyBinding, MailErr> {
-        let (_, found) = self.active(agent)?;
+        let (state, found) = self.active(agent)?;
         key.verify(&register_key_payload(agent.as_str(), &key), signature)
             .map_err(|_| MailErr::InvalidSignature)?;
+        let conflict = || MailErr::KeyConflict {
+            agent: found.name.to_string(),
+        };
+        if found.inner.lock().key.is_some_and(|bound| bound != key) {
+            return Err(conflict());
+        }
+        // The registry decides first, atomically, and durably (outside the
+        // agent's lock: it fsyncs); then the binding applies in memory.
+        if let Some(ring) = &state.keyring {
+            match ring.bind(&found.name, key, *signature) {
+                Ok(true) => {}
+                Ok(false) => return Err(conflict()),
+                Err(e) => super::persist(Err(e)),
+            }
+        }
         let mut st = found.inner.lock();
         match st.key {
-            Some(bound) if bound != key => Err(MailErr::KeyConflict {
-                agent: found.name.to_string(),
-            }),
+            Some(bound) if bound != key => Err(conflict()),
             _ => {
                 st.key = Some(key);
                 st.key_proof = Some(*signature);
@@ -567,6 +585,11 @@ impl Bus {
             });
         }
         st.key_counter = counter;
+        drop(st);
+        if let Some(ring) = &self.open()?.keyring {
+            super::persist(ring.raise_counter(&agent.folded(), counter));
+        }
+        let mut st = found.inner.lock();
         st.key_packages.extend(packages);
         while st.key_packages.len() > MAX_KEY_PACKAGES {
             st.key_packages.pop_front();

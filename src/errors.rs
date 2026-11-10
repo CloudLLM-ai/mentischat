@@ -19,6 +19,12 @@ pub enum TakenReason {
         /// When anyone may take it.
         until: String,
     },
+    /// It is reserved for the public key bound to it in the key registry;
+    /// only a `reclaim` proven by that key takes it.
+    Bound {
+        /// The bound key, 64 hex digits.
+        public_key: String,
+    },
 }
 
 /// Domain failures of the mailbox. Never logged with backtraces; mapped once
@@ -306,6 +312,10 @@ impl MailboxError {
                     TakenReason::Held { until } => {
                         body["reason"] = json!("held");
                         body["heldUntil"] = json!(until);
+                    }
+                    TakenReason::Bound { public_key } => {
+                        body["reason"] = json!("bound");
+                        body["publicKey"] = json!(public_key);
                     }
                 }
                 body

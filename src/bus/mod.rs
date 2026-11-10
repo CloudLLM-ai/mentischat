@@ -38,6 +38,7 @@ use crate::signed::{deregister_payload, reclaim_payload};
 mod clock;
 mod convos;
 mod delivery;
+mod keyring;
 mod log;
 mod model;
 mod notify;
@@ -52,6 +53,7 @@ mod state;
 mod stream;
 
 pub use clock::{now_rfc3339, rfc3339};
+pub use keyring::{KeyRegistryLoad, KEY_REGISTRY_FILE};
 pub use model::{
     parse_duration, AgentOverview, DiscardOutcome, HistoryPage, InboxPage, KeyProof, Message,
     Overview, Reach, RegisterOutcome, Registration, Retention, RosterEntry, RosterListing,
@@ -179,6 +181,32 @@ impl Bus {
         })
     }
 
+    /// Keep name-to-key bindings in the on-disk registry at `path`
+    /// (see [`KEY_REGISTRY_FILE`] for the daemon's), so identities outlive
+    /// the in-memory mailbox.
+    ///
+    /// With a registry attached, a name bound to a key
+    /// ([`register_key`](Self::register_key)) stays reserved for that key
+    /// across idle expiry, the end of its hold, crashes and restarts: a
+    /// `register` of it fails `name_taken` with reason `bound` (and the key),
+    /// and only a `reclaim` proven by the key takes it, binding the key to
+    /// the new registration at once. A deregister signed by the key releases
+    /// the binding. Counters the key signs for its name are recorded too, so
+    /// a proof cannot be replayed after a restart. Mail, rooms and the roster
+    /// stay in memory.
+    ///
+    /// Every change is appended and `fsync`ed; a write that fails is logged
+    /// to stderr and the change still applies in memory for this run.
+    ///
+    /// # Errors
+    ///
+    /// The registry cannot be created, read or compacted.
+    pub fn with_key_registry(mut self, path: &Path) -> std::io::Result<(Self, KeyRegistryLoad)> {
+        let (ring, load) = keyring::KeyRing::open(path)?;
+        self.state.keyring = Some(ring);
+        Ok((self, load))
+    }
+
     /// Keep the last `capacity` messages of each room instead of
     /// [`DEFAULT_ROOM_CAPACITY`]; at least 1.
     pub fn with_room_capacity(mut self, capacity: usize) -> Self {
@@ -286,16 +314,43 @@ impl Bus {
                 };
                 let owned = ownership(name, bound, opts.proof, reclaim_payload)?;
                 if let Ownership::Proven(counter) = owned {
-                    return refresh_agent(&agent, counter, now, provider, description);
+                    let outcome = refresh_agent(&agent, counter, now, provider, description)?;
+                    if let Some(ring) = &state.keyring {
+                        persist(ring.raise_counter(&key, counter));
+                    }
+                    return Ok(outcome);
                 }
             }
             let stored = agent.name.to_string();
             return Err(state.name_taken(&holds, stored, TakenReason::Registered, now));
         }
         let hold = holds.get(&key).filter(|h| h.until_ms > now).cloned();
-        let key_counter = match &hold {
-            None => 0,
-            Some(h) => {
+        // A name the key registry holds is reserved for its key, held or not.
+        let ring = state.keyring.as_ref().and_then(|r| r.get(&key));
+        let key_counter = match (&hold, ring) {
+            (_, Some(bound)) => {
+                let owned = if opts.reclaim {
+                    ownership(
+                        name,
+                        Some((bound.key, bound.counter)),
+                        opts.proof,
+                        reclaim_payload,
+                    )?
+                } else {
+                    Ownership::Unproven
+                };
+                match owned {
+                    Ownership::Proven(counter) => counter,
+                    Ownership::Keyless | Ownership::Unproven => {
+                        let reason = TakenReason::Bound {
+                            public_key: bound.key.to_hex(),
+                        };
+                        return Err(state.name_taken(&holds, name.to_string(), reason, now));
+                    }
+                }
+            }
+            (None, None) => 0,
+            (Some(h), None) => {
                 let owned = if opts.reclaim {
                     let bound = h.key.map(|k| (k.key, k.counter));
                     ownership(name, bound, opts.proof, reclaim_payload)?
@@ -337,8 +392,19 @@ impl Bus {
             registered_ms,
             now,
         );
-        // A proven reclaim used `key_counter`; the next one must go above it.
-        agent.inner.lock().key_counter = key_counter;
+        {
+            let mut st = agent.inner.lock();
+            // A proven reclaim used `key_counter`; the next one must go above it.
+            st.key_counter = key_counter;
+            // A name reclaimed from the registry comes back bound to its key.
+            if let Some(bound) = ring {
+                st.key = Some(bound.key);
+                st.key_proof = Some(bound.proof);
+            }
+        }
+        if let (Some(r), Some(_)) = (&state.keyring, ring) {
+            persist(r.raise_counter(&key, key_counter));
+        }
         let outcome = register_outcome(&agent, true);
         state.add_agent(key.clone(), Arc::new(agent));
         holds.remove(&key);
@@ -400,6 +466,11 @@ impl Bus {
                     });
                 }
                 st.key_counter = counter;
+                drop(st);
+                // A signed deregister is the one thing that frees a bound name.
+                if let Some(ring) = &state.keyring {
+                    persist(ring.release(&key));
+                }
             }
         }
         let until_ms = self.now_ms() + self.retention.name_hold.as_millis() as u64;
@@ -937,6 +1008,14 @@ impl Bus {
 /// Check a message body and return its JSON-escaped length: at most
 /// [`MAX_BODY_BYTES`] and not blank. Shared by direct and room sends and by
 /// snapshot restore, so a restored message obeys what a sent one does.
+/// Log a key-registry write that failed. The change already applies in
+/// memory; only its survival across a restart is lost.
+pub(super) fn persist(result: std::io::Result<()>) {
+    if let Err(e) = result {
+        eprintln!("mentischat: key registry write failed: {e}");
+    }
+}
+
 fn validate_body(body: &str) -> Result<usize, MailErr> {
     if body.len() > MAX_BODY_BYTES || body.trim().is_empty() {
         return Err(MailErr::InvalidBody);

@@ -1,5 +1,14 @@
 UNRELEASED
 
+  - feat(bench): `make ping-pong`: two agent processes, each with its own
+    hand-written client, count to 100 through a throwaway daemon, each number
+    answering the last, over `/ws` pushes, parked pulls or `/notify` wake-ups.
+    On a Linux server 100 numbers take 7.9 ms over `/ws` (hop p50 0.066 ms)
+    and 6.8 ms over parked pulls; over `/notify` 147 s, because a wake-up
+    frame is paced (200 ms settle, 3 s cooldown per socket) so a harness is
+    not woken per message. `tests/ping_pong.rs` runs the same players on every
+    test run.
+
   - build(deps): the end-to-end encryption stack moves to OpenMLS 0.9.2
     (`openmls_rust_crypto`, `_basic_credential`, `_memory_storage` and
     `_traits` 0.6), and the MSRV to Rust 1.91, which 0.9 requires. The 0.8

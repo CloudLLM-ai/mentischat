@@ -1,5 +1,13 @@
 UNRELEASED
 
+  - fix(perf): pushes and wake-ups no longer wait about 40 ms on Linux. The
+    daemon served on a plain listener, so Nagle's algorithm held each small
+    `/ws` push, `/notify` frame and receipt until the client's delayed ACK
+    released it; measured on a Linux server, every `/ws` push took 41 ms
+    one way. Accepted connections now set `TCP_NODELAY`
+    (`mentischat::low_latency_listener`, also for embedders). Clients that
+    care about latency should set it on their side too.
+
   - fix(signed): a saved journal record that carries a field its kind does not
     sign (a body on a welcome, a description on a join) is refused at
     restore instead of ignored, so a journal that verifies has exactly the

@@ -1,6 +1,6 @@
 # Makefile
 # Sections below: build and verify, dependencies and coverage, fuzzing, benchmarks, soak, run.
-.PHONY: build release clean fmt fmt-check check test doc help tasks clippy publish publish-dry-run install uninstall run run-plain stop ci msrv deny clippy-security coverage coverage-branch coverage-open bench bench-json bench-baseline bench-compare soak fuzz-build fuzz-targets fuzz-replay fuzz fuzz-cmin
+.PHONY: build release clean fmt fmt-check check test doc help tasks clippy publish publish-dry-run install uninstall run run-plain stop ci msrv deny clippy-security coverage coverage-branch coverage-open bench bench-json bench-baseline bench-compare soak ping-pong fuzz-build fuzz-targets fuzz-replay fuzz fuzz-cmin
 
 default: help
 CARGO_CMD=/usr/bin/env cargo
@@ -98,6 +98,20 @@ bench-compare: ## Compare current.json with the baseline; fails past BENCH_THRES
 # The daemon binary under sustained traffic with a restart halfway (tests/soak.rs).
 soak: ## Soak test: SOAK_SECONDS (default 600) of mixed traffic, a restart, leak and delivery checks
 	SOAK_SECONDS=$(SOAK_SECONDS) ${CARGO_CMD} test --release --all-features --locked --test soak -- --ignored --nocapture soak_long
+
+# Ping-pong: two agent processes count to PING_PONG_TO through a throwaway
+# daemon on PING_PONG_PORT (never 9480, so a live daemon is untouched), in
+# every mode (ws, poll, notify). notify is paced by design (~1.5 s per number).
+PING_PONG_TO?=100
+PING_PONG_PORT?=19580
+PING_PONG_MODE?=all
+ping-pong: ## Two agents count to PING_PONG_TO through a throwaway daemon; per-mode latency (PING_PONG_MODE=ws|poll|notify|all)
+	${CARGO_CMD} build --release --locked --bin mentischat --example ping_pong
+	@dir=$$(mktemp -d); \
+	MENTISCHAT_PLAIN=1 MENTISCHAT_DIR=$$dir MENTISCHAT_LISTEN_PORT=$(PING_PONG_PORT) target/release/mentischat > $$dir/daemon.log 2>&1 & pid=$$!; \
+	sleep 1; \
+	target/release/examples/ping_pong --addr 127.0.0.1:$(PING_PONG_PORT) --to $(PING_PONG_TO) --mode $(PING_PONG_MODE); status=$$?; \
+	kill $$pid; wait $$pid 2>/dev/null; rm -rf $$dir; exit $$status
 
 # Fuzzing needs nightly and cargo-fuzz (cargo install cargo-fuzz); it is not part of `make ci`.
 fuzz-build: ## Build every fuzz target (needs nightly and cargo-fuzz)

@@ -806,3 +806,72 @@ async fn only_the_key_holder_deregisters_a_key_bound_name() {
     let names: Vec<&str> = roster.agents.iter().map(|a| a.name.as_str()).collect();
     assert_eq!(names, ["lyra"]);
 }
+
+/// A daemon over `data` with the key registry attached, as `main.rs` serves it.
+async fn daemon_with_registry(data: &std::path::Path) -> Daemon {
+    let (bus, _) = Bus::new(data)
+        .unwrap()
+        .with_key_registry(&data.join(mentischat::bus::KEY_REGISTRY_FILE))
+        .unwrap();
+    let app = mentischat::build_router(Arc::new(bus));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            mentischat::low_latency_listener(listener),
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .ok();
+    });
+    Daemon::new(addr)
+}
+
+/// After a daemon restart the name is reserved for its key in the registry.
+/// A proxy holding that key gets it back with a plain `register` (it signs the
+/// reclaim itself, no retry by the model), already bound; a proxy with another
+/// key for the name is refused with reason `bound`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn after_a_restart_the_proxy_takes_its_bound_name_back_by_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("daemon");
+    let clients = dir.path().join("clients");
+    let proxy_on = |daemon: Daemon, clients: &std::path::Path| {
+        let id = Identity::open(clients, "vega").unwrap();
+        Harness::spawn_with(
+            Client::open(id, daemon).unwrap(),
+            daemon,
+            mentischat::client::UpdatePolicy::default(),
+        )
+    };
+
+    let before = daemon_with_registry(&data).await;
+    let mut h = proxy_on(before, &clients);
+    let (err, body) = h.tool("register", json!({ "agent": "vega" })).await;
+    assert!(!err, "{body}");
+    assert_eq!(body["secure"], true, "{body}");
+
+    // The restarted daemon: a new mailbox over the same registry.
+    let after = daemon_with_registry(&data).await;
+    let mut h = proxy_on(after, &clients);
+    let (err, body) = h.tool("register", json!({ "agent": "vega" })).await;
+    assert!(!err, "the proxy should reclaim its own bound name: {body}");
+    assert_eq!(body["secure"], true, "{body}");
+
+    let impostor_clients = dir.path().join("impostor");
+    let mut impostor = proxy_on(after, &impostor_clients);
+    let (err, body) = impostor.tool("register", json!({ "agent": "vega" })).await;
+    assert!(err, "{body}");
+    assert_eq!(body["error"], "name_taken", "{body}");
+    assert_eq!(body["reason"], "registered", "{body}");
+
+    // On the next start, before vega is back, the impostor is told the name
+    // is reserved and for which key.
+    let third = daemon_with_registry(&data).await;
+    let mut impostor = proxy_on(third, &impostor_clients);
+    let (err, body) = impostor.tool("register", json!({ "agent": "vega" })).await;
+    assert!(err, "{body}");
+    assert_eq!(body["reason"], "bound", "{body}");
+    let vega_key = Identity::open(&clients, "vega").unwrap().public().to_hex();
+    assert_eq!(body["publicKey"], vega_key, "{body}");
+}

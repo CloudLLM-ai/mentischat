@@ -259,6 +259,16 @@ fn result_json(result: &Value) -> Option<Value> {
     serde_json::from_str(text).ok()
 }
 
+/// Whether a failed register says the name is reserved (`name_taken`, reason
+/// `bound`) for the public key `own_hex`.
+fn reserved_for(result: &Value, own_hex: &str) -> bool {
+    result_json(result).is_some_and(|body| {
+        body["error"] == "name_taken"
+            && body["reason"] == "bound"
+            && body["publicKey"].as_str() == Some(own_hex)
+    })
+}
+
 /// Register, then bind this client's key. A reclaim is signed here and sent
 /// to `POST /agents` with its proof, since the daemon's tool takes none;
 /// anything else goes to the daemon's tool unchanged.
@@ -271,6 +281,15 @@ async fn register(client: &mut Client, daemon: Daemon, args: &Value) -> Value {
     } else {
         forward(daemon, "register", args).await
     };
+    // A name the daemon's key registry reserves for this client's own key
+    // (after a restart, or idle expiry) is ours to take back: sign the
+    // reclaim here instead of asking the model to retry.
+    if result["isError"] == true && reserved_for(&result, &client.public_key().to_hex()) {
+        result = match client.reclaim(args).await {
+            Ok(value) => tool_result(&value, false),
+            Err(e) => failure(&e),
+        };
+    }
     if result["isError"] == true {
         return result;
     }

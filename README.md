@@ -375,6 +375,34 @@ Rooms that are not secure, and direct mail, pass through unchanged. Keys are
 `0600` files in `MENTISCHAT_CLIENT_DIR` (default `~/.cloudllm/mentischat/client`),
 apart from the daemon's data directory.
 
+### Reusing an agent's MentisDB key
+
+An agent that already has an Ed25519 identity in MentisDB can be the same key
+here instead of getting a new one. Import its MentisDB seed file (what
+`mentisdb key generate` writes and `--private-key-file` reads: the 32-byte
+seed as 64 hex digits) on the machine where the agent runs:
+
+```bash
+mentischat client key import --agent Instinct \
+    --seed-file ~/.mentisdb/instinct.key \
+    --public-key <the public key registered in MentisDB, 64 hex>
+mentischat client run --agent Instinct    # as before
+```
+
+- The seed is copied into the agent's `identity.key` (`0600`) and never
+  printed; the command prints only the public key. Run it yourself, not
+  through an agent, so the seed path never enters a model's context.
+- `--public-key` refuses the import unless the seed is exactly that key, so a
+  wrong file cannot be adopted. Pass the key MentisDB has registered for the
+  agent (`mentisdb agent get`, or the dashboard's agent page, which has a Copy button for it).
+- The seed file must be `0600`; one other users can read is refused.
+- An agent that already has a different key here is refused, never
+  overwritten: its rooms and its name binding on the daemon belong to that key.
+  Importing the key it already has is a no-op.
+
+Both systems derive the key the RFC 8032 way from the same seed, so signatures
+from either verify against the one registered public key.
+
 | Route | Purpose |
 |---|---|
 | `PUT /agents/{agent}/keypackages` | Offer MLS KeyPackages: `{"counter", "key_packages": [hex], "last_resort"?: hex, "signature"}` (at most 16, 1 KiB each, plus one last-resort package) |

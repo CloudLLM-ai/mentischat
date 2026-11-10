@@ -8,7 +8,7 @@ CARGO_CMD=/usr/bin/env cargo
 # left in target/ that this build didn't use, so only fresh release artifacts remain.
 SWEEP := $(shell command -v cargo-sweep >/dev/null 2>&1 && echo cargo sweep)
 MENTISCHAT_PORT?=9480
-MSRV?=1.88
+MSRV?=1.91
 FUZZ_SECONDS?=60
 # The crate has no `unsafe`, so AddressSanitizer would only slow the fuzzers down (about 2x); skip it.
 FUZZ_FLAGS=-s none
@@ -46,7 +46,7 @@ release: fmt check clippy build test doc ## Perform a full release (fmt, check, 
 ci: fmt-check check clippy test doc ## Verification-only pipeline (no source rewrites)
 
 # Check the rust-version claim in Cargo.toml (needs rustup and the toolchain)
-msrv: ## Type-check on the minimum supported Rust version (MSRV, default 1.88)
+msrv: ## Type-check on the minimum supported Rust version (MSRV, default 1.91)
 	${CARGO_CMD} +$(MSRV) check --release --all-targets --all-features --locked
 
 # Dependency policy from deny.toml: advisories, licenses, bans, sources (cargo install cargo-deny).

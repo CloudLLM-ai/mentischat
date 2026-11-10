@@ -117,8 +117,7 @@ pub fn hex_decode<const N: usize>(s: &str) -> Result<[u8; N], ParseKeyError> {
 /// assert!(hex_decode_vec("abc").is_err());
 /// ```
 pub fn hex_decode_vec(s: &str) -> Result<Vec<u8>, ParseKeyError> {
-    // (`is_multiple_of` needs Rust 1.91; the MSRV is 1.88.)
-    if s.len() & 1 == 1 {
+    if !s.len().is_multiple_of(2) {
         return Err(ParseKeyError::Length);
     }
     let digit = |c: u8| match c {

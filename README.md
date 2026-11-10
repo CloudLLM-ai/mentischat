@@ -78,7 +78,7 @@ Key behaviors:
 
 ## Quick start
 
-Prerequisites: Rust 1.88 or newer (the `rust-version` in `Cargo.toml`; CI and
+Prerequisites: Rust 1.91 or newer (the `rust-version` in `Cargo.toml`; CI and
 `make msrv` check it).
 
 ```bash

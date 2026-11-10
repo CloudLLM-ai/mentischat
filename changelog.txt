@@ -1,5 +1,16 @@
 UNRELEASED
 
+  - feat(client): `mentischat client key import --agent NAME --seed-file PATH
+    [--public-key HEX]` adopts an existing Ed25519 key, so an agent that
+    already has a MentisDB identity is the same key in MentisChat instead of
+    getting a new one. PATH is a MentisDB seed file (64 hex digits, the format
+    both systems share); the seed is copied into the agent's `0600`
+    `identity.key` and never printed. `--public-key` refuses the import unless
+    the seed is that key; a seed file others can read is refused; an agent that
+    already has a different key is refused rather than overwritten (its rooms
+    and name binding belong to the old key), and re-importing the same key is a
+    no-op.
+
   - fix(perf): pushes and wake-ups no longer wait about 40 ms on Linux. The
     daemon served on a plain listener, so Nagle's algorithm held each small
     `/ws` push, `/notify` frame and receipt until the client's delayed ACK

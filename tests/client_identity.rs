@@ -163,3 +163,153 @@ fn test_client_error_display_and_daemon_code() {
         assert_eq!(error.daemon_code(), None);
     }
 }
+
+/// RFC 8032 section 7.1, test 1: the seed and the public key every
+/// conforming Ed25519 implementation (MentisDB's included) derives from it.
+const RFC8032_SEED: &str = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
+const RFC8032_PUBLIC: &str = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+
+/// A seed file the way `mentisdb key generate` writes it: 64 lowercase hex
+/// digits and a newline, mode 0600.
+fn mentisdb_seed_file(dir: &std::path::Path, hex: &str) -> std::path::PathBuf {
+    let path = dir.join("instinct.key");
+    std::fs::write(&path, format!("{hex}\n")).expect("write seed");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    path
+}
+
+/// An existing MentisDB seed becomes the agent's identity with the public key
+/// MentisDB derives from it, stored private, and reloads unchanged.
+#[test]
+fn test_import_adopts_a_mentisdb_seed_with_the_same_public_key() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let src = tempfile::tempdir().expect("src");
+    let seed = mentisdb_seed_file(src.path(), RFC8032_SEED);
+    let want: mentischat::signed::PublicKey = RFC8032_PUBLIC.parse().unwrap();
+
+    let imported = Identity::import(root.path(), "Instinct", &seed, Some(&want)).expect("import");
+    assert_eq!(imported.public().to_hex(), RFC8032_PUBLIC);
+    let key = root.path().join("instinct").join("identity.key");
+    assert_eq!(mode(&key), 0o600);
+    assert_eq!(mode(&root.path().join("instinct")), 0o700);
+    assert_eq!(std::fs::read_to_string(&key).unwrap().trim(), RFC8032_SEED);
+    let reopened = Identity::open(root.path(), "Instinct").expect("reopen");
+    assert_eq!(reopened.public(), imported.public());
+}
+
+/// `--public-key` pins the key: a seed that is some other key is refused and
+/// nothing is written.
+#[test]
+fn test_import_refuses_a_seed_that_is_not_the_expected_key() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let src = tempfile::tempdir().expect("src");
+    let seed = mentisdb_seed_file(src.path(), RFC8032_SEED);
+    let other = Identity::open(src.path(), "Other")
+        .expect("other key")
+        .public();
+
+    let err = Identity::import(root.path(), "Instinct", &seed, Some(&other)).unwrap_err();
+    assert!(
+        matches!(err, ClientError::Usage(ref m) if m.contains("nothing was imported")),
+        "{err}"
+    );
+    assert!(!root.path().join("instinct").exists());
+}
+
+/// A seed file other users can read is a leaked key: refused, not adopted.
+#[test]
+fn test_import_refuses_a_seed_file_others_can_read() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let src = tempfile::tempdir().expect("src");
+    let seed = mentisdb_seed_file(src.path(), RFC8032_SEED);
+    std::fs::set_permissions(&seed, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let err = Identity::import(root.path(), "Instinct", &seed, None).unwrap_err();
+    assert!(
+        matches!(err, ClientError::Storage(ref m) if m.contains("chmod 600")),
+        "{err}"
+    );
+    assert!(!root.path().join("instinct").exists());
+}
+
+/// A file that is not 64 hex digits is refused.
+#[test]
+fn test_import_refuses_a_damaged_seed_file() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let src = tempfile::tempdir().expect("src");
+    for bad in [
+        "",
+        "abc",
+        &RFC8032_SEED[..62],
+        &format!("{RFC8032_SEED}00"),
+        &"zz".repeat(32),
+    ] {
+        let seed = mentisdb_seed_file(src.path(), bad);
+        let err = Identity::import(root.path(), "Instinct", &seed, None).unwrap_err();
+        assert!(matches!(err, ClientError::Storage(_)), "{bad:?}: {err}");
+    }
+    assert!(!root.path().join("instinct").exists());
+}
+
+/// Importing the key the agent already has changes nothing; importing a
+/// different one is refused and the existing identity is left intact, since
+/// its rooms and name binding belong to the old key.
+#[test]
+fn test_import_never_replaces_a_different_existing_key() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let src = tempfile::tempdir().expect("src");
+    let seed = mentisdb_seed_file(src.path(), RFC8032_SEED);
+
+    let first = Identity::import(root.path(), "Instinct", &seed, None).expect("import");
+    let again = Identity::import(root.path(), "Instinct", &seed, None).expect("same key again");
+    assert_eq!(again.public(), first.public());
+
+    let existing = Identity::open(root.path(), "Vega").expect("vega").public();
+    let err = Identity::import(root.path(), "Vega", &seed, None).unwrap_err();
+    assert!(
+        matches!(err, ClientError::Usage(ref m) if m.contains("nothing was changed")),
+        "{err}"
+    );
+    assert_eq!(
+        Identity::open(root.path(), "Vega").unwrap().public(),
+        existing
+    );
+}
+
+/// The command line: `key import` needs `--seed-file`, and `--public-key`
+/// must be a valid key.
+#[test]
+fn test_key_import_command_line() {
+    use mentischat::client::cli::{parse, Command};
+    let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+    assert_eq!(
+        parse(&args(&[
+            "key",
+            "import",
+            "--agent",
+            "Instinct",
+            "--seed-file",
+            "/k",
+            "--public-key",
+            RFC8032_PUBLIC
+        ])),
+        Ok(Command::KeyImport {
+            agent: "Instinct".into(),
+            seed_file: "/k".into(),
+            expected: Some(RFC8032_PUBLIC.parse().unwrap()),
+        })
+    );
+    assert!(parse(&args(&["key", "import", "--agent", "Instinct"])).is_err());
+    assert!(parse(&args(&[
+        "key",
+        "import",
+        "--agent",
+        "Instinct",
+        "--seed-file",
+        "/k",
+        "--public-key",
+        "beef"
+    ]))
+    .is_err());
+}

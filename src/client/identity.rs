@@ -87,6 +87,82 @@ impl Identity {
         })
     }
 
+    /// Adopt an existing Ed25519 key as `agent`'s identity under `client_dir`,
+    /// so the agent is the same key in MentisChat as it already is elsewhere.
+    ///
+    /// `seed_file` is a seed file in the format MentisDB's `mentisdb key
+    /// generate` writes and `--private-key-file` reads, which is also this
+    /// client's own `identity.key` format: the 32-byte seed as 64 hex digits
+    /// and a newline. Both derive the key the RFC 8032 way, so the imported
+    /// identity has exactly the public key MentisDB registered for that seed.
+    ///
+    /// The seed is copied into `<client_dir>/<agent>/identity.key` (`0600`, in
+    /// a `0700` directory, written atomically) and is never printed or
+    /// returned; only the public key is.
+    ///
+    /// When `expected` is given, the import is refused unless the seed's
+    /// public key is exactly that key. Pass the public key the agent has
+    /// registered in MentisDB, so a wrong file cannot be adopted by mistake.
+    ///
+    /// Importing the key the agent already has is a no-op. Importing a
+    /// *different* key over an existing identity is refused: the identity's
+    /// rooms and its name binding on the daemon belong to the old key, and
+    /// replacing it would strand them.
+    ///
+    /// # Errors
+    ///
+    /// - [`ClientError::Storage`] when `seed_file` cannot be read, is
+    ///   accessible to other users (`chmod 600` it), or does not hold 64 hex
+    ///   digits; or when the identity cannot be written.
+    /// - [`ClientError::Usage`] when the seed's public key is not `expected`,
+    ///   or `agent` already has a different key.
+    pub fn import(
+        client_dir: &Path,
+        agent: &str,
+        seed_file: &Path,
+        expected: Option<&PublicKey>,
+    ) -> Result<Self, ClientError> {
+        let storage = |e: String| ClientError::Storage(format!("{}: {e}", seed_file.display()));
+        let text = fs::read_to_string(seed_file).map_err(|e| storage(e.to_string()))?;
+        refuse_loose_permissions(seed_file)?;
+        let seed = hex_decode::<32>(text.trim()).map_err(|e| storage(e.to_string()))?;
+        let keys = Keypair::from_seed(seed);
+        if let Some(want) = expected {
+            if keys.public() != *want {
+                return Err(ClientError::Usage(format!(
+                    "{} holds the key {}, not the expected {}; nothing was imported",
+                    seed_file.display(),
+                    keys.public(),
+                    want
+                )));
+            }
+        }
+        let dir = client_dir.join(agent.to_ascii_lowercase());
+        let path = dir.join("identity.key");
+        if path.exists() {
+            let current = Self::open(client_dir, agent)?;
+            if current.public() == keys.public() {
+                return Ok(current);
+            }
+            return Err(ClientError::Usage(format!(
+                "{agent} already has the key {}; importing {} would strand its rooms and \
+                 name binding, so nothing was changed. Use another agent name, or move \
+                 {} away first if the old key is truly abandoned",
+                current.public(),
+                keys.public(),
+                dir.display()
+            )));
+        }
+        make_private_dir(&dir)?;
+        write_private(&path, format!("{}\n", hex_encode(&seed)).as_bytes())?;
+        Ok(Self {
+            agent: agent.to_string(),
+            keys,
+            seed,
+            dir,
+        })
+    }
+
     /// The agent name this identity acts as.
     pub fn agent(&self) -> &str {
         &self.agent

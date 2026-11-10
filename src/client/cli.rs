@@ -3,25 +3,37 @@
 //! ```text
 //! mentischat client run --agent NAME [--addr 127.0.0.1:9480]   stdio MCP proxy
 //! mentischat client key init|show --agent NAME                 the agent's public key
+//! mentischat client key import --agent NAME --seed-file PATH    adopt an existing key
 //! ```
 
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::{default_client_dir, proxy, Client, ClientError, Daemon, Identity, UpdatePolicy};
 use crate::names::AgentName;
+use crate::signed::PublicKey;
 
 /// Usage text for `mentischat client`.
 pub const USAGE: &str = "\
 Usage: mentischat client run --agent NAME [--addr HOST:PORT]
                              [--update-messages N] [--update-minutes M]
        mentischat client key init|show --agent NAME
+       mentischat client key import --agent NAME --seed-file PATH
+                                    [--public-key HEX]
 
 run   serve MCP over stdio for one agent, signing and encrypting for secure
       rooms; configure your harness with this as an MCP stdio server
 key   create (init) or print (show) the agent's Ed25519 identity. Prints the
       public key as hex and as the public_key_bytes array MentisDB expects,
       plus the operator command that registers it on a MentisDB chain
+key import
+      adopt an existing Ed25519 key as the agent's identity, so an agent that
+      already has a MentisDB identity is the same key here. PATH is a MentisDB
+      seed file (what `mentisdb key generate` writes and --private-key-file
+      reads: 64 hex digits). It must be 0600; the seed is copied, never printed.
+      --public-key refuses the import unless the seed is that key: pass the
+      key registered in MentisDB. An agent that already has a different key is
+      refused, never overwritten
 
 Keys live in MENTISCHAT_CLIENT_DIR (default ~/.cloudllm/mentischat/client),
 one 0600 file per agent. --addr defaults to the daemon's 127.0.0.1:9480.
@@ -53,6 +65,15 @@ pub enum Command {
         /// The agent name.
         agent: String,
     },
+    /// Adopt an existing seed file as the identity, then print its public key.
+    KeyImport {
+        /// The agent name.
+        agent: String,
+        /// The seed file to adopt (MentisDB's format: 64 hex digits).
+        seed_file: PathBuf,
+        /// Refuse unless the seed's public key is this one.
+        expected: Option<PublicKey>,
+    },
 }
 
 /// Why a command line is not a [`Command`].
@@ -72,7 +93,9 @@ impl std::error::Error for UsageError {}
 /// # Errors
 ///
 /// [`UsageError`] for an unknown subcommand or flag, a missing or invalid
-/// `--agent`, or an `--addr` that is not a loopback socket address.
+/// `--agent`, an `--addr` that is not a loopback socket address, a
+/// `--public-key` that is not a valid Ed25519 key, or `key import` without
+/// `--seed-file`.
 ///
 /// # Examples
 ///
@@ -98,6 +121,8 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
     let mut agent = None;
     let mut addr = crate::BIND_ADDR;
     let mut update = UpdatePolicy::default();
+    let mut seed_file = None;
+    let mut expected = None;
     let mut it = flags.into_iter();
     while let Some(flag) = it.next() {
         let value = it
@@ -122,6 +147,14 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
                     .map_err(|_| err("--update-minutes is not a whole number"))?;
                 update.interval = std::time::Duration::from_secs(minutes.saturating_mul(60));
             }
+            "--seed-file" => seed_file = Some(PathBuf::from(value)),
+            "--public-key" => {
+                expected = Some(
+                    value
+                        .parse::<PublicKey>()
+                        .map_err(|_| err("--public-key is not a 64-hex Ed25519 public key"))?,
+                );
+            }
             other => return Err(UsageError(format!("unknown flag {other}"))),
         }
     }
@@ -140,6 +173,11 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
         }),
         ["key", "init"] => Ok(Command::KeyInit { agent }),
         ["key", "show"] => Ok(Command::KeyShow { agent }),
+        ["key", "import"] => Ok(Command::KeyImport {
+            agent,
+            seed_file: seed_file.ok_or_else(|| err("key import needs --seed-file"))?,
+            expected,
+        }),
         _ => Err(err("unknown subcommand")),
     }
 }
@@ -224,6 +262,19 @@ async fn execute(command: Command) -> Result<(), ClientError> {
                 )));
             }
             print!("{}", describe_key(&Identity::open(&dir, &agent)?));
+            Ok(())
+        }
+        Command::KeyImport {
+            agent,
+            seed_file,
+            expected,
+        } => {
+            let identity = Identity::import(&dir, &agent, &seed_file, expected.as_ref())?;
+            print!("{}", describe_key(&identity));
+            println!(
+                "imported: this key is already a MentisDB identity; keep the key_id it is \
+                 registered under there (the register line is only for chains that lack it)"
+            );
             Ok(())
         }
         Command::Run {

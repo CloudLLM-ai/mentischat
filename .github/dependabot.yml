@@ -13,17 +13,10 @@ updates:
       minor-and-patch:
         update-types: [minor, patch]
     ignore:
-      # Pinned on purpose: cloudllm_mcp is `=0.4.0` (unstable API between minors)
-      # and the openmls 0.9 line needs Rust 1.91 while the MSRV is 1.88.
+      # Pinned on purpose: cloudllm_mcp is `=0.4.0` (unstable API between minors).
       - dependency-name: cloudllm_mcp
-      - dependency-name: openmls
-        update-types: [version-update:semver-minor]
-      - dependency-name: openmls_*
-        update-types: [version-update:semver-minor]
-      # Held at the newest releases that support Rust 1.88: uuid 1.27 needs
-      # 1.89 and parking_lot 0.13 needs 1.95.
-      - dependency-name: uuid
-        versions: [">=1.27.0"]
+      # Held at the newest release that supports the MSRV (Rust 1.91):
+      # parking_lot 0.13 needs 1.95.
       - dependency-name: parking_lot
         versions: [">=0.13.0"]
       # The test WebSocket client follows the tokio-tungstenite that axum uses

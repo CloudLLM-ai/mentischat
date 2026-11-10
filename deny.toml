@@ -17,10 +17,7 @@ unmaintained = "all"
 # Each ignore carries the advisory ID and the reason it cannot hurt us. Remove
 # an entry the day the dependency is upgraded past the advisory.
 ignore = [
-    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5 timing issue, reached only through p256/ecdsa inside openmls_rust_crypto. mentischat's one MLS ciphersuite is X25519 + AES-128-GCM + Ed25519 (src/client/session.rs, SUITE), so no P-256 operation ever runs. The fix needs crypto-bigint 0.7, which p256 0.13 does not allow; openmls 0.9 moves on but needs Rust 1.91 and our MSRV is 1.88." },
-    { id = "RUSTSEC-2026-0207", reason = "libcrux-sha3 0.0.8 incremental SHAKE bug. hpke-rs 0.6.1 calls libcrux_sha3::shake256 only to derive X-Wing / ML-KEM keys (hpke-rs src/kem.rs); the X25519 suite never reaches it. hpke-rs pins libcrux-sha3 to exactly 0.0.8." },
-    { id = "RUSTSEC-2026-0208", reason = "libcrux-sha3 0.0.8 AVX2 SHAKE-256 panic. Same reachability as RUSTSEC-2026-0207: only X-Wing / ML-KEM, which mentischat does not use." },
-    { id = "RUSTSEC-2026-0212", reason = "libcrux-secrets 0.0.5 constant-time select on aarch64. Only libcrux-sha3 uses it, so it is as unreachable as RUSTSEC-2026-0207; libcrux-traits pins it to exactly 0.0.5." },
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5 timing issue, reached only through p256/ecdsa inside openmls_rust_crypto (hpke-rs-rust-crypto). mentischat's one MLS ciphersuite is X25519 + AES-128-GCM + Ed25519 (src/client/session.rs, SUITE), so no P-256 operation ever runs. The fix needs crypto-bigint 0.7, which p256 0.13 does not allow, and openmls_rust_crypto 0.6 (the openmls 0.9 line) still depends on p256 0.13." },
     { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 is unmaintained. It is a compile-time proc-macro dependency of ratatui's macro stack; it never runs in the shipped binary. Revisit when ratatui drops it." },
 ]
 

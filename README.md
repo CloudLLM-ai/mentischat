@@ -833,9 +833,9 @@ launchd retries every 30 seconds until the port is free.
 | `src/client/` | The key-holding client (feature `e2e`): `identity.rs` (key file, `0600`), `http.rs`, `session.rs` (MLS groups on OpenMLS), `proxy.rs` (stdio MCP), `cli.rs` |
 | `src/errors.rs`, `src/names.rs` | Typed mailbox errors; agent-name validation and the suggested names |
 | `src/tui/` | The terminal view: `mod.rs` (dashboard), `banner.rs`, `log_buffer.rs`, `terminal.rs` |
-| `tests/` | `bus`, `names`, `history`, `retention`, `rooms`, `signed`, `signed_http`, `signed_ds`, `e2e`, `e2e_proxy`, `budget`, `scale`, `pull_limit`, `stream`, `ws`, `http`, `mcp`, `engine`, `snapshot`, `snapshot_fuzz`, `tui`; shared helpers in `common/` |
+| `tests/` | `bus`, `names`, `history`, `retention`, `rooms`, `signed`, `signed_http`, `signed_ds`, `e2e`, `e2e_proxy`, `budget`, `scale`, `pull_limit`, `stream`, `ws`, `http`, `mcp`, `engine`, `snapshot`, `snapshot_fuzz`, `tui`, `ping_pong`; shared helpers in `common/` |
 | `fuzz/` | cargo-fuzz targets and their corpora (nightly; see Fuzzing) |
-| `benches/`, `examples/` | Criterion benches (`bus`, `rest`, `engine`, `signed`) and the HTTP load generator `http_load` |
+| `benches/`, `examples/` | Criterion benches (`bus`, `rest`, `engine`, `signed`) the HTTP load generator `http_load`, and `ping_pong` (two agents taking turns) |
 | `launchd/`, `skills/` | Optional launchd service; engineering-style notes |
 | `changelog.txt` | Release notes |
 
@@ -943,6 +943,27 @@ of hyper, syscalls and (in the load generator) the client, against about 2
 for the handler. To move many messages, send them with `POST /messages/batch`
 (up to 256 per request) and drain with `check_inbox` / `GET /inboxes/{agent}`
 and a `limit` (up to 256 per page).
+
+### Ping-pong: two agents taking turns
+
+`make ping-pong` runs two agent processes, each with its own hand-written client
+(`examples/ping_pong/agent.rs`), counting `1`, `2`, `3`, ... to 100 through a
+throwaway daemon, each number answering the last. It measures a conversation,
+not throughput: every hop waits for the one before it.
+
+| Mode | How a player hears the next number | M4 Max (macOS) | Linux server (16 vCPU) |
+|---|---|---|---|
+| `ws` | pushed on its `/ws` stream; sends as `send` frames | 100 numbers in 14 ms, hop p50 0.13 ms | 7.9 ms, hop p50 0.066 ms |
+| `poll` | `check_inbox` with `wait_ms` (a parked pull); sends by REST | 10 ms, hop p50 0.10 ms | 6.8 ms, hop p50 0.065 ms |
+| `notify` | a `/notify` wake-up, then `check_inbox`; sends by REST | 147 s, hop p50 208 ms, max 2.8 s | 147 s, hop p50 204 ms, max 2.8 s |
+
+`notify` is paced on purpose: a wake-up frame comes 200 ms after mail stops
+arriving and never within 3 s of the previous one on that socket, so a harness
+agent is not woken once per message. Two agents that only listen through it
+therefore manage about two turns per 3 s; for a fast exchange, listen on `/ws`
+or park a `check_inbox`. `tests/ping_pong.rs` runs the same players on every
+test run: `ws` and `poll` to 100 must finish in under a second, and `notify`
+must keep its pacing.
 
 To reproduce the HTTP and WebSocket numbers:
 

@@ -20,8 +20,9 @@ member.
 
 Key behaviors:
 
-- **Names you pick** — an agent registers as `Vega`, `Orion` or any other
-  valid name; stars, constellations and moons are suggested. Names are unique
+- **Names you pick** — an agent registers as `Red`, `Blue` or any other
+  valid name; colours are suggested, common ones first, and stars once the
+  colours are taken. Names are unique
   without regard to case (`Vega` and `vega` are one agent) and keep the
   spelling they were registered with.
 - **Pulled once, kept as read** — `check_inbox` returns unread mail and marks
@@ -140,10 +141,13 @@ Five more tools handle [rooms](#rooms): `create_room`, `join_room`, `invite`,
 
 Register with `agent`, the name you want: 1–63 characters, `[a-zA-Z0-9]` then
 `[a-zA-Z0-9._-]`. If the user gave the agent a name it uses that; otherwise it
-picks one, and stars, constellations and moons suit the mailbox (`Vega`,
-`Orion`, `Lyra`, `Castor`). `list_agents` returns five free ones from that
-list in `suggestions`, starting at a random point so agents connecting
-together do not all try the same name. Any valid name is accepted except a
+picks a colour. `list_agents` returns five free names in `suggestions`, in
+tiers from common to rare: everyday colours (`Red`, `Blue`, `Green`), then
+familiar ones (`Teal`, `Navy`, `Coral`), then rare shades (`Ochre`, `Sienna`),
+then stars, constellations and moons (`Vega`, `Orion`). A tier is reached only
+when the ones before it have fewer than five free names, and each is read
+from a random point so agents connecting together do not all try the same
+name. Any valid name is accepted except a
 numbered one, which ends in `.`, `_` or `-` followed only by digits (`Vega_2`,
 `vega-2`, `vega.10`): a new registration of such a name fails
 `numbered_name` with five free `suggestions`, so an agent whose name is taken

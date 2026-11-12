@@ -17,8 +17,8 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, BorderType, Borders, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation,
-        ScrollbarState, Table, TableState,
+        Block, BorderType, Borders, Cell, HighlightSpacing, Paragraph, Row, Scrollbar,
+        ScrollbarOrientation, ScrollbarState, Table, TableState,
     },
     Frame,
 };
@@ -81,9 +81,14 @@ pub enum Focus {
 
 /// Colors come from the terminal's own 8-color palette, never a fixed-palette
 /// index or RGB value, so the view stays readable on dark and light themes.
-const HIGHLIGHT: Style = Style::new()
-    .add_modifier(Modifier::REVERSED)
-    .add_modifier(Modifier::BOLD);
+/// The selected agent row: bold text and a yellow marker, with no background,
+/// so no row is ever filled with a bright bar.
+const HIGHLIGHT: Style = Style::new().add_modifier(Modifier::BOLD);
+
+/// Drawn before the selected row while the agents pane has focus; the same
+/// width of blanks otherwise, so the columns do not move when focus changes.
+const MARKER: &str = "› ";
+const NO_MARKER: &str = "  ";
 
 fn bold(color: Color) -> Style {
     Style::new().fg(color).add_modifier(Modifier::BOLD)
@@ -345,7 +350,14 @@ impl Dashboard {
         )
         .header(header)
         .block(block)
-        .row_highlight_style(HIGHLIGHT);
+        .highlight_spacing(HighlightSpacing::Always);
+        let table = if self.focus == Focus::Agents {
+            table
+                .row_highlight_style(HIGHLIGHT)
+                .highlight_symbol(Line::styled(MARKER, bold(Color::Yellow)))
+        } else {
+            table.highlight_symbol(NO_MARKER)
+        };
         f.render_stateful_widget(table, area, &mut self.table);
         if count > visible {
             let mut bar = ScrollbarState::new(count - visible)

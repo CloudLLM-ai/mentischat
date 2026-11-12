@@ -171,59 +171,19 @@ pub const NATO_NAMES: [&str; 26] = [
     "Uniform", "Victor", "Whiskey", "Xray", "Yankee", "Zulu",
 ];
 
-/// Names offered once too few NATO names are free: stars, constellations and
-/// moons.
-pub const STAR_NAMES: [&str; 42] = [
-    "Alcyone",
-    "Aldebaran",
-    "Altair",
-    "Andromeda",
-    "Antares",
-    "Aquila",
-    "Arcturus",
-    "Callisto",
-    "Canopus",
-    "Capella",
-    "Carina",
-    "Cassiopeia",
-    "Castor",
-    "Charon",
-    "Corvus",
-    "Cygnus",
-    "Deneb",
-    "Draco",
-    "Electra",
-    "Europa",
-    "Ganymede",
-    "Hydra",
-    "Io",
-    "Lyra",
-    "Maia",
-    "Mira",
-    "Miranda",
-    "Oberon",
-    "Orion",
-    "Pegasus",
-    "Perseus",
-    "Phoenix",
-    "Polaris",
-    "Pollux",
-    "Regulus",
-    "Rigel",
-    "Sirius",
-    "Spica",
-    "Titan",
-    "Triton",
-    "Vega",
-    "Vela",
+/// Names offered once too few NATO names are free: the Greek alphabet, in
+/// order, without Delta, which is already a NATO name.
+pub const GREEK_NAMES: [&str; 23] = [
+    "Alpha", "Beta", "Gamma", "Epsilon", "Zeta", "Eta", "Theta", "Iota", "Kappa", "Lambda", "Mu",
+    "Nu", "Xi", "Omicron", "Pi", "Rho", "Sigma", "Tau", "Upsilon", "Phi", "Chi", "Psi", "Omega",
 ];
 
 /// How many free names `list_agents` and `name_taken` offer.
 pub const SUGGESTION_COUNT: usize = 5;
 
 /// The suggestion lists in the order they are offered: NATO names, then
-/// stars.
-pub const SUGGESTION_TIERS: [&[&str]; 2] = [&NATO_NAMES, &STAR_NAMES];
+/// Greek letters.
+pub const SUGGESTION_TIERS: [&[&str]; 2] = [&NATO_NAMES, &GREEK_NAMES];
 
 /// Up to [`SUGGESTION_COUNT`] free names for which `is_taken` is false, taken
 /// from [`SUGGESTION_TIERS`] in order: a tier is reached only when the tiers
@@ -233,13 +193,13 @@ pub const SUGGESTION_TIERS: [&[&str]; 2] = [&NATO_NAMES, &STAR_NAMES];
 /// # Examples
 ///
 /// ```
-/// use mentischat::names::{suggestions, NATO_NAMES, STAR_NAMES};
+/// use mentischat::names::{suggestions, GREEK_NAMES, NATO_NAMES};
 ///
 /// let fresh = suggestions(|_| false);
 /// assert!(fresh.iter().all(|n| NATO_NAMES.contains(&n.as_str())));
 ///
 /// let nato_gone = suggestions(|n| NATO_NAMES.contains(&n));
-/// assert!(nato_gone.iter().all(|n| STAR_NAMES.contains(&n.as_str())));
+/// assert!(nato_gone.iter().all(|n| GREEK_NAMES.contains(&n.as_str())));
 /// ```
 pub fn suggestions(is_taken: impl Fn(&str) -> bool) -> Vec<String> {
     SUGGESTION_TIERS

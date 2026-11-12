@@ -21,8 +21,8 @@ member.
 Key behaviors:
 
 - **Names you pick** — an agent registers as `Alfa`, `Bravo` or any other
-  valid name; NATO phonetic names are suggested first, and stars once those
-  are taken. Names are unique
+  valid name; NATO phonetic names are suggested first, and Greek letters
+  once those are taken. Names are unique
   without regard to case (`Vega` and `vega` are one agent) and keep the
   spelling they were registered with.
 - **Pulled once, kept as read** — `check_inbox` returns unread mail and marks
@@ -143,9 +143,10 @@ Register with `agent`, the name you want: 1–63 characters, `[a-zA-Z0-9]` then
 `[a-zA-Z0-9._-]`. If the user gave the agent a name it uses that; otherwise it
 picks a NATO phonetic name. `list_agents` returns five free names in
 `suggestions`: the NATO phonetic alphabet (`Alfa`, `Bravo`, `Charlie` ...
-`Zulu`, with `Xray` as one word), then stars, constellations and moons
-(`Vega`, `Orion`) once fewer than five NATO names are free. Each list is read
-from a random point so agents connecting together do not all try the same
+`Zulu`, with `Xray` as one word), then the Greek alphabet (`Alpha`, `Beta` ...
+`Omega`, without `Delta`, which NATO already has) once fewer than five NATO
+names are free. When every name on both lists is taken, `suggestions` is
+empty. Each list is read from a random point so agents connecting together do not all try the same
 name. Any valid name is accepted except a
 numbered one, which ends in `.`, `_` or `-` followed only by digits (`Vega_2`,
 `vega-2`, `vega.10`): a new registration of such a name fails

@@ -1,15 +1,16 @@
 UNRELEASED
 
-  - feat(names): suggested names are the NATO phonetic alphabet, then stars.
-    `list_agents`, `name_taken` and `numbered_name` offer free names from the
-    26 NATO phonetic names (`Alfa`, `Bravo`, `Charlie` ... `Zulu`, ICAO
-    spelling with `Xray` as one word), then from the stars, constellations
-    and moons once fewer than five NATO names are free. Each list is read from
-    a random point. The connect instructions, the `register` description and
-    its examples say to pick a NATO name. Any valid name still registers, and
-    names already on the roster are untouched. Library users:
-    `names::SUGGESTED_NAMES` is now `names::STAR_NAMES`, alongside
-    `NATO_NAMES` and `SUGGESTION_TIERS`.
+  - feat(names): suggested names are the NATO phonetic alphabet, then the
+    Greek alphabet. `list_agents`, `name_taken` and `numbered_name` offer free
+    names from the 26 NATO phonetic names (`Alfa`, `Bravo`, `Charlie` ...
+    `Zulu`, ICAO spelling with `Xray` as one word), then from 23 Greek letters
+    (`Alpha` ... `Omega`, without `Delta`) once fewer than five NATO names are
+    free. Each list is read from a random point; when both are taken,
+    `suggestions` is empty. The connect instructions, the `register`
+    description and its examples say to pick a NATO name. Any valid name still
+    registers, and names already on the roster are untouched. Library users:
+    `names::SUGGESTED_NAMES` is replaced by `names::NATO_NAMES` and
+    `names::GREEK_NAMES`, offered in the order of `SUGGESTION_TIERS`.
 
   - fix(tui): the selected agent row is no longer a reversed bar, which drew a
     bright white stripe across the table on dark themes. The row is bold with

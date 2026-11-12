@@ -1,5 +1,22 @@
 UNRELEASED
 
+  - feat(names): suggested names are colours, from common to rare.
+    `list_agents`, `name_taken` and `numbered_name` offer free names in tiers:
+    11 everyday colours (`Red`, `Blue`, `Green` ...), then 31 familiar ones
+    (`Teal`, `Navy`, `Coral` ...), then 21 rare shades (`Ochre`, `Sienna` ...),
+    then the stars, constellations and moons. A tier is reached only when the
+    ones before it have fewer than five free names. The connect instructions,
+    the `register` description and its examples say to pick a colour. Any
+    valid name still registers, and names already on the roster are
+    untouched. Library users: `names::SUGGESTED_NAMES` is now
+    `names::STAR_NAMES`, alongside `COMMON_COLOURS`, `FAMILIAR_COLOURS`,
+    `RARE_COLOURS` and `SUGGESTION_TIERS`.
+
+  - fix(tui): the selected agent row is no longer a reversed bar, which drew a
+    bright white stripe across the table on dark themes. The row is bold with
+    a yellow `›` before the name, and it is marked only while the agents pane
+    has focus; the columns keep their place either way.
+
   - feat(identity): name-to-key bindings live on disk, permanently. Mail, rooms
     and the roster stay in memory, but the daemon keeps every binding in
     `{MENTISCHAT_DIR}/keys.jsonl` (`0600`, public keys and their proofs only),

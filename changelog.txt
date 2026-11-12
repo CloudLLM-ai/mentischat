@@ -1,5 +1,17 @@
 UNRELEASED
 
+  - feat(observe): the log pane follows conversations. In the live view every
+    message sent logs `sent Alpha → Beta (id 42, 312 B)` (or `→ #room`), and
+    every message read, by `check_inbox` or a stream `ack`, logs
+    `read Beta ← Alpha (id 42)`, over MCP, REST and WebSocket alike. Writing
+    the lines changes nothing: no mail is marked read, no room cursor moves
+    and `lastSeen` is untouched. With `MENTISCHAT_OBSERVE=1` the live view
+    also shows the first line of each body, cut to 100 characters, and plain
+    logs (launchd, a pipe, `MENTISCHAT_PLAIN=1`) carry the lines without
+    bodies; otherwise plain logs carry none. Signed room messages are never
+    previewed. Library users: `Bus::with_traffic_log` with `TrafficLog::Off`
+    (the default), `Metadata` or `WithPreviews`.
+
   - feat(names): suggested names are the 24 letters of the Greek alphabet
     (`Alpha`, `Beta`, `Gamma` ... `Omega`). `list_agents`, `name_taken` and
     `numbered_name` offer up to five free ones, read from a random point; when

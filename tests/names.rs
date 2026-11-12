@@ -12,10 +12,7 @@ use common::{
 };
 use mentischat::bus::{rfc3339, Bus, Registration, Retention};
 use mentischat::errors::{MailboxError, TakenReason};
-use mentischat::names::{
-    AgentName, COMMON_COLOURS, FAMILIAR_COLOURS, RARE_COLOURS, STAR_NAMES, SUGGESTION_COUNT,
-    SUGGESTION_TIERS,
-};
+use mentischat::names::{AgentName, NATO_NAMES, STAR_NAMES, SUGGESTION_COUNT, SUGGESTION_TIERS};
 
 fn folded(names: &[String]) -> HashSet<String> {
     names.iter().map(|n| n.to_ascii_lowercase()).collect()
@@ -57,13 +54,8 @@ fn suggested_names_are_valid_and_distinct_ignoring_case() {
     assert_eq!(distinct.len(), all.len());
     assert_eq!(
         SUGGESTION_TIERS,
-        [
-            &COMMON_COLOURS[..],
-            &FAMILIAR_COLOURS[..],
-            &RARE_COLOURS[..],
-            &STAR_NAMES[..]
-        ],
-        "common colours, then familiar, then rare, then stars"
+        [&NATO_NAMES[..], &STAR_NAMES[..]],
+        "NATO names, then stars"
     );
 }
 
@@ -146,18 +138,16 @@ async fn concurrent_registrations_of_one_name_have_one_winner() {
 }
 
 #[tokio::test]
-/// An empty roster is offered common colours only, distinct, from different
+/// An empty roster is offered NATO names only, distinct, from different
 /// starting points.
-async fn list_agents_offers_distinct_free_common_colours() {
+async fn list_agents_offers_distinct_free_nato_names() {
     let (_d, bus) = fresh_bus("suggest");
     let mut first = HashSet::new();
     for _ in 0..20 {
         let suggestions = bus.list_agents().await.unwrap().suggestions;
         assert_eq!(suggestions.len(), SUGGESTION_COUNT);
         assert_eq!(folded(&suggestions).len(), SUGGESTION_COUNT, "distinct");
-        assert!(suggestions
-            .iter()
-            .all(|s| COMMON_COLOURS.contains(&s.as_str())));
+        assert!(suggestions.iter().all(|s| NATO_NAMES.contains(&s.as_str())));
         first.insert(suggestions[0].clone());
     }
     assert!(
@@ -170,7 +160,7 @@ async fn list_agents_offers_distinct_free_common_colours() {
 /// suggestions: the free names of an earlier tier always lead, and the next
 /// tier fills only the places left.
 #[tokio::test]
-async fn suggestions_move_from_common_to_rare_colours_then_stars() {
+async fn suggestions_move_from_nato_names_to_stars() {
     let (_d, bus) = fresh_bus("suggest_tiers");
     for (i, tier) in SUGGESTION_TIERS
         .iter()
@@ -205,11 +195,7 @@ async fn suggestions_move_from_common_to_rare_colours_then_stars() {
 #[tokio::test]
 async fn suggestions_skip_registered_and_held_names() {
     let (_d, bus) = fresh_bus("suggest_free");
-    let colours = COMMON_COLOURS
-        .iter()
-        .chain(&FAMILIAR_COLOURS)
-        .chain(&RARE_COLOURS);
-    for n in colours.chain(&STAR_NAMES[3..]) {
+    for n in NATO_NAMES.iter().chain(&STAR_NAMES[3..]) {
         // A lowercased registration still takes the suggested spelling.
         bus.register(&name(&n.to_ascii_lowercase())).await.unwrap();
     }

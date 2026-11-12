@@ -4,7 +4,9 @@
 //! The daemon shows this only when started from a terminal; under launchd, a
 //! pipe, or with `MENTISCHAT_PLAIN=1` it logs plain lines instead. It reads
 //! the mailbox through [`crate::bus::Bus::overview`] and never writes to it.
-//! Log lines carry names, ids and byte counts, never message bodies.
+//! Log lines carry names, ids and byte counts, including a line for each
+//! message sent and read; the start of each unsigned body appears only when
+//! the daemon runs with `MENTISCHAT_OBSERVE=1`.
 //!
 //! Colors come from the terminal's own palette so the view reads on dark and
 //! light backgrounds.

@@ -25,8 +25,8 @@ Usage: mentischat
 
 Serves MCP at /mcp and REST on 127.0.0.1:9480. Started from a terminal it paints
 a live view; set MENTISCHAT_PLAIN=1, or run it without a terminal, for plain logs.
-The live view logs every message sent and read by name, id and size, and with
-MENTISCHAT_OBSERVE=1 also the start of each message. Plain logs carry these
+The live view logs every message sent and read with the start of each message;
+MENTISCHAT_OBSERVE=0 keeps it to names, ids and sizes. Plain logs carry these
 lines, without message text, only with MENTISCHAT_OBSERVE=1.
 MENTISCHAT_DIR overrides the data directory (default ~/.cloudllm/mentischat).
 
@@ -90,18 +90,29 @@ fn wants_terminal_view() -> bool {
         && std::io::stdout().is_terminal()
 }
 
-/// The live view always shows traffic, and previews with
-/// `MENTISCHAT_OBSERVE=1`. Plain logs end up in files (launchd, a pipe), which
-/// a line per message would grow without bound and where a body would outlive
-/// the mailbox: they carry traffic only with `MENTISCHAT_OBSERVE=1`, and never
-/// previews.
-fn traffic_log(use_view: bool) -> TrafficLog {
-    let observe = std::env::var("MENTISCHAT_OBSERVE").as_deref() == Ok("1");
-    match (use_view, observe) {
-        (true, true) => TrafficLog::WithPreviews,
-        (true, false) | (false, true) => TrafficLog::Metadata,
-        (false, false) => TrafficLog::Off,
-    }
+/// What the log shows of traffic, from `MENTISCHAT_OBSERVE` (`0`, `1` or
+/// unset). The live view shows traffic with previews unless it is `0`, which
+/// keeps it to names, ids and sizes. Plain logs end up in files (launchd, a
+/// pipe), which a line per message would grow without bound and where a body
+/// would outlive the mailbox: they carry traffic only when it is `1`, and
+/// never previews.
+fn traffic_log(use_view: bool, observe: Option<&str>) -> Result<TrafficLog, String> {
+    let observe = match observe {
+        None => None,
+        Some("0") => Some(false),
+        Some("1") => Some(true),
+        Some(other) => {
+            return Err(format!(
+                "MENTISCHAT_OBSERVE must be 0 or 1, not {:?}",
+                other.chars().take(32).collect::<String>()
+            ))
+        }
+    };
+    Ok(match (use_view, observe) {
+        (true, None | Some(true)) => TrafficLog::WithPreviews,
+        (true, Some(false)) | (false, Some(true)) => TrafficLog::Metadata,
+        (false, None | Some(false)) => TrafficLog::Off,
+    })
 }
 
 async fn run_daemon() -> ExitCode {
@@ -121,6 +132,15 @@ async fn run_daemon() -> ExitCode {
             .compact()
             .init();
     }
+
+    let observe = std::env::var("MENTISCHAT_OBSERVE").ok();
+    let traffic = match traffic_log(use_view, observe.as_deref()) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("mentischat: {e}");
+            return ExitCode::from(2);
+        }
+    };
 
     let retention = match Retention::from_settings(|var| std::env::var(var).ok()) {
         Ok(r) => r,
@@ -180,7 +200,7 @@ async fn run_daemon() -> ExitCode {
         other => other,
     };
     let bus = match opened {
-        Ok(bus) => bus.with_traffic_log(traffic_log(use_view)),
+        Ok(bus) => bus.with_traffic_log(traffic),
         Err(e) => {
             eprintln!("mentischat: failed to open {}: {e}", data_dir.display());
             return ExitCode::FAILURE;

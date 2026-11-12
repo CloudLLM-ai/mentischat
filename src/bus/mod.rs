@@ -51,6 +51,7 @@ mod signed_persist;
 mod snapshot;
 mod state;
 mod stream;
+mod traffic;
 
 pub use clock::{now_rfc3339, rfc3339};
 pub use keyring::{KeyRegistryLoad, KEY_REGISTRY_FILE};
@@ -79,6 +80,7 @@ pub use signed::{
 pub use signed_persist::{verify_signed_record, RecordSummary};
 pub use snapshot::{remove_snapshot, SnapshotError};
 pub use stream::{Push, StreamSession};
+pub use traffic::{TrafficLog, PREVIEW_CHARS};
 
 use clock::{rfc3339_ms, unix_ms, Clock};
 use delivery::{history_page, history_rows};
@@ -144,6 +146,8 @@ pub struct Bus {
     /// Where the engine reads the time; the system clock unless
     /// [`with_clock`](Self::with_clock) replaced it.
     clock: Clock,
+    /// Whether messages sent and read are logged, and with how much of a body.
+    traffic: TrafficLog,
 }
 
 impl Bus {
@@ -178,6 +182,7 @@ impl Bus {
             retention,
             data_dir: data_dir.to_path_buf(),
             clock: Clock::System,
+            traffic: TrafficLog::default(),
         })
     }
 
@@ -243,6 +248,20 @@ impl Bus {
     /// ```
     pub fn with_clock(mut self, now_ms: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
         self.clock = Clock::Custom(Arc::new(now_ms));
+        self
+    }
+
+    /// Log traffic: [`TrafficLog::Off`] unless changed here.
+    ///
+    /// With [`TrafficLog::Metadata`] every send writes an `info` line naming
+    /// the sender, the recipient or room, the message id and the body's size,
+    /// and every read (a `check_inbox` that takes a message, or a stream
+    /// acknowledgement) writes one naming the reader. Writing them changes
+    /// nothing in the mailbox. [`TrafficLog::WithPreviews`] adds the start of
+    /// each unsigned body to its sent line, so give it only to a log the
+    /// operator alone sees.
+    pub fn with_traffic_log(mut self, traffic: TrafficLog) -> Self {
+        self.traffic = traffic;
         self
     }
 
@@ -579,6 +598,7 @@ impl Bus {
             body_json_len,
             self.now_ms(),
         )?;
+        self.traffic.sent(&msg, traffic::Body::Plain);
         Ok(SendReceipt::new(&msg, Reach::Direct(heard)))
     }
 
@@ -655,8 +675,8 @@ impl Bus {
         ))
     }
 
-    /// Stamp `agent` as seen and take its next batch, if any;
-    /// `unregistered` when it left in the meantime.
+    /// Stamp `agent` as seen and take its next batch, if any, logging each
+    /// message taken as read; `unregistered` when it left in the meantime.
     fn take(
         &self,
         state: &State,
@@ -667,11 +687,14 @@ impl Bus {
         match state.pull(agent, self.now_ms(), page) {
             Pulled::Gone => Err(state.unregistered(name.as_str())),
             Pulled::Nothing => Ok(None),
-            Pulled::Batch(batch) => Ok(Some(Taken {
-                agent: agent.name.clone(),
-                messages: batch.messages,
-                remaining: batch.remaining,
-                skipped: batch.skipped,
+            Pulled::Batch(batch) => Ok(Some({
+                self.traffic.read(&agent.name, &batch.messages);
+                Taken {
+                    agent: agent.name.clone(),
+                    messages: batch.messages,
+                    remaining: batch.remaining,
+                    skipped: batch.skipped,
+                }
             })),
         }
     }
@@ -863,6 +886,7 @@ impl Bus {
             self.now_ms(),
             signed::SendGate::Unsigned,
         )?;
+        self.traffic.sent(&msg, traffic::Body::Plain);
         Ok(SendReceipt::new(&msg, Reach::Room(heard)))
     }
 

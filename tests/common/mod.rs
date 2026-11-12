@@ -9,9 +9,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use mentischat::bus::{Bus, KeyProof, Registration, Retention, Stats};
+use mentischat::bus::{Bus, KeyProof, Registration, Retention, Stats, TrafficLog};
 use mentischat::names::{AgentName, RoomName};
 use mentischat::signed::{deregister_payload, reclaim_payload, register_key_payload, Keypair};
+use mentischat::tui::LogBuffer;
 
 pub fn name(s: &str) -> AgentName {
     AgentName::parse(s).expect("valid test name")
@@ -38,6 +39,38 @@ pub fn bus_with(tag: &str, retention: Retention) -> (tempfile::TempDir, Arc<Bus>
     let dir = tempfile::tempdir().expect("tempdir");
     let bus = Bus::with_retention(&dir.path().join(tag), retention).expect("bus opens");
     (dir, Arc::new(bus))
+}
+
+/// A bus in a fresh temp directory whose traffic lines show `traffic`.
+pub fn traffic_bus(traffic: TrafficLog) -> (tempfile::TempDir, Arc<Bus>) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bus = Bus::new(&dir.path().join("traffic"))
+        .expect("bus opens")
+        .with_traffic_log(traffic);
+    (dir, Arc::new(bus))
+}
+
+/// Capture this thread's log output, formatted as the terminal view formats
+/// it, until the guard drops.
+pub fn capture_logs() -> (LogBuffer, tracing::subscriber::DefaultGuard) {
+    let logs = LogBuffer::new();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_target(false)
+        .without_time()
+        .compact()
+        .with_writer(logs.clone())
+        .finish();
+    (logs, tracing::subscriber::set_default(subscriber))
+}
+
+/// The traffic lines captured so far, without their time and level.
+pub fn traffic_lines(logs: &LogBuffer) -> Vec<String> {
+    logs.lines()
+        .iter()
+        .filter_map(|l| l.split_once(" INFO ").map(|(_, rest)| rest.to_string()))
+        .filter(|l| l.starts_with("sent ") || l.starts_with("read "))
+        .collect()
 }
 
 /// The default retention with agents dropped after `secs` idle.

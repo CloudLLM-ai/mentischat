@@ -526,6 +526,7 @@ impl Bus {
                         entry: entry.clone().map(Box::new),
                     },
                 )?;
+                self.traffic.sent(&msg, super::traffic::Body::Signed);
                 Ok(SignedOutcome::Sent(SendReceipt::new(
                     &msg,
                     Reach::Room(heard),

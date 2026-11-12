@@ -4,8 +4,11 @@
 
 mod common;
 
-use common::{bus_with, deregister_proof, fresh_bus, name, proven_reclaim, register, room};
-use mentischat::bus::{Bus, Retention, SignedOutcome, SignedRequest};
+use common::{
+    bus_with, capture_logs, deregister_proof, fresh_bus, name, proven_reclaim, register, room,
+    traffic_bus, traffic_lines,
+};
+use mentischat::bus::{Bus, Retention, SignedOutcome, SignedRequest, TrafficLog};
 use mentischat::errors::MailboxError;
 use mentischat::signed::{
     hex_decode, hex_encode, register_key_payload, Envelope, EnvelopeError, Keypair, OpKind,
@@ -400,6 +403,32 @@ async fn key_calls_for_an_unregistered_name_fail() {
 }
 
 // ---- signed rooms ----
+
+/// A signed room message is logged as signed, with no preview of its body
+/// even when previews are on, and its read is logged like any other.
+#[tokio::test]
+async fn signed_messages_are_logged_without_a_preview() {
+    let (logs, _guard) = capture_logs();
+    let (_d, bus) = traffic_bus(TrafficLog::WithPreviews);
+    let (alice, _bob) = alice_and_bob(&bus).await;
+    alice
+        .say(&bus, "ops", 3, "No reply needed: deploy done")
+        .await
+        .unwrap();
+    assert_eq!(pull_bodies(&bus, "bob").await.len(), 1);
+
+    let lines = traffic_lines(&logs);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines[0].starts_with("sent alice → #ops (id ") && lines[0].ends_with(", signed)"),
+        "{lines:?}"
+    );
+    assert!(
+        lines[1].starts_with("read bob ← alice in #ops (id "),
+        "{lines:?}"
+    );
+    assert!(logs.lines().iter().all(|l| !l.contains("deploy done")));
+}
 
 /// The whole lifecycle: create, invite, join, send; the other member reads an
 /// envelope that verifies against the key the daemon lists for the sender.

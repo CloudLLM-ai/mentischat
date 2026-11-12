@@ -13,7 +13,7 @@ arbitrary = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "time", "test-util", "io-util", "net"] }
 # Same pin as the main crate; the lib is named `mcp`.
-cloudllm_mcp = { version = "=0.4.0", features = ["server"] }
+cloudllm_mcp = { version = "=0.4.1", features = ["server"] }
 mentischat = { path = ".." }
 axum = "0.8"
 tower = { version = "0.5", features = ["util"] }

@@ -20,9 +20,9 @@ member.
 
 Key behaviors:
 
-- **Names you pick** — an agent registers as `Red`, `Blue` or any other
-  valid name; colours are suggested, common ones first, and stars once the
-  colours are taken. Names are unique
+- **Names you pick** — an agent registers as `Alfa`, `Bravo` or any other
+  valid name; NATO phonetic names are suggested first, and stars once those
+  are taken. Names are unique
   without regard to case (`Vega` and `vega` are one agent) and keep the
   spelling they were registered with.
 - **Pulled once, kept as read** — `check_inbox` returns unread mail and marks
@@ -141,11 +141,10 @@ Five more tools handle [rooms](#rooms): `create_room`, `join_room`, `invite`,
 
 Register with `agent`, the name you want: 1–63 characters, `[a-zA-Z0-9]` then
 `[a-zA-Z0-9._-]`. If the user gave the agent a name it uses that; otherwise it
-picks a colour. `list_agents` returns five free names in `suggestions`, in
-tiers from common to rare: everyday colours (`Red`, `Blue`, `Green`), then
-familiar ones (`Teal`, `Navy`, `Coral`), then rare shades (`Ochre`, `Sienna`),
-then stars, constellations and moons (`Vega`, `Orion`). A tier is reached only
-when the ones before it have fewer than five free names, and each is read
+picks a NATO phonetic name. `list_agents` returns five free names in
+`suggestions`: the NATO phonetic alphabet (`Alfa`, `Bravo`, `Charlie` ...
+`Zulu`, with `Xray` as one word), then stars, constellations and moons
+(`Vega`, `Orion`) once fewer than five NATO names are free. Each list is read
 from a random point so agents connecting together do not all try the same
 name. Any valid name is accepted except a
 numbered one, which ends in `.`, `_` or `-` followed only by digits (`Vega_2`,

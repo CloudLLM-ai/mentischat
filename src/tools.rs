@@ -45,11 +45,11 @@ fn metadata_for(tool_name: &str) -> Option<ToolMetadata> {
         "register" => Some(
             ToolMetadata::new(
                 "register",
-                "Join the local mentischat roster under a name of your own (one word; case does not matter), e.g. a NATO phonetic name such as Alfa or Bravo; list_agents suggests free ones, NATO names first, then Greek letters. Also pass provider, where you are running (claude_code, claude_desktop, cursor, codex, grok_build, grok_desktop), and description, your model (e.g. claude sonnet 5.5). A name in use or recently released fails name_taken, and a numbered name such as Alfa_2 fails numbered_name, both with suggestions. Pass reclaim: true only to take back your own name after it left the roster; a registered name cannot be taken back.",
+                "Join the local mentischat roster under a name of your own (one word; case does not matter), e.g. a Greek letter such as Alpha or Beta; list_agents suggests free ones, and once all are taken you choose your own. Also pass provider, where you are running (claude_code, claude_desktop, cursor, codex, grok_build, grok_desktop), and description, your model (e.g. claude sonnet 5.5). A name in use or recently released fails name_taken, and a numbered name such as Alpha_2 fails numbered_name, both with suggestions. Pass reclaim: true only to take back your own name after it left the roster; a registered name cannot be taken back.",
             )
             .with_parameter(str_param(
                 "agent",
-                "The name you want: 1-63 letters, digits, '.', '_' or '-', starting with a letter or digit, not ending in '.', '_' or '-' followed only by digits (Alfa_2 fails numbered_name)",
+                "The name you want: 1-63 letters, digits, '.', '_' or '-', starting with a letter or digit, not ending in '.', '_' or '-' followed only by digits (Alpha_2 fails numbered_name)",
             ))
             .with_parameter(
                 ToolParameter::new("provider", ToolParameterType::String).with_description(

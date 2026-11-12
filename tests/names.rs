@@ -12,7 +12,7 @@ use common::{
 };
 use mentischat::bus::{rfc3339, Bus, Registration, Retention};
 use mentischat::errors::{MailboxError, TakenReason};
-use mentischat::names::{AgentName, NATO_NAMES, STAR_NAMES, SUGGESTION_COUNT, SUGGESTION_TIERS};
+use mentischat::names::{AgentName, GREEK_NAMES, NATO_NAMES, SUGGESTION_COUNT, SUGGESTION_TIERS};
 
 fn folded(names: &[String]) -> HashSet<String> {
     names.iter().map(|n| n.to_ascii_lowercase()).collect()
@@ -54,8 +54,8 @@ fn suggested_names_are_valid_and_distinct_ignoring_case() {
     assert_eq!(distinct.len(), all.len());
     assert_eq!(
         SUGGESTION_TIERS,
-        [&NATO_NAMES[..], &STAR_NAMES[..]],
-        "NATO names, then stars"
+        [&NATO_NAMES[..], &GREEK_NAMES[..]],
+        "NATO names, then Greek letters"
     );
 }
 
@@ -160,7 +160,7 @@ async fn list_agents_offers_distinct_free_nato_names() {
 /// suggestions: the free names of an earlier tier always lead, and the next
 /// tier fills only the places left.
 #[tokio::test]
-async fn suggestions_move_from_nato_names_to_stars() {
+async fn suggestions_move_from_nato_names_to_greek_letters() {
     let (_d, bus) = fresh_bus("suggest_tiers");
     for (i, tier) in SUGGESTION_TIERS
         .iter()
@@ -195,25 +195,25 @@ async fn suggestions_move_from_nato_names_to_stars() {
 #[tokio::test]
 async fn suggestions_skip_registered_and_held_names() {
     let (_d, bus) = fresh_bus("suggest_free");
-    for n in NATO_NAMES.iter().chain(&STAR_NAMES[3..]) {
+    for n in NATO_NAMES.iter().chain(&GREEK_NAMES[3..]) {
         // A lowercased registration still takes the suggested spelling.
         bus.register(&name(&n.to_ascii_lowercase())).await.unwrap();
     }
-    bus.deregister(&name(STAR_NAMES[10])).await.unwrap(); // now held
+    bus.deregister(&name(GREEK_NAMES[10])).await.unwrap(); // now held
 
-    let free: HashSet<String> = STAR_NAMES[..3]
+    let free: HashSet<String> = GREEK_NAMES[..3]
         .iter()
         .map(|n| n.to_ascii_lowercase())
         .collect();
     let listed = bus.list_agents().await.unwrap().suggestions;
     assert_eq!(folded(&listed), free, "{listed:?}");
-    let err = bus.register(&name(STAR_NAMES[5])).await.unwrap_err();
+    let err = bus.register(&name(GREEK_NAMES[5])).await.unwrap_err();
     assert_eq!(
-        folded(&taken(err, &STAR_NAMES[5].to_ascii_lowercase(), false)),
+        folded(&taken(err, &GREEK_NAMES[5].to_ascii_lowercase(), false)),
         free
     );
 
-    for n in &STAR_NAMES[..3] {
+    for n in &GREEK_NAMES[..3] {
         bus.register(&name(n)).await.unwrap();
     }
     assert!(

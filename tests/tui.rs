@@ -418,18 +418,50 @@ fn panels_are_dark_gray_and_the_focused_one_is_bold_yellow() {
 }
 
 #[test]
-fn table_header_is_bold_yellow_and_the_selected_row_is_reversed() {
+fn table_header_is_bold_yellow() {
     let mut dash = sample();
     let buf = painted(&mut dash, 110, 36);
     let (x, y) = find(&buf, "NAME");
     assert_eq!(buf[(x, y)].fg, Color::Yellow);
     assert!(buf[(x, y)].modifier.contains(Modifier::BOLD));
+}
 
+/// The selected agent is marked with a yellow `›` and bold text, never a
+/// reversed or filled bar, and only while the agents pane has focus.
+#[test]
+fn the_selected_row_is_marked_without_a_bar_and_only_when_focused() {
+    let mut dash = sample();
+    let buf = painted(&mut dash, 110, 36);
     let (x, y) = find(&buf, "claude_code");
-    let selected = buf[(x, y)].modifier;
-    assert!(selected.contains(Modifier::REVERSED) && selected.contains(Modifier::BOLD));
-    let (x, y) = find(&buf, "grok_build");
-    assert!(!buf[(x, y)].modifier.contains(Modifier::REVERSED));
+    assert_eq!(
+        buf[(x - 2, y)].symbol(),
+        " ",
+        "no marker while the logs have focus"
+    );
+    assert!(!buf[(x, y)].modifier.contains(Modifier::BOLD));
+
+    dash.on_key(KeyCode::Tab, KeyModifiers::NONE);
+    let buf = painted(&mut dash, 110, 36);
+    let (sx, sy) = find(&buf, "claude_code");
+    assert_eq!(
+        (sx, sy),
+        (x, y),
+        "the columns do not move when focus changes"
+    );
+    assert_eq!(buf[(x - 2, y)].symbol(), "›");
+    assert_eq!(buf[(x - 2, y)].fg, Color::Yellow);
+    for col in x - 2..buf.area.width - 1 {
+        let cell = &buf[(col, y)];
+        assert!(
+            !cell.modifier.contains(Modifier::REVERSED),
+            "column {col} is reversed"
+        );
+        assert_eq!(cell.bg, Color::Reset, "column {col} has a background");
+    }
+    assert!(buf[(x, y)].modifier.contains(Modifier::BOLD));
+    let (gx, gy) = find(&buf, "grok_build");
+    assert_eq!(buf[(gx - 2, gy)].symbol(), " ");
+    assert!(!buf[(gx, gy)].modifier.contains(Modifier::BOLD));
 }
 
 #[test]

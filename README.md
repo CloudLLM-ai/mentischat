@@ -113,7 +113,8 @@ the tile counts the whole roster.
 It is painted like the MentisDB console: the terminal's own 8-color palette (so
 it reads on light and dark themes), a green **MENTIS** and cyan **CHAT** block
 banner, dark-gray rounded panels whose border turns bold yellow on the focused
-pane, a yellow table header with a reverse-video selected row, and ↑/↓
+pane, a yellow table header, the selected agent in bold behind a yellow `›`
+while the agents pane has focus, and ↑/↓
 scrollbars when a pane overflows. The key guide along the bottom is plain: white
 keys, gray descriptions, no bar behind them.
 

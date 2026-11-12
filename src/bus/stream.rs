@@ -146,11 +146,18 @@ impl State {
     }
 
     /// Acknowledge everything leased to the stream `epoch` with an id up to
-    /// `up_to`: direct mail becomes read now. Returns how many.
-    fn stream_ack(&self, agent: &Arc<Agent>, epoch: u64, up_to: u64, now: u64) -> usize {
+    /// `up_to`: direct mail becomes read now. Returns the messages
+    /// acknowledged.
+    fn stream_ack(
+        &self,
+        agent: &Arc<Agent>,
+        epoch: u64,
+        up_to: u64,
+        now: u64,
+    ) -> Vec<Arc<super::log::Msg>> {
         let mut st = agent.inner.lock();
         if st.removed || st.stream_epoch != epoch {
-            return 0;
+            return Vec::new();
         }
         st.last_seen_ms = now;
         let (acked, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut st.leased)
@@ -164,7 +171,7 @@ impl State {
             .map(|l| l.msg.clone())
             .collect();
         self.mark_read(agent, &mut st, &direct, now);
-        acked.len()
+        acked.into_iter().map(|l| l.msg).collect()
     }
 
     /// End every stream: take back all leases and invalidate the streams, so a
@@ -238,13 +245,16 @@ impl Bus {
 
     /// Acknowledge, cumulatively, every message pushed to `session` with an
     /// id up to `up_to`: direct mail is marked read now, and the window frees
-    /// for more. Returns how many messages that acknowledged.
+    /// for more. Each acknowledged message is logged as read. Returns how many
+    /// messages that acknowledged.
     ///
     /// # Errors
     ///
     /// `shutting_down`.
     pub fn stream_ack(&self, session: &StreamSession, up_to: u64) -> Result<usize, MailErr> {
         let state = self.open()?;
-        Ok(state.stream_ack(&session.agent, session.epoch, up_to, self.now_ms()))
+        let acked = state.stream_ack(&session.agent, session.epoch, up_to, self.now_ms());
+        self.traffic.read(&session.agent.name, &acked);
+        Ok(acked.len())
     }
 }

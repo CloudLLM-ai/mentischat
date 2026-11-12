@@ -24,6 +24,7 @@ pub fn command(data_dir: &Path) -> Command {
         "MENTISCHAT_READ_TTL",
         "MENTISCHAT_AGENT_TTL",
         "MENTISCHAT_NAME_HOLD",
+        "MENTISCHAT_OBSERVE",
     ] {
         cmd.env_remove(var);
     }

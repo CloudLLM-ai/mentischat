@@ -237,6 +237,15 @@ fn test_bad_configuration_exits_two() {
     let (code, stderr) = run_to_exit(cmd);
     assert_eq!(code, Some(2));
     assert!(stderr.contains("MENTISCHAT_LISTEN_PORT"), "{stderr}");
+
+    let mut cmd = command(dir.path());
+    cmd.env("MENTISCHAT_OBSERVE", "yes");
+    let (code, stderr) = run_to_exit(cmd);
+    assert_eq!(code, Some(2));
+    assert!(
+        stderr.contains("MENTISCHAT_OBSERVE must be 0 or 1"),
+        "{stderr}"
+    );
 }
 
 /// The daemon needs a data directory: with neither `MENTISCHAT_DIR` nor `HOME`

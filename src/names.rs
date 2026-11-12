@@ -161,74 +161,17 @@ impl Provider {
     }
 }
 
-/// The first names offered to an agent that has not picked one: the everyday
-/// colours. Agents may register any valid name; these are suggestions.
-pub const COMMON_COLOURS: [&str; 11] = [
-    "Black", "Blue", "Brown", "Green", "Grey", "Orange", "Pink", "Purple", "Red", "White", "Yellow",
+/// The first names offered to an agent that has not picked one: the NATO
+/// phonetic alphabet (ICAO spelling, with X-ray written as one word). Each
+/// starts with a different letter, and the set was chosen to be hard to
+/// confuse. Agents may register any valid name; these are suggestions.
+pub const NATO_NAMES: [&str; 26] = [
+    "Alfa", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot", "Golf", "Hotel", "India", "Juliett",
+    "Kilo", "Lima", "Mike", "November", "Oscar", "Papa", "Quebec", "Romeo", "Sierra", "Tango",
+    "Uniform", "Victor", "Whiskey", "Xray", "Yankee", "Zulu",
 ];
 
-/// Colours offered once too few common ones are free: well known, but not
-/// everyday.
-pub const FAMILIAR_COLOURS: [&str; 31] = [
-    "Amber",
-    "Aqua",
-    "Beige",
-    "Bronze",
-    "Copper",
-    "Coral",
-    "Cream",
-    "Crimson",
-    "Cyan",
-    "Emerald",
-    "Gold",
-    "Indigo",
-    "Ivory",
-    "Jade",
-    "Lavender",
-    "Lime",
-    "Magenta",
-    "Maroon",
-    "Mint",
-    "Navy",
-    "Olive",
-    "Peach",
-    "Plum",
-    "Rose",
-    "Ruby",
-    "Sapphire",
-    "Scarlet",
-    "Silver",
-    "Teal",
-    "Turquoise",
-    "Violet",
-];
-
-/// Colours offered once too few familiar ones are free: the less common shades.
-pub const RARE_COLOURS: [&str; 21] = [
-    "Apricot",
-    "Azure",
-    "Burgundy",
-    "Cerise",
-    "Cerulean",
-    "Charcoal",
-    "Cobalt",
-    "Fuchsia",
-    "Lilac",
-    "Mauve",
-    "Ochre",
-    "Onyx",
-    "Pearl",
-    "Russet",
-    "Saffron",
-    "Sage",
-    "Sienna",
-    "Slate",
-    "Tangerine",
-    "Topaz",
-    "Umber",
-];
-
-/// Names offered once too few colours are free: stars, constellations and
+/// Names offered once too few NATO names are free: stars, constellations and
 /// moons.
 pub const STAR_NAMES: [&str; 42] = [
     "Alcyone",
@@ -278,14 +221,9 @@ pub const STAR_NAMES: [&str; 42] = [
 /// How many free names `list_agents` and `name_taken` offer.
 pub const SUGGESTION_COUNT: usize = 5;
 
-/// The suggestion lists in the order they are offered: common colours, then
-/// familiar, then rare, then stars.
-pub const SUGGESTION_TIERS: [&[&str]; 4] = [
-    &COMMON_COLOURS,
-    &FAMILIAR_COLOURS,
-    &RARE_COLOURS,
-    &STAR_NAMES,
-];
+/// The suggestion lists in the order they are offered: NATO names, then
+/// stars.
+pub const SUGGESTION_TIERS: [&[&str]; 2] = [&NATO_NAMES, &STAR_NAMES];
 
 /// Up to [`SUGGESTION_COUNT`] free names for which `is_taken` is false, taken
 /// from [`SUGGESTION_TIERS`] in order: a tier is reached only when the tiers
@@ -295,13 +233,13 @@ pub const SUGGESTION_TIERS: [&[&str]; 4] = [
 /// # Examples
 ///
 /// ```
-/// use mentischat::names::{suggestions, COMMON_COLOURS, FAMILIAR_COLOURS};
+/// use mentischat::names::{suggestions, NATO_NAMES, STAR_NAMES};
 ///
 /// let fresh = suggestions(|_| false);
-/// assert!(fresh.iter().all(|n| COMMON_COLOURS.contains(&n.as_str())));
+/// assert!(fresh.iter().all(|n| NATO_NAMES.contains(&n.as_str())));
 ///
-/// let common_gone = suggestions(|n| COMMON_COLOURS.contains(&n));
-/// assert!(common_gone.iter().all(|n| FAMILIAR_COLOURS.contains(&n.as_str())));
+/// let nato_gone = suggestions(|n| NATO_NAMES.contains(&n));
+/// assert!(nato_gone.iter().all(|n| STAR_NAMES.contains(&n.as_str())));
 /// ```
 pub fn suggestions(is_taken: impl Fn(&str) -> bool) -> Vec<String> {
     SUGGESTION_TIERS

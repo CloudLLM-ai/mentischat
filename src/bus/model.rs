@@ -267,7 +267,7 @@ pub struct RosterListing {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next: Option<String>,
     /// Up to [`crate::names::SUGGESTION_COUNT`] names from
-    /// [`crate::names::SUGGESTED_NAMES`] that are neither registered nor held.
+    /// [`crate::names::SUGGESTION_TIERS`], in tier order, that are neither registered nor held.
     pub suggestions: Vec<String>,
 }
 

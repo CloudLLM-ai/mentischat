@@ -569,13 +569,13 @@ async fn agents_are_told_when_to_wait_and_how_to_mark_what_they_need() {
     for phrase in [
         // The four cases, each with an example request.
         "1. Tell.",
-        "tell Orion the tests pass",
+        "tell Blue the tests pass",
         "2. Ask, answer can wait.",
-        "ask Lyra to look at the flaky test when she can",
+        "ask Red to look at the flaky test when it can",
         "3. Ask, answer needed now.",
-        "ask Vega which port the API uses",
+        "ask Green which port the API uses",
         "4. Conversation.",
-        "debug this with Vega",
+        "debug this with Green",
         // How to wait, and when to stop.
         "check_inbox with wait_ms 30000",
         "After 10 empty calls",

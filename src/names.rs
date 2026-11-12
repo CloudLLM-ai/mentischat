@@ -161,9 +161,76 @@ impl Provider {
     }
 }
 
-/// Names offered to agents that have not picked one: stars, constellations
-/// and moons. Agents may register any valid name; these are suggestions.
-pub const SUGGESTED_NAMES: [&str; 42] = [
+/// The first names offered to an agent that has not picked one: the everyday
+/// colours. Agents may register any valid name; these are suggestions.
+pub const COMMON_COLOURS: [&str; 11] = [
+    "Black", "Blue", "Brown", "Green", "Grey", "Orange", "Pink", "Purple", "Red", "White", "Yellow",
+];
+
+/// Colours offered once too few common ones are free: well known, but not
+/// everyday.
+pub const FAMILIAR_COLOURS: [&str; 31] = [
+    "Amber",
+    "Aqua",
+    "Beige",
+    "Bronze",
+    "Copper",
+    "Coral",
+    "Cream",
+    "Crimson",
+    "Cyan",
+    "Emerald",
+    "Gold",
+    "Indigo",
+    "Ivory",
+    "Jade",
+    "Lavender",
+    "Lime",
+    "Magenta",
+    "Maroon",
+    "Mint",
+    "Navy",
+    "Olive",
+    "Peach",
+    "Plum",
+    "Rose",
+    "Ruby",
+    "Sapphire",
+    "Scarlet",
+    "Silver",
+    "Teal",
+    "Turquoise",
+    "Violet",
+];
+
+/// Colours offered once too few familiar ones are free: the less common shades.
+pub const RARE_COLOURS: [&str; 21] = [
+    "Apricot",
+    "Azure",
+    "Burgundy",
+    "Cerise",
+    "Cerulean",
+    "Charcoal",
+    "Cobalt",
+    "Fuchsia",
+    "Lilac",
+    "Mauve",
+    "Ochre",
+    "Onyx",
+    "Pearl",
+    "Russet",
+    "Saffron",
+    "Sage",
+    "Sienna",
+    "Slate",
+    "Tangerine",
+    "Topaz",
+    "Umber",
+];
+
+/// Names offered once too few colours are free: stars, constellations and
+/// moons.
+pub const STAR_NAMES: [&str; 42] = [
     "Alcyone",
     "Aldebaran",
     "Altair",
@@ -211,20 +278,52 @@ pub const SUGGESTED_NAMES: [&str; 42] = [
 /// How many free names `list_agents` and `name_taken` offer.
 pub const SUGGESTION_COUNT: usize = 5;
 
-/// Up to [`SUGGESTION_COUNT`] names from [`SUGGESTED_NAMES`] for which
-/// `is_taken` is false, starting at a random point in the list so agents
-/// connecting together are not all offered the same first name.
+/// The suggestion lists in the order they are offered: common colours, then
+/// familiar, then rare, then stars.
+pub const SUGGESTION_TIERS: [&[&str]; 4] = [
+    &COMMON_COLOURS,
+    &FAMILIAR_COLOURS,
+    &RARE_COLOURS,
+    &STAR_NAMES,
+];
+
+/// Up to [`SUGGESTION_COUNT`] free names for which `is_taken` is false, taken
+/// from [`SUGGESTION_TIERS`] in order: a tier is reached only when the tiers
+/// before it have too few free names. Each tier is read from a random point so
+/// agents connecting together are not all offered the same first name.
+///
+/// # Examples
+///
+/// ```
+/// use mentischat::names::{suggestions, COMMON_COLOURS, FAMILIAR_COLOURS};
+///
+/// let fresh = suggestions(|_| false);
+/// assert!(fresh.iter().all(|n| COMMON_COLOURS.contains(&n.as_str())));
+///
+/// let common_gone = suggestions(|n| COMMON_COLOURS.contains(&n));
+/// assert!(common_gone.iter().all(|n| FAMILIAR_COLOURS.contains(&n.as_str())));
+/// ```
 pub fn suggestions(is_taken: impl Fn(&str) -> bool) -> Vec<String> {
-    let start = (uuid::Uuid::new_v4().as_u128() % SUGGESTED_NAMES.len() as u128) as usize;
-    SUGGESTED_NAMES
+    SUGGESTION_TIERS
         .iter()
-        .cycle()
-        .skip(start)
-        .take(SUGGESTED_NAMES.len())
-        .filter(|name| !is_taken(name))
+        .flat_map(|tier| free_from(tier, &is_taken))
         .take(SUGGESTION_COUNT)
         .map(|name| (*name).to_string())
         .collect()
+}
+
+/// The names of `list` for which `is_taken` is false, once each, starting at a
+/// random point and wrapping round.
+fn free_from<'a>(
+    list: &'a [&'a str],
+    is_taken: &'a impl Fn(&str) -> bool,
+) -> impl Iterator<Item = &'a &'a str> + 'a {
+    let start = (uuid::Uuid::new_v4().as_u128() % list.len() as u128) as usize;
+    list.iter()
+        .cycle()
+        .skip(start)
+        .take(list.len())
+        .filter(move |name| !is_taken(name))
 }
 
 /// The rejected input as echoed in `invalid_name`: at most 64 characters, so

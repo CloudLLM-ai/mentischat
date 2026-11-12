@@ -12,7 +12,10 @@ use common::{
 };
 use mentischat::bus::{rfc3339, Bus, Registration, Retention};
 use mentischat::errors::{MailboxError, TakenReason};
-use mentischat::names::{AgentName, SUGGESTED_NAMES, SUGGESTION_COUNT};
+use mentischat::names::{
+    AgentName, COMMON_COLOURS, FAMILIAR_COLOURS, RARE_COLOURS, STAR_NAMES, SUGGESTION_COUNT,
+    SUGGESTION_TIERS,
+};
 
 fn folded(names: &[String]) -> HashSet<String> {
     names.iter().map(|n| n.to_ascii_lowercase()).collect()
@@ -38,16 +41,30 @@ fn taken(err: MailboxError, agent: &str, held: bool) -> Vec<String> {
     }
 }
 
+/// Every suggested name, in every tier, is a valid name that is not numbered,
+/// and no two of them are the same name ignoring case, across all tiers.
 #[test]
 fn suggested_names_are_valid_and_distinct_ignoring_case() {
-    for n in SUGGESTED_NAMES {
-        assert!(AgentName::parse(n).is_ok(), "{n}");
-    }
-    let distinct: HashSet<String> = SUGGESTED_NAMES
+    let all: Vec<&str> = SUGGESTION_TIERS
         .iter()
-        .map(|n| n.to_ascii_lowercase())
+        .flat_map(|t| t.iter().copied())
         .collect();
-    assert_eq!(distinct.len(), SUGGESTED_NAMES.len());
+    for n in &all {
+        let parsed = AgentName::parse(n).unwrap_or_else(|_| panic!("{n} is not a valid name"));
+        assert!(!parsed.is_numbered(), "{n}");
+    }
+    let distinct: HashSet<String> = all.iter().map(|n| n.to_ascii_lowercase()).collect();
+    assert_eq!(distinct.len(), all.len());
+    assert_eq!(
+        SUGGESTION_TIERS,
+        [
+            &COMMON_COLOURS[..],
+            &FAMILIAR_COLOURS[..],
+            &RARE_COLOURS[..],
+            &STAR_NAMES[..]
+        ],
+        "common colours, then familiar, then rare, then stars"
+    );
 }
 
 #[tokio::test]
@@ -129,7 +146,9 @@ async fn concurrent_registrations_of_one_name_have_one_winner() {
 }
 
 #[tokio::test]
-async fn list_agents_offers_distinct_free_suggested_names() {
+/// An empty roster is offered common colours only, distinct, from different
+/// starting points.
+async fn list_agents_offers_distinct_free_common_colours() {
     let (_d, bus) = fresh_bus("suggest");
     let mut first = HashSet::new();
     for _ in 0..20 {
@@ -138,7 +157,7 @@ async fn list_agents_offers_distinct_free_suggested_names() {
         assert_eq!(folded(&suggestions).len(), SUGGESTION_COUNT, "distinct");
         assert!(suggestions
             .iter()
-            .all(|s| SUGGESTED_NAMES.contains(&s.as_str())));
+            .all(|s| COMMON_COLOURS.contains(&s.as_str())));
         first.insert(suggestions[0].clone());
     }
     assert!(
@@ -147,35 +166,75 @@ async fn list_agents_offers_distinct_free_suggested_names() {
     );
 }
 
+/// Each tier is reached only when the tiers before it cannot fill the
+/// suggestions: the free names of an earlier tier always lead, and the next
+/// tier fills only the places left.
+#[tokio::test]
+async fn suggestions_move_from_common_to_rare_colours_then_stars() {
+    let (_d, bus) = fresh_bus("suggest_tiers");
+    for (i, tier) in SUGGESTION_TIERS
+        .iter()
+        .enumerate()
+        .take(SUGGESTION_TIERS.len() - 1)
+    {
+        let next = SUGGESTION_TIERS[i + 1];
+        for n in &tier[2..] {
+            bus.register(&name(n)).await.unwrap();
+        }
+        let listed = bus.list_agents().await.unwrap().suggestions;
+        assert_eq!(listed.len(), SUGGESTION_COUNT, "{listed:?}");
+        assert_eq!(
+            folded(&listed[..2]),
+            folded(&tier[..2].iter().map(|n| n.to_string()).collect::<Vec<_>>()),
+            "tier {i}'s free names lead: {listed:?}"
+        );
+        assert!(
+            listed[2..].iter().all(|s| next.contains(&s.as_str())),
+            "tier {} fills the rest: {listed:?}",
+            i + 1
+        );
+        for n in &tier[..2] {
+            bus.register(&name(n)).await.unwrap();
+        }
+    }
+}
+
+/// Registered and held names are never suggested, whichever list they are
+/// on; when every name on both lists is taken nothing is suggested, and names
+/// outside the lists still register.
 #[tokio::test]
 async fn suggestions_skip_registered_and_held_names() {
     let (_d, bus) = fresh_bus("suggest_free");
-    for n in &SUGGESTED_NAMES[3..] {
+    let colours = COMMON_COLOURS
+        .iter()
+        .chain(&FAMILIAR_COLOURS)
+        .chain(&RARE_COLOURS);
+    for n in colours.chain(&STAR_NAMES[3..]) {
         // A lowercased registration still takes the suggested spelling.
         bus.register(&name(&n.to_ascii_lowercase())).await.unwrap();
     }
-    bus.deregister(&name(SUGGESTED_NAMES[10])).await.unwrap(); // now held
+    bus.deregister(&name(STAR_NAMES[10])).await.unwrap(); // now held
 
-    let free: HashSet<String> = SUGGESTED_NAMES[..3]
+    let free: HashSet<String> = STAR_NAMES[..3]
         .iter()
         .map(|n| n.to_ascii_lowercase())
         .collect();
     let listed = bus.list_agents().await.unwrap().suggestions;
     assert_eq!(folded(&listed), free, "{listed:?}");
-    let err = bus.register(&name(SUGGESTED_NAMES[5])).await.unwrap_err();
+    let err = bus.register(&name(STAR_NAMES[5])).await.unwrap_err();
     assert_eq!(
-        folded(&taken(err, &SUGGESTED_NAMES[5].to_ascii_lowercase(), false)),
+        folded(&taken(err, &STAR_NAMES[5].to_ascii_lowercase(), false)),
         free
     );
 
-    for n in &SUGGESTED_NAMES[..3] {
+    for n in &STAR_NAMES[..3] {
         bus.register(&name(n)).await.unwrap();
     }
     assert!(
         bus.list_agents().await.unwrap().suggestions.is_empty(),
         "nothing left to suggest"
     );
-    // Names outside the list are still fine.
+    // Names outside the lists are still fine.
     assert!(bus.register(&name("reviewer2")).await.unwrap().created);
 }
 

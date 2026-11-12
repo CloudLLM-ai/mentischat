@@ -161,67 +161,32 @@ impl Provider {
     }
 }
 
-/// The first names offered to an agent that has not picked one: the NATO
-/// phonetic alphabet (ICAO spelling, with X-ray written as one word). Each
-/// starts with a different letter, and the set was chosen to be hard to
-/// confuse. Agents may register any valid name; these are suggestions.
-pub const NATO_NAMES: [&str; 26] = [
-    "Alfa", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot", "Golf", "Hotel", "India", "Juliett",
-    "Kilo", "Lima", "Mike", "November", "Oscar", "Papa", "Quebec", "Romeo", "Sierra", "Tango",
-    "Uniform", "Victor", "Whiskey", "Xray", "Yankee", "Zulu",
-];
-
-/// Names offered once too few NATO names are free: the Greek alphabet, in
-/// order, without Delta, which is already a NATO name.
-pub const GREEK_NAMES: [&str; 23] = [
-    "Alpha", "Beta", "Gamma", "Epsilon", "Zeta", "Eta", "Theta", "Iota", "Kappa", "Lambda", "Mu",
-    "Nu", "Xi", "Omicron", "Pi", "Rho", "Sigma", "Tau", "Upsilon", "Phi", "Chi", "Psi", "Omega",
+/// Names offered to agents that have not picked one: the Greek alphabet, in
+/// order. Agents may register any valid name; these are suggestions, and when
+/// all are taken none are offered.
+pub const SUGGESTED_NAMES: [&str; 24] = [
+    "Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta", "Eta", "Theta", "Iota", "Kappa",
+    "Lambda", "Mu", "Nu", "Xi", "Omicron", "Pi", "Rho", "Sigma", "Tau", "Upsilon", "Phi", "Chi",
+    "Psi", "Omega",
 ];
 
 /// How many free names `list_agents` and `name_taken` offer.
 pub const SUGGESTION_COUNT: usize = 5;
 
-/// The suggestion lists in the order they are offered: NATO names, then
-/// Greek letters.
-pub const SUGGESTION_TIERS: [&[&str]; 2] = [&NATO_NAMES, &GREEK_NAMES];
-
-/// Up to [`SUGGESTION_COUNT`] free names for which `is_taken` is false, taken
-/// from [`SUGGESTION_TIERS`] in order: a tier is reached only when the tiers
-/// before it have too few free names. Each tier is read from a random point so
-/// agents connecting together are not all offered the same first name.
-///
-/// # Examples
-///
-/// ```
-/// use mentischat::names::{suggestions, GREEK_NAMES, NATO_NAMES};
-///
-/// let fresh = suggestions(|_| false);
-/// assert!(fresh.iter().all(|n| NATO_NAMES.contains(&n.as_str())));
-///
-/// let nato_gone = suggestions(|n| NATO_NAMES.contains(&n));
-/// assert!(nato_gone.iter().all(|n| GREEK_NAMES.contains(&n.as_str())));
-/// ```
+/// Up to [`SUGGESTION_COUNT`] names from [`SUGGESTED_NAMES`] for which
+/// `is_taken` is false, starting at a random point in the list so agents
+/// connecting together are not all offered the same first name.
 pub fn suggestions(is_taken: impl Fn(&str) -> bool) -> Vec<String> {
-    SUGGESTION_TIERS
+    let start = (uuid::Uuid::new_v4().as_u128() % SUGGESTED_NAMES.len() as u128) as usize;
+    SUGGESTED_NAMES
         .iter()
-        .flat_map(|tier| free_from(tier, &is_taken))
+        .cycle()
+        .skip(start)
+        .take(SUGGESTED_NAMES.len())
+        .filter(|name| !is_taken(name))
         .take(SUGGESTION_COUNT)
         .map(|name| (*name).to_string())
         .collect()
-}
-
-/// The names of `list` for which `is_taken` is false, once each, starting at a
-/// random point and wrapping round.
-fn free_from<'a>(
-    list: &'a [&'a str],
-    is_taken: &'a impl Fn(&str) -> bool,
-) -> impl Iterator<Item = &'a &'a str> + 'a {
-    let start = (uuid::Uuid::new_v4().as_u128() % list.len() as u128) as usize;
-    list.iter()
-        .cycle()
-        .skip(start)
-        .take(list.len())
-        .filter(move |name| !is_taken(name))
 }
 
 /// The rejected input as echoed in `invalid_name`: at most 64 characters, so

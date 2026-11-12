@@ -5,7 +5,6 @@ edition = "2021"
 description = "Local mailbox daemon letting agents message each other via MCP tools and REST."
 license = "MIT"
 repository = "https://github.com/CloudLLM-ai/mentischat"
-homepage = "https://github.com/CloudLLM-ai/mentischat"
 documentation = "https://github.com/CloudLLM-ai/mentischat#readme"
 readme = "README.md"
 keywords = ["mcp", "mailbox", "agents", "daemon"]

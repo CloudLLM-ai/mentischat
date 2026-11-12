@@ -1,14 +1,15 @@
 UNRELEASED
 
   - feat(observe): the log pane follows conversations. In the live view every
-    message sent logs `sent Alpha → Beta (id 42, 312 B)` (or `→ #room`), and
+    message sent logs `sent Alpha → Beta (id 42, 312 B) "first line…"` (or
+    `→ #room`), with the first line of the body cut to 100 characters, and
     every message read, by `check_inbox` or a stream `ack`, logs
     `read Beta ← Alpha (id 42)`, over MCP, REST and WebSocket alike. Writing
     the lines changes nothing: no mail is marked read, no room cursor moves
-    and `lastSeen` is untouched. With `MENTISCHAT_OBSERVE=1` the live view
-    also shows the first line of each body, cut to 100 characters, and plain
-    logs (launchd, a pipe, `MENTISCHAT_PLAIN=1`) carry the lines without
-    bodies; otherwise plain logs carry none. Signed room messages are never
+    and `lastSeen` is untouched. `MENTISCHAT_OBSERVE=0` leaves the bodies out
+    of the live view. Plain logs (launchd, a pipe, `MENTISCHAT_PLAIN=1`) carry
+    the lines, never with bodies, only with `MENTISCHAT_OBSERVE=1`. Any other
+    value stops the daemon at startup. Signed room messages are never
     previewed. Library users: `Bus::with_traffic_log` with `TrafficLog::Off`
     (the default), `Metadata` or `WithPreviews`.
 

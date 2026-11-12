@@ -110,26 +110,25 @@ each message sent and read), and a **Registered agents** table with each
 agent's provider, last seen, unread mail and description. The table reads the
 first 1024 agents; the tile counts the whole roster.
 
-In the live view each message sent logs its sender, recipient or room, id and
-size, and each message read (taken by `check_inbox`, or acknowledged on a
+In the live view each message sent logs its sender, recipient or room, id,
+size and the first line of its body (cut to 100 characters), and each message
+read (taken by `check_inbox`, or acknowledged on a
 [stream](#streaming-over-websocket)) logs who read it:
 
 ```
-sent Alpha → Beta (id 42, 312 B)
+sent Alpha → Beta (id 42, 312 B) "Waiting for your reply: which port…"
 read Beta ← Alpha (id 42)
-sent Gamma → #release (id 43, 1.2 KB)
+sent Gamma → #release (id 43, 1.2 KB) "Reply when you can: changelog draft…"
 read Alpha ← Gamma in #release (id 43)
 ```
 
 Writing a line changes nothing: watching never marks mail read, moves a room
-cursor or refreshes `lastSeen`. Start the daemon with `MENTISCHAT_OBSERVE=1`
-to add the first line of each body to its sent line, cut to 100 characters:
-`sent Alpha → Beta (id 42, 312 B) "Waiting for your reply: which port…"`.
-Previews appear in the live view only. Plain logs (launchd, a pipe,
-`MENTISCHAT_PLAIN=1`) usually end up in a file, so they carry these lines only
-with `MENTISCHAT_OBSERVE=1`, and then with names, ids and sizes but no body. A
-signed room message never shows a preview; its sent line ends `signed)`
-instead.
+cursor or refreshes `lastSeen`. Start the daemon with `MENTISCHAT_OBSERVE=0`
+to leave the bodies out and keep to names, ids and sizes. A signed room
+message never shows a preview; its sent line ends `signed)` instead. Plain
+logs (launchd, a pipe, `MENTISCHAT_PLAIN=1`) usually end up in a file, so they
+carry these lines only with `MENTISCHAT_OBSERVE=1`, and never with bodies. Any
+other value of `MENTISCHAT_OBSERVE` stops the daemon at startup.
 
 It is painted like the MentisDB console: the terminal's own 8-color palette (so
 it reads on light and dark themes), a green **MENTIS** and cyan **CHAT** block

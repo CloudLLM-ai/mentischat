@@ -177,6 +177,34 @@ impl PublicKey {
     }
 }
 
+impl PublicKey {
+    /// A short, stable fingerprint for people to compare out of band: the
+    /// first 16 bytes of SHA-256 of the key, as eight groups of four hex
+    /// digits.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mentischat::signed::Keypair;
+    ///
+    /// let print = Keypair::from_seed([1; 32]).public().fingerprint();
+    /// assert_eq!(print.len(), 39);
+    /// assert_eq!(print.split(' ').count(), 8);
+    /// assert_ne!(print, Keypair::from_seed([2; 32]).public().fingerprint());
+    /// ```
+    pub fn fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(self.0);
+        let hex = hex_encode(&digest[..16]);
+        let (groups, _) = hex.as_bytes().as_chunks::<4>();
+        groups
+            .iter()
+            .map(|g| String::from_utf8_lossy(g).into_owned())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
 impl fmt::Debug for PublicKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "PublicKey({})", self.to_hex())
@@ -312,6 +340,8 @@ pub enum OpKind {
     Reclaim,
     /// Prove ownership of a key-bound name to take it off the roster.
     Deregister,
+    /// Replace the key bound to a name, signed by the key being replaced.
+    RotateKey,
 }
 
 /// An `op` name that is not one of the known operations.
@@ -345,6 +375,7 @@ impl OpKind {
             Self::PublishKeyPackages => "key_packages",
             Self::Reclaim => "reclaim",
             Self::Deregister => "deregister",
+            Self::RotateKey => "rotate_key",
         }
     }
 }
@@ -375,6 +406,7 @@ impl FromStr for OpKind {
             "key_packages" => Self::PublishKeyPackages,
             "reclaim" => Self::Reclaim,
             "deregister" => Self::Deregister,
+            "rotate_key" => Self::RotateKey,
             _ => return Err(UnknownOp),
         })
     }
@@ -600,6 +632,27 @@ pub fn reclaim_payload(signer: &str, counter: u64) -> Vec<u8> {
 /// ```
 pub fn deregister_payload(signer: &str, counter: u64) -> Vec<u8> {
     header(OpKind::Deregister, "", signer, counter, 0)
+}
+
+/// The bytes the key bound to `signer` signs to replace itself with
+/// `new_key`. The counter is the signer's own, strictly above every counter the
+/// key has used (the sequence of [`reclaim_payload`]); the room is empty.
+///
+/// # Examples
+///
+/// ```
+/// use mentischat::signed::{rotate_key_payload, Keypair};
+///
+/// let new = Keypair::from_seed([2; 32]).public();
+/// let payload = rotate_key_payload("Vega", 9, &new);
+/// assert!(payload.starts_with(b"mentischat/rotate-key/v1\0"));
+/// assert_eq!(payload, rotate_key_payload("vega", 9, &new));
+/// assert!(payload.ends_with(new.as_bytes()));
+/// ```
+pub fn rotate_key_payload(signer: &str, counter: u64, new_key: &PublicKey) -> Vec<u8> {
+    let mut out = header(OpKind::RotateKey, "", signer, counter, 32);
+    out.extend_from_slice(new_key.as_bytes());
+    out
 }
 
 /// The bytes signed to publish `packages` (opaque serialized MLS KeyPackages)

@@ -37,6 +37,8 @@ use crate::signed::{
 
 /// The `kind` of [`OpRec::dropped`].
 const DROPPED: &str = "drop";
+/// The `kind` of [`OpRec::rotated`].
+const ROTATED: &str = "rotate_key";
 
 /// Most journal records a signed room keeps; past it the room is not saved.
 pub(super) const MAX_JOURNAL: usize = 8192;
@@ -154,6 +156,29 @@ impl OpRec {
         }
     }
 
+    /// The record that the member, invitee or banned name `agent` replaced
+    /// its key: `key` is the old key and `target_key` the new one, and the
+    /// signature is the old key's over
+    /// [`rotate_key_payload`](crate::signed::rotate_key_payload), which does
+    /// not name a room, so one rotation is journaled in every room it touches.
+    pub(super) fn rotated(agent: &str, rotation: &super::keyring::Rotation) -> Self {
+        Self {
+            agent: agent.to_string(),
+            key: rotation.old.to_hex(),
+            counter: rotation.counter,
+            signature: rotation.signature.to_hex(),
+            kind: ROTATED.to_string(),
+            description: None,
+            public: None,
+            invitee: None,
+            invitee_key: None,
+            target: None,
+            target_key: Some(rotation.new.to_hex()),
+            welcome: None,
+            body: None,
+        }
+    }
+
     /// Whether every optional field set on this record belongs to `kind`.
     ///
     /// [`OpRec::new`] sets only the fields its operation signs, so a record
@@ -233,7 +258,8 @@ impl OpRec {
             OpKind::RegisterKey
             | OpKind::PublishKeyPackages
             | OpKind::Reclaim
-            | OpKind::Deregister => return None,
+            | OpKind::Deregister
+            | OpKind::RotateKey => return None,
         };
         Some((op, key, signature))
     }
@@ -313,11 +339,16 @@ pub(super) fn replay(
     let mut description = None;
     let mut seen_keys: HashSet<PublicKey> = HashSet::new();
     for (index, record) in rec.journal.iter().enumerate() {
-        if record.kind == DROPPED {
+        if record.kind == DROPPED || record.kind == ROTATED {
             if index == 0 {
                 return Err("first record is not create");
             }
-            replay_dropped(&mut state, record)?;
+            if record.kind == DROPPED {
+                replay_dropped(&mut state, record)?;
+            } else {
+                let new = replay_rotated(&mut state, record)?;
+                seen_keys.insert(new);
+            }
             state.journal.push(record.clone());
             continue;
         }
@@ -372,6 +403,56 @@ pub(super) fn replay(
         description,
         public,
     })
+}
+
+/// A [`OpRec::rotated`] record: the old key's signature must hold, and the old
+/// key must be pinned for the agent as a member or invitee, or banned with its
+/// name; each of those moves to the new key. Counters are the agent's own
+/// sequence, not the room's, so no watermark moves. Returns the new key.
+fn replay_rotated(state: &mut SignedState, record: &OpRec) -> Result<PublicKey, &'static str> {
+    let clean = record.description.is_none()
+        && record.public.is_none()
+        && record.invitee.is_none()
+        && record.invitee_key.is_none()
+        && record.target.is_none()
+        && record.welcome.is_none()
+        && record.body.is_none();
+    let parsed = (
+        AgentName::parse(&record.agent),
+        record.key.parse::<PublicKey>(),
+        record.target_key.as_deref().map(str::parse::<PublicKey>),
+        record.signature.parse::<Signature>(),
+    );
+    let (Ok(agent), Ok(old), Some(Ok(new)), Ok(signature)) = parsed else {
+        return Err("malformed rotate record");
+    };
+    if !clean {
+        return Err("malformed rotate record");
+    }
+    old.verify(
+        &crate::signed::rotate_key_payload(agent.as_str(), record.counter, &new),
+        &signature,
+    )
+    .map_err(|_| "signature does not verify")?;
+    let name = agent.folded();
+    let mut moved = false;
+    if state.pins.get(&name) == Some(&old) {
+        state.pins.insert(name.clone(), new);
+        moved = true;
+    }
+    if state.invitations.get(&name) == Some(&old) {
+        state.invitations.insert(name.clone(), new);
+        moved = true;
+    }
+    if let Some(banned) = state.banned.get_mut(&name).filter(|k| **k == Some(old)) {
+        *banned = Some(new);
+        moved = true;
+    }
+    if moved {
+        Ok(new)
+    } else {
+        Err("rotate of a key the room does not hold")
+    }
 }
 
 /// A [`OpRec::dropped`] record: it carries a member name and nothing else, and

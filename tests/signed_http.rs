@@ -384,3 +384,65 @@ async fn delete_agents_needs_a_signed_proof_for_a_key_bound_name() {
     let (s, v) = call(&app, "GET", "/agents/vega/key", None).await;
     assert_eq!((s, v["error"].as_str()), (404, Some("unregistered")), "{v}");
 }
+
+/// Roles, bans, rotation and `whois` over REST: the role and fingerprint are
+/// in the room listing, a participant's admin op is 403 `not_an_admin`, a
+/// rotation answers with the new binding, and `whois` reports it.
+#[tokio::test]
+async fn roles_rotation_and_whois_over_rest() {
+    use mentischat::signed::rotate_key_payload;
+    let (_d, app) = app();
+    let (alice, bob) = (Keypair::from_seed([1; 32]), Keypair::from_seed([2; 32]));
+    enroll(&app, "alice", &alice).await;
+    enroll(&app, "bob", &bob).await;
+    let create = SignedOp::Create {
+        description: String::new(),
+        public: true,
+    };
+    let post = |body| call(&app, "POST", "/signed/ops", Some(body));
+    assert_eq!(
+        post(op_body(&alice, "alice", "lobby", 1, &create)).await.0,
+        200
+    );
+    assert_eq!(
+        post(op_body(&bob, "bob", "lobby", 1, &SignedOp::Join))
+            .await
+            .0,
+        200
+    );
+    let (status, v) = call(&app, "GET", "/signed/rooms/lobby?agent=bob", None).await;
+    assert_eq!(status, 200);
+    assert_eq!(v["public"], true);
+    assert_eq!(v["admins"], json!(["alice"]));
+    assert_eq!(v["members"][1]["role"], "participant");
+    assert_eq!(v["members"][1]["fingerprint"], bob.public().fingerprint());
+
+    let promote = SignedOp::Promote {
+        target: "bob".into(),
+    };
+    let (status, v) = post(op_body(&bob, "bob", "lobby", 2, &promote)).await;
+    assert_eq!((status, v["error"].as_str()), (403, Some("not_an_admin")));
+
+    let next = Keypair::from_seed([22; 32]);
+    let new = next.public();
+    let body = json!({
+        "new_key": new.to_hex(),
+        "counter": 5,
+        "signature": bob.sign(&rotate_key_payload("bob", 5, &new)).to_hex(),
+        "proof": next.sign(&register_key_payload("bob", &new)).to_hex(),
+    });
+    let (status, v) = call(&app, "POST", "/agents/bob/key/rotate", Some(body.clone())).await;
+    assert_eq!(status, 200);
+    assert_eq!(v["publicKey"], new.to_hex());
+    assert_eq!(v["fingerprint"], new.fingerprint());
+    // Replaying it finds the new key already bound.
+    let (status, v) = call(&app, "POST", "/agents/bob/key/rotate", Some(body)).await;
+    assert_eq!((status, v["error"].as_str()), (400, Some("invalid_key")));
+
+    let (status, v) = call(&app, "GET", "/agents/bob/whois", None).await;
+    assert_eq!(status, 200);
+    assert_eq!(v["publicKey"], new.to_hex());
+    assert_eq!(v["fingerprint"], new.fingerprint());
+    let (status, _) = call(&app, "GET", "/agents/nobody/whois", None).await;
+    assert_eq!(status, 404);
+}

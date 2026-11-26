@@ -541,6 +541,34 @@ pub struct KeyBinding {
     pub agent: String,
     /// The bound Ed25519 public key, 64 lowercase hex digits.
     pub public_key: String,
+    /// Its fingerprint ([`PublicKey::fingerprint`]), for people to compare.
+    pub fingerprint: String,
+}
+
+impl KeyBinding {
+    fn new(agent: &str, key: &PublicKey) -> Self {
+        Self {
+            agent: agent.to_string(),
+            public_key: key.to_hex(),
+            fingerprint: key.fingerprint(),
+        }
+    }
+}
+
+/// Who holds a name: what `GET /agents/{agent}/whois` answers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Whois {
+    /// The name as registered.
+    pub agent: String,
+    /// The bound key, 64 lowercase hex digits; `None` for a keyless name.
+    pub public_key: Option<String>,
+    /// The key's fingerprint, when there is a key.
+    pub fingerprint: Option<String>,
+    /// The provider it registered with, if any.
+    pub provider: Option<String>,
+    /// What it says it does, if anything.
+    pub description: Option<String>,
 }
 
 /// A member's role in a signed room.
@@ -561,6 +589,8 @@ pub struct SignedMember {
     pub agent: String,
     /// Its pinned public key, 64 lowercase hex digits.
     pub public_key: String,
+    /// The key's fingerprint ([`PublicKey::fingerprint`]).
+    pub fingerprint: String,
     /// Admin or participant.
     pub role: Role,
 }
@@ -712,10 +742,7 @@ impl Bus {
             _ => {
                 st.key = Some(key);
                 st.key_proof = Some(*signature);
-                Ok(KeyBinding {
-                    agent: found.name.to_string(),
-                    public_key: key.to_hex(),
-                })
+                Ok(KeyBinding::new(&found.name, &key))
             }
         }
     }
@@ -730,10 +757,116 @@ impl Bus {
         let state = self.open()?;
         let found = state.agent(agent.as_str(), Key::fold(agent.as_str()).as_str())?;
         let key = found.inner.lock().key;
-        Ok(key.map(|k| KeyBinding {
+        Ok(key.map(|k| KeyBinding::new(&found.name, &k)))
+    }
+
+    /// Who holds `agent`: its key, the key's fingerprint, its provider and
+    /// description. Reads the roster only.
+    ///
+    /// # Errors
+    ///
+    /// `unregistered`; `shutting_down`.
+    pub async fn whois(&self, agent: &AgentName) -> Result<Whois, MailErr> {
+        let state = self.open()?;
+        let found = state.agent(agent.as_str(), Key::fold(agent.as_str()).as_str())?;
+        let st = found.inner.lock();
+        Ok(Whois {
             agent: found.name.to_string(),
-            public_key: k.to_hex(),
-        }))
+            public_key: st.key.map(|k| k.to_hex()),
+            fingerprint: st.key.map(|k| k.fingerprint()),
+            provider: st.provider.clone(),
+            description: st.description.clone(),
+        })
+    }
+
+    /// Replace the key bound to `agent` with `new_key`. `signature` is the
+    /// current key's signature over
+    /// [`rotate_key_payload`](crate::signed::rotate_key_payload) at `counter`,
+    /// strictly above every counter the key has signed for its name; `proof` is
+    /// the new key's signature over [`register_key_payload`], proving
+    /// possession.
+    ///
+    /// The key registry records the rotation before it applies. Then every
+    /// signed room that holds the old key for this name, as a member's pin, an
+    /// invitation or a ban, moves to the new key and journals the rotation, so
+    /// a restart replays it. The agent's KeyPackages, made under the old key,
+    /// are dropped.
+    ///
+    /// # Errors
+    ///
+    /// `unregistered`; `key_required` (no key bound yet: bind one instead);
+    /// `invalid_key` when `new_key` is the bound key; `invalid_signature`;
+    /// `stale_counter`; `key_in_use` while the agent is in an end-to-end
+    /// encrypted room; `key_conflict` when the registry has moved on;
+    /// `shutting_down`.
+    pub async fn rotate_key(
+        &self,
+        agent: &AgentName,
+        new_key: PublicKey,
+        counter: u64,
+        signature: &Signature,
+        proof: &Signature,
+    ) -> Result<KeyBinding, MailErr> {
+        let (state, found) = self.active(agent)?;
+        let (old, last) = {
+            let st = found.inner.lock();
+            let old = st.key.ok_or_else(|| MailErr::KeyRequired {
+                agent: found.name.to_string(),
+            })?;
+            (old, st.key_counter)
+        };
+        if old == new_key {
+            return Err(MailErr::InvalidKey);
+        }
+        let rotation = super::keyring::Rotation {
+            old,
+            new: new_key,
+            counter,
+            signature: *signature,
+            proof: *proof,
+        };
+        if !rotation.verifies(agent.as_str()) {
+            return Err(MailErr::InvalidSignature);
+        }
+        if counter <= last {
+            return Err(MailErr::StaleCounter {
+                room: String::new(),
+                last,
+            });
+        }
+        let folded = Key::fold(&found.name);
+        if let Some(room) = state.secure_room_of(folded.as_str(), old) {
+            return Err(MailErr::KeyInUse {
+                agent: found.name.to_string(),
+                room,
+            });
+        }
+        if let Some(ring) = &state.keyring {
+            match ring.rotate(&found.name, rotation) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(MailErr::KeyConflict {
+                        agent: found.name.to_string(),
+                    })
+                }
+                Err(e) => super::persist(Err(e)),
+            }
+        }
+        {
+            let mut st = found.inner.lock();
+            if st.key != Some(old) {
+                return Err(MailErr::KeyConflict {
+                    agent: found.name.to_string(),
+                });
+            }
+            st.key = Some(new_key);
+            st.key_proof = Some(*proof);
+            st.key_counter = counter;
+            st.key_packages.clear();
+            st.last_resort = None;
+        }
+        state.rotate_in_rooms(&found.name, &rotation);
+        Ok(KeyBinding::new(&found.name, &new_key))
     }
 
     /// Apply one signed room operation after verifying its signature under
@@ -1034,6 +1167,49 @@ impl Bus {
 }
 
 impl State {
+    /// A signed room in which the member `name` (folded) signs with `key` and
+    /// that has accepted MLS Commits: an end-to-end encrypted room whose group
+    /// knows the key.
+    fn secure_room_of(&self, name: &str, key: PublicKey) -> Option<String> {
+        self.rooms.entries().into_iter().find_map(|(_, room)| {
+            let st = room.inner.lock();
+            let signed = st.signed.as_ref()?;
+            (signed.epoch > 0 && signed.pins.get(name) == Some(&key)).then(|| room.name.to_string())
+        })
+    }
+
+    /// Move every signed room's hold on `rotation.old` for `agent` (pin,
+    /// invitation, ban) to `rotation.new`, journaling the rotation there.
+    fn rotate_in_rooms(&self, agent: &str, rotation: &super::keyring::Rotation) {
+        let name = Key::fold(agent);
+        let name = name.as_str();
+        for (_, room) in self.rooms.entries() {
+            let mut st = room.inner.lock();
+            let Some(signed) = st.signed.as_mut() else {
+                continue;
+            };
+            let mut moved = false;
+            for held in [signed.pins.get_mut(name), signed.invitations.get_mut(name)]
+                .into_iter()
+                .flatten()
+            {
+                if *held == rotation.old {
+                    *held = rotation.new;
+                    moved = true;
+                }
+            }
+            if let Some(banned) = signed.banned.get_mut(name) {
+                if *banned == Some(rotation.old) {
+                    *banned = Some(rotation.new);
+                    moved = true;
+                }
+            }
+            if moved {
+                signed.record(&OpRec::rotated(agent, rotation));
+            }
+        }
+    }
+
     fn signed_create(
         &self,
         agent: &Arc<Agent>,
@@ -1335,6 +1511,7 @@ impl State {
                 signed.pins.get(folded).map(|k| SignedMember {
                     agent: m.name.to_string(),
                     public_key: k.to_hex(),
+                    fingerprint: k.fingerprint(),
                     role: if signed.is_admin(folded) {
                         Role::Admin
                     } else {

@@ -186,6 +186,15 @@ pub enum MailboxError {
         /// The agent whose key differs.
         agent: String,
     },
+    /// A key rotation while the key signs for an end-to-end encrypted room
+    /// (one with MLS Commits): the room's group knows the old key, so leave
+    /// the room, rotate, and be added again.
+    KeyInUse {
+        /// The agent rotating its key.
+        agent: String,
+        /// A secure room it is in.
+        room: String,
+    },
     /// A signed operation's counter is not above the highest this key has
     /// used in the room (a replay, or a client that lost its place).
     StaleCounter {
@@ -253,6 +262,7 @@ impl MailboxError {
             Self::InvalidKey => "invalid_key",
             Self::KeyRequired { .. } => "key_required",
             Self::KeyConflict { .. } => "key_conflict",
+            Self::KeyInUse { .. } => "key_in_use",
             Self::StaleCounter { .. } => "stale_counter",
             Self::StaleEpoch { .. } => "stale_epoch",
             Self::NoKeyPackage { .. } => "no_key_package",
@@ -296,6 +306,7 @@ impl MailboxError {
             | Self::RoomFull { .. }
             | Self::KeyRequired { .. }
             | Self::KeyConflict { .. }
+            | Self::KeyInUse { .. }
             | Self::StaleCounter { .. }
             | Self::StaleEpoch { .. }
             | Self::NameTaken { .. } => StatusCode::CONFLICT,
@@ -373,6 +384,7 @@ impl MailboxError {
             | Self::RoomNotFound { room }
             | Self::RoomExists { room } => json!({ "error": self.code(), "room": room }),
             Self::NotAMember { agent, room }
+            | Self::KeyInUse { agent, room }
             | Self::NotAnAdmin { agent, room }
             | Self::Banned { agent, room } => {
                 json!({ "error": self.code(), "agent": agent, "room": room })

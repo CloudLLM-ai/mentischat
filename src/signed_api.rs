@@ -114,6 +114,44 @@ pub async fn get_key(bus: &Bus, agent: &str) -> Result<Value, MailboxError> {
     })
 }
 
+/// `POST /agents/{agent}/key/rotate` `{ "new_key", "counter", "signature",
+/// "proof" }`: replace the key bound to the name. `signature` is the current
+/// key's, over [`rotate_key_payload`](crate::signed::rotate_key_payload);
+/// `proof` is the new key's, over
+/// [`register_key_payload`](crate::signed::register_key_payload).
+///
+/// # Errors
+///
+/// See [`Bus::rotate_key`], plus `invalid_name`, `invalid_key`,
+/// `invalid_signature` and `invalid_body` for parameters that do not parse.
+pub async fn rotate_key(bus: &Bus, agent: &str, params: &Value) -> Result<Value, MailboxError> {
+    let agent = AgentName::parse(agent)?;
+    let new_key = public_key(params, "new_key")?;
+    let counter = params
+        .get("counter")
+        .and_then(uint)
+        .ok_or(MailboxError::InvalidBody)?;
+    let proof = text(params, "proof")?
+        .parse()
+        .map_err(|_| MailboxError::InvalidSignature)?;
+    let binding = bus
+        .rotate_key(&agent, new_key, counter, &signature(params)?, &proof)
+        .await?;
+    Ok(to_wire(binding))
+}
+
+/// `GET /agents/{agent}/whois`: who holds a name, for people checking an
+/// identity out of band: the name as registered, its key and fingerprint, its
+/// provider and description.
+///
+/// # Errors
+///
+/// `invalid_name`, `unregistered`, `shutting_down`.
+pub async fn whois(bus: &Bus, agent: &str) -> Result<Value, MailboxError> {
+    let agent = AgentName::parse(agent)?;
+    Ok(to_wire(bus.whois(&agent).await?))
+}
+
 /// Parse the `op` field and the fields it needs into a [`SignedOp`].
 fn parse_op(params: &Value) -> Result<SignedOp, MailboxError> {
     let kind: OpKind = text(params, "op")?
@@ -121,9 +159,11 @@ fn parse_op(params: &Value) -> Result<SignedOp, MailboxError> {
         .map_err(|_| MailboxError::InvalidBody)?;
     let own = |key: &str| text(params, key).map(str::to_string);
     Ok(match kind {
-        OpKind::RegisterKey | OpKind::PublishKeyPackages | OpKind::Reclaim | OpKind::Deregister => {
-            return Err(MailboxError::InvalidBody)
-        }
+        OpKind::RegisterKey
+        | OpKind::PublishKeyPackages
+        | OpKind::Reclaim
+        | OpKind::Deregister
+        | OpKind::RotateKey => return Err(MailboxError::InvalidBody),
         OpKind::Create => SignedOp::Create {
             description: match params.get("description") {
                 None | Some(Value::Null) => String::new(),

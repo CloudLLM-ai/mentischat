@@ -20,6 +20,7 @@
 //! {"bind":{"agent":"Vega","key":"<64 hex>","proof":"<128 hex>"}}
 //! {"counter":{"agent":"vega","counter":1731300000000000}}
 //! {"release":{"agent":"vega"}}
+//! {"rotate":{"agent":"vega","old_key":"<64 hex>","new_key":"<64 hex>","counter":1731300000000001,"signature":"<128 hex>","proof":"<128 hex>"}}
 //! ```
 //!
 //! - `bind` records the name as registered and the signature over
@@ -30,6 +31,10 @@
 //!   (reclaims, deregisters, KeyPackages), so a captured proof cannot be
 //!   replayed after a restart.
 //! - `release` deletes the binding (a signed deregister).
+//! - `rotate` replaces the key: `signature` is the old key's, over
+//!   [`rotate_key_payload`], and `proof` the new key's, over
+//!   [`register_key_payload`]. On load both are checked again and the old key
+//!   must be the one bound; compaction writes the new binding as a `bind`.
 //!
 //! On open the log is compacted: rewritten, atomically, with one `bind` and
 //! one `counter` line per live binding. Binding is rare (once per identity),
@@ -48,7 +53,7 @@ use std::path::{Path, PathBuf};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-use crate::signed::{register_key_payload, PublicKey, Signature};
+use crate::signed::{register_key_payload, rotate_key_payload, PublicKey, Signature};
 
 /// The registry's file name under the daemon's data directory.
 pub const KEY_REGISTRY_FILE: &str = "keys.jsonl";
@@ -87,6 +92,45 @@ enum Record {
     Release {
         agent: String,
     },
+    Rotate {
+        agent: String,
+        old_key: String,
+        new_key: String,
+        counter: u64,
+        signature: String,
+        proof: String,
+    },
+}
+
+/// A key rotation as the registry records it.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Rotation {
+    /// The key being replaced.
+    pub old: PublicKey,
+    /// The key replacing it.
+    pub new: PublicKey,
+    /// The signer's counter.
+    pub counter: u64,
+    /// The old key's signature over [`rotate_key_payload`].
+    pub signature: Signature,
+    /// The new key's signature over [`register_key_payload`].
+    pub proof: Signature,
+}
+
+impl Rotation {
+    /// Whether both signatures hold for `name`.
+    pub(super) fn verifies(&self, name: &str) -> bool {
+        self.old
+            .verify(
+                &rotate_key_payload(name, self.counter, &self.new),
+                &self.signature,
+            )
+            .is_ok()
+            && self
+                .new
+                .verify(&register_key_payload(name, &self.new), &self.proof)
+                .is_ok()
+    }
 }
 
 /// The on-disk key registry, with its bindings in memory for lookups.
@@ -224,6 +268,42 @@ impl KeyRing {
         Ok(())
     }
 
+    /// Replace the key bound to `name` with `rotation.new`, durably, if
+    /// `rotation.old` is the one bound now. `Ok(false)` when it is not, or the
+    /// counter is not above the binding's.
+    ///
+    /// # Errors
+    ///
+    /// The append or `fsync` failed; nothing changes in memory.
+    pub fn rotate(&self, name: &str, rotation: Rotation) -> io::Result<bool> {
+        let folded = fold(name);
+        let mut entries = self.entries.lock();
+        match entries.get(&folded) {
+            Some((_, b)) if b.key == rotation.old && rotation.counter > b.counter => {}
+            _ => return Ok(false),
+        }
+        self.append(&Record::Rotate {
+            agent: name.to_string(),
+            old_key: rotation.old.to_hex(),
+            new_key: rotation.new.to_hex(),
+            counter: rotation.counter,
+            signature: rotation.signature.to_hex(),
+            proof: rotation.proof.to_hex(),
+        })?;
+        entries.insert(
+            folded,
+            (
+                name.to_string(),
+                Bound {
+                    key: rotation.new,
+                    proof: rotation.proof,
+                    counter: rotation.counter,
+                },
+            ),
+        );
+        Ok(true)
+    }
+
     /// Delete the binding of the folded name `key`, durably.
     pub fn release(&self, key: &str) -> io::Result<()> {
         if !self.contains(key) {
@@ -288,6 +368,44 @@ fn apply(entries: &mut HashMap<String, (String, Bound)>, line: &str) -> bool {
             None => false,
         },
         Record::Release { agent } => entries.remove(&fold(&agent)).is_some(),
+        Record::Rotate {
+            agent,
+            old_key,
+            new_key,
+            counter,
+            signature,
+            proof,
+        } => {
+            let parsed = (
+                old_key.parse::<PublicKey>(),
+                new_key.parse::<PublicKey>(),
+                signature.parse::<Signature>(),
+                proof.parse::<Signature>(),
+            );
+            let (Ok(old), Ok(new), Ok(signature), Ok(proof)) = parsed else {
+                return false;
+            };
+            let rotation = Rotation {
+                old,
+                new,
+                counter,
+                signature,
+                proof,
+            };
+            match entries.get_mut(&fold(&agent)) {
+                Some((_, b))
+                    if b.key == old && counter > b.counter && rotation.verifies(&agent) =>
+                {
+                    *b = Bound {
+                        key: new,
+                        proof,
+                        counter,
+                    };
+                    true
+                }
+                _ => false,
+            }
+        }
     }
 }
 

@@ -34,6 +34,8 @@ pub fn router(bus: Ctx) -> Router {
         .route("/agents", post(register).get(list))
         .route("/agents/{agent}", delete(deregister_one))
         .route("/agents/{agent}/key", put(put_key).get(get_key))
+        .route("/agents/{agent}/key/rotate", post(rotate_key))
+        .route("/agents/{agent}/whois", get(whois))
         .route("/agents/{agent}/keypackages", put(put_key_packages))
         .route("/agents/{agent}/keypackages/take", post(take_key_package))
         .route("/messages", post(send_msg))
@@ -300,6 +302,26 @@ async fn put_key(
 async fn get_key(State(bus): State<Ctx>, path: Result<Path<String>, PathRejection>) -> Reply {
     Ok(Json(
         crate::signed_api::get_key(&bus, &path_agent(path)?).await?,
+    ))
+}
+
+/// `POST /agents/{agent}/key/rotate` `{ "new_key", "counter", "signature", "proof" }`
+/// — replace the bound key, signed by the old one.
+async fn rotate_key(
+    State(bus): State<Ctx>,
+    path: Result<Path<String>, PathRejection>,
+    body: Result<Json<Value>, JsonRejection>,
+) -> Reply {
+    let agent = path_agent(path)?;
+    Ok(Json(
+        crate::signed_api::rotate_key(&bus, &agent, &json_body(body)?).await?,
+    ))
+}
+
+/// `GET /agents/{agent}/whois` — key, fingerprint, provider, description.
+async fn whois(State(bus): State<Ctx>, path: Result<Path<String>, PathRejection>) -> Reply {
+    Ok(Json(
+        crate::signed_api::whois(&bus, &path_agent(path)?).await?,
     ))
 }
 

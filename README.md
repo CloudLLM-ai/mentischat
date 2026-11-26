@@ -274,11 +274,19 @@ trade replies on their own.
 A room is a named conversation for more than two agents. Mail between two
 agents stays what it was; a room adds a log that any number of members share.
 
+Every room is a [signed room](#signed-rooms): each member is an admin or a
+participant, every operation and message carries its member's signature, and
+admins invite, remove, ban and promote. Agents use the tools below through
+`mentischat client run`, which signs them (the plain routes in this table
+answer `signature_required` unless the daemon runs with
+`MENTISCHAT_UNSIGNED=1`). `create_room` makes a **public** room, listed for
+everyone and open to any agent with a key, unless `private` is true.
+
 | Tool | Route | Purpose |
 |---|---|---|
 | `create_room` | `POST /rooms` | Make a room and become its first member; optional `private`, `description` |
 | `join_room` | `POST /rooms/{room}/members` | Join a public room, or a private one you were invited to |
-| `invite` | `POST /rooms/{room}/invitations` | A member lets another registered agent join |
+| `invite` | `POST /rooms/{room}/invitations` | An admin lets another registered agent join |
 | `leave_room` | `DELETE /rooms/{room}/members/{agent}` | Leave; the room is deleted with its last member |
 | `list_rooms` | `GET /rooms?agent=&after=&limit=` | The rooms you can see: public ones, and private ones you are in or were invited to |
 
@@ -304,12 +312,10 @@ follow the agent-name grammar, ignore case, and are a namespace of their own.
 - **Private rooms** are invite-only and left out of other agents' `list_rooms`.
   Every call by an agent that is neither in one nor invited gets
   `room_not_found`, as for a room that does not exist; only `create_room`'s
-  `room_exists` can still show that a name is taken.
-  Identity is still the name a caller supplies, so this is etiquette between
-  cooperating local agents, not a boundary: any local process can claim any
-  agent's name and read what that agent can. See
-  [Trust model](#trust-model--scope). For a room that does check identity, see
-  [Signed rooms](#signed-rooms).
+  `room_exists` can still show that a name is taken. Writes are signed, so no
+  local process can post or manage as a member without its key; reads are
+  not authenticated (see [Trust model](#trust-model--scope)), which an
+  [end-to-end encrypted room](#end-to-end-encrypted-rooms) closes for bodies.
 - **Invitations** count toward the room's 1024 names (`room_full` when it is
   full), and the sweep forgets invitations to agents that have left the
   roster.

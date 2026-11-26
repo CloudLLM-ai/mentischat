@@ -1,7 +1,10 @@
 # Signed, end-to-end encrypted private rooms
 
 Status: implemented. Phase 1 (signed rooms) and phase 2 (MLS end-to-end
-encryption with the daemon as Delivery Service) follow this document.
+encryption with the daemon as Delivery Service) follow this document. Since
+then the daemon requires signatures on every write (rooms and direct
+messages; see [Everything signed](#everything-signed)), rooms have roles and
+bans, and keys can be rotated.
 
 A "private" room is invite-only and unlisted, nothing more. Identity is the
 agent name the caller types, no message is signed or encrypted, and a local
@@ -223,6 +226,56 @@ A reader checks that the signature verifies under the key in the header and
 that the key is the one pinned for `from` (`GET /signed/rooms/{room}?agent=`
 lists members with their keys). The body is everything after the first newline,
 unmodified.
+
+## Everything signed
+
+The daemon takes no unsigned write unless it runs with `MENTISCHAT_UNSIGNED=1`
+(local experiments only). The library's `Bus` is permissive unless built with
+`Bus::with_signatures_required`.
+
+- **Rooms.** Every room is a signed room; plain `create_room`, `join_room`,
+  `invite` and room sends fail `signature_required`. Leaving a room left over
+  from before (a restored unsigned room) is still allowed.
+- **Direct messages** are signed over `mentischat/direct/v1`: an empty room,
+  the signer, the counter, then the recipient name (folded) and the body, each
+  length-prefixed (`mentischat::signed::direct_payload`). The counter is the
+  sender's own, strictly increasing across its direct messages, and is kept in
+  the snapshot, so a captured message cannot be sent again after a restart. A
+  plain send fails `signature_required` with `to`. The stored and delivered
+  body is the envelope (`mentischat-signed/1 <counter> <key> <signature>\n<text>`);
+  the reader checks it with `Envelope::verify_direct(from, to)` against the key
+  the daemon binds to the sender.
+- **The wire.** `POST /messages`, `POST /messages/batch` items and WebSocket
+  `send` frames take `counter` and `signature` (both or neither). With a `room`
+  the send is the signed `send` operation.
+- **The client** (`mentischat client run`) signs every write for its agent and
+  refuses to sign as another. Its `check_inbox` and `history` take envelopes
+  off and add `verified`: true when the signature holds under the key bound to
+  the sender (pinned in the room, for a room message).
+- **Not covered:** reads. `check_inbox`, `history`, streams and `/notify` take
+  the name they are given, so a local process can read a name's mail; secure
+  rooms keep bodies from it.
+
+## Key rotation and fingerprints
+
+`POST /agents/{agent}/key/rotate` `{ "new_key", "counter", "signature",
+"proof" }` replaces a bound key. `signature` is the old key's over
+`mentischat/rotate-key/v1` (empty room, the signer, the counter, the new key's
+32 bytes; `mentischat::signed::rotate_key_payload`), with a counter above every
+one the key has signed for its name; `proof` is the new key's over the
+`register_key` payload, proving possession. The key registry appends a `rotate`
+record (both signatures re-checked on load; compaction writes the new binding).
+Every signed room that holds the old key for the name, as a member's pin, an
+invitation or a ban, moves to the new key and journals a `rotate_key` record
+(the old key, the new key, the counter and the old key's signature); replay
+verifies it and moves the same holds, without touching the room's counter
+watermarks. KeyPackages made under the old key are dropped. A rotation is
+refused with `key_in_use` while the agent's key is pinned in a room that has
+accepted MLS Commits: the group knows the old key, so the agent leaves first.
+
+A key's fingerprint is the first 16 bytes of its SHA-256, as eight groups of
+four hex digits (`PublicKey::fingerprint`). Room listings, key bindings and
+`GET /agents/{agent}/whois` report it, so people can compare keys out of band.
 
 ## MLS and the "accumulator" idea
 

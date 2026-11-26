@@ -599,3 +599,71 @@ impl Actor {
         bus.register_key(&name(self.name), key, &sig).await.unwrap();
     }
 }
+
+/// A participant in a public room sends at most a minute's allowance; admins
+/// and private rooms are not limited, and the window slides.
+#[tokio::test]
+async fn public_rooms_limit_how_fast_a_participant_sends() {
+    use mentischat::bus::PUBLIC_SENDS_PER_MINUTE;
+    let (_d, bus, clock) = common::bus_with_clock("roles-rate", Default::default());
+    let (alice, bob) = (Actor::new("alice", 1), Actor::new("bob", 2));
+    alice.enroll(&bus).await;
+    bob.enroll(&bus).await;
+    alice.op(&bus, "lobby", 1, create(true)).await.unwrap();
+    bob.op(&bus, "lobby", 1, SignedOp::Join).await.unwrap();
+    let mut counter = 1;
+    for _ in 0..PUBLIC_SENDS_PER_MINUTE {
+        counter += 1;
+        bob.say(&bus, "lobby", counter, "chatter").await.unwrap();
+    }
+    counter += 1;
+    let err = bob
+        .say(&bus, "lobby", counter, "one too many")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, MailboxError::RateLimited { retry_after_ms } if retry_after_ms > 0));
+    // The refused send spent no counter, and the admin is not limited.
+    for i in 0..=PUBLIC_SENDS_PER_MINUTE as u64 {
+        alice.say(&bus, "lobby", 2 + i, "admin").await.unwrap();
+    }
+    clock.advance(Duration::from_secs(61));
+    bob.say(&bus, "lobby", counter, "later").await.unwrap();
+
+    // A private room has no limit.
+    alice.op(&bus, "den", 1, create(false)).await.unwrap();
+    alice.op(&bus, "den", 2, alice.invite(&bob)).await.unwrap();
+    bob.op(&bus, "den", 1, SignedOp::Join).await.unwrap();
+    for c in 2..(PUBLIC_SENDS_PER_MINUTE as u64 + 5) {
+        bob.say(&bus, "den", c, "private").await.unwrap();
+    }
+}
+
+/// One key cannot churn in and out of a public room.
+#[tokio::test]
+async fn public_rooms_limit_how_often_a_key_joins() {
+    use mentischat::bus::PUBLIC_JOINS_PER_KEY;
+    let (_d, bus, clock) = common::bus_with_clock("roles-churn", Default::default());
+    let (alice, bob) = (Actor::new("alice", 1), Actor::new("bob", 2));
+    alice.enroll(&bus).await;
+    bob.enroll(&bus).await;
+    alice.op(&bus, "lobby", 1, create(true)).await.unwrap();
+    let mut counter = 0;
+    for _ in 0..PUBLIC_JOINS_PER_KEY {
+        bob.op(&bus, "lobby", counter + 1, SignedOp::Join)
+            .await
+            .unwrap();
+        bob.op(&bus, "lobby", counter + 2, SignedOp::Leave)
+            .await
+            .unwrap();
+        counter += 2;
+    }
+    let err = bob
+        .op(&bus, "lobby", counter + 1, SignedOp::Join)
+        .await
+        .unwrap_err();
+    assert_eq!(code(err), "rate_limited");
+    clock.advance(Duration::from_secs(61));
+    bob.op(&bus, "lobby", counter + 1, SignedOp::Join)
+        .await
+        .unwrap();
+}

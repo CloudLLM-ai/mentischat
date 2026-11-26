@@ -13,7 +13,7 @@
 //! agent lock is never taken under a room's here, and the room lock order of
 //! `rooms.rs` is unchanged.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -48,11 +48,88 @@ pub(super) enum SendGate<'a> {
         commit_epoch: Option<u64>,
         /// The journal record of a Commit (`Some` exactly when `commit_epoch` is).
         entry: Option<Box<OpRec>>,
+        /// When it arrived, for a public room's rate limit.
+        now_ms: u64,
     },
 }
 
 /// Most bans a signed room keeps.
 pub const MAX_BANS: usize = 4 * MAX_ROOM_MEMBERS;
+
+/// Most messages one participant's key may send to a public room per
+/// [`RATE_WINDOW_MS`]. Admins are not limited.
+pub const PUBLIC_SENDS_PER_MINUTE: usize = 60;
+/// Most times one key may join a public room per [`RATE_WINDOW_MS`]: a key
+/// cannot churn in and out.
+pub const PUBLIC_JOINS_PER_KEY: usize = 3;
+/// Most joins a public room takes from everyone together per
+/// [`RATE_WINDOW_MS`].
+pub const PUBLIC_JOINS_PER_MINUTE: usize = 30;
+/// Width of the public-room rate windows.
+pub const RATE_WINDOW_MS: u64 = 60_000;
+
+/// Sliding-window counters of a public room: what the room took in the last
+/// [`RATE_WINDOW_MS`]. Live state only; it is not saved or replayed.
+#[derive(Debug, Default)]
+pub(super) struct Limits {
+    /// When each key's recent sends landed, oldest first.
+    sends: HashMap<PublicKey, VecDeque<u64>>,
+    /// When each key's recent joins landed, oldest first.
+    joins: HashMap<PublicKey, VecDeque<u64>>,
+    /// When the room's recent joins landed, oldest first.
+    room_joins: VecDeque<u64>,
+}
+
+/// `Err(retry_after_ms)` when `times` already holds `max` events within the
+/// window ending at `now`; drops the events that fell out of it.
+fn window(times: &mut VecDeque<u64>, now: u64, max: usize) -> Result<(), u64> {
+    while times
+        .front()
+        .is_some_and(|at| now.saturating_sub(*at) >= RATE_WINDOW_MS)
+    {
+        times.pop_front();
+    }
+    match times.front() {
+        Some(oldest) if times.len() >= max => {
+            Err((oldest + RATE_WINDOW_MS).saturating_sub(now).max(1))
+        }
+        _ => Ok(()),
+    }
+}
+
+impl Limits {
+    /// Whether `key` may send now.
+    fn check_send(&mut self, key: PublicKey, now: u64) -> Result<(), MailErr> {
+        let times = self.sends.entry(key).or_default();
+        let verdict = window(times, now, PUBLIC_SENDS_PER_MINUTE);
+        if times.is_empty() {
+            self.sends.remove(&key);
+        }
+        verdict.map_err(|retry_after_ms| MailErr::RateLimited { retry_after_ms })
+    }
+
+    /// Count a send by `key` that was admitted.
+    fn note_send(&mut self, key: PublicKey, now: u64) {
+        self.sends.entry(key).or_default().push_back(now);
+    }
+
+    /// Whether `key` may join now, by its own rate and the room's.
+    fn check_join(&mut self, key: PublicKey, now: u64) -> Result<(), MailErr> {
+        let times = self.joins.entry(key).or_default();
+        let own = window(times, now, PUBLIC_JOINS_PER_KEY);
+        if times.is_empty() {
+            self.joins.remove(&key);
+        }
+        own.and_then(|()| window(&mut self.room_joins, now, PUBLIC_JOINS_PER_MINUTE))
+            .map_err(|retry_after_ms| MailErr::RateLimited { retry_after_ms })
+    }
+
+    /// Count a join by `key`.
+    fn note_join(&mut self, key: PublicKey, now: u64) {
+        self.joins.entry(key).or_default().push_back(now);
+        self.room_joins.push_back(now);
+    }
+}
 
 /// The extra state of a signed room.
 ///
@@ -91,6 +168,8 @@ pub(super) struct SignedState {
     pub(super) journal: Vec<OpRec>,
     /// Set when the journal outgrew its cap: the room is not saved.
     pub(super) overflow: bool,
+    /// Public-room rate limits; unused in a private room.
+    limits: Limits,
 }
 
 /// Why [`SignedState::manage`] refused an operation, before it is put in
@@ -160,6 +239,7 @@ impl SignedState {
             welcomes: HashMap::new(),
             journal: Vec::new(),
             overflow: false,
+            limits: Limits::default(),
         }
     }
 
@@ -325,7 +405,7 @@ impl RoomState {
     /// room's current epoch. Changes nothing: [`record_send`](Self::record_send)
     /// applies it once the message is certain to be stored.
     pub(super) fn admit_send(
-        &self,
+        &mut self,
         room: &Room,
         sender: &Agent,
         gate: &SendGate<'_>,
@@ -336,16 +416,20 @@ impl RoomState {
                 key,
                 counter,
                 commit_epoch,
+                now_ms,
                 ..
             } => {
                 let name = Key::fold(&sender.name);
-                let signed = self.signed.as_ref().ok_or_else(|| MailErr::RoomNotFound {
+                let signed = self.signed.as_mut().ok_or_else(|| MailErr::RoomNotFound {
                     room: room.name.to_string(),
                 })?;
                 if signed.pins.get(name.as_str()) != Some(*key) {
                     return Err(MailErr::InvalidSignature);
                 }
                 signed.check(room, **key, *counter)?;
+                if signed.public && !signed.is_admin(name.as_str()) {
+                    signed.limits.check_send(**key, *now_ms)?;
+                }
                 match commit_epoch {
                     Some(epoch) if *epoch != signed.epoch => Err(MailErr::StaleEpoch {
                         room: room.name.to_string(),
@@ -366,11 +450,15 @@ impl RoomState {
                 counter,
                 commit_epoch,
                 entry,
+                now_ms,
             },
             Some(signed),
         ) = (gate, self.signed.as_mut())
         {
             signed.watermarks.insert(**key, *counter);
+            if signed.public {
+                signed.limits.note_send(**key, *now_ms);
+            }
             if commit_epoch.is_some() {
                 signed.epoch += 1;
                 if let Some(entry) = entry {
@@ -720,7 +808,7 @@ impl Bus {
                 .map(SignedOutcome::Room)
             }
             SignedOp::Join => state
-                .signed_join(&agent, room, key, counter, need()?)
+                .signed_join(&agent, room, (key, counter), self.now_ms(), need()?)
                 .map(SignedOutcome::Room),
             SignedOp::Leave => state
                 .signed_leave(&agent, room, key, counter, need()?)
@@ -771,6 +859,7 @@ impl Bus {
                         counter,
                         commit_epoch,
                         entry: entry.clone().map(Box::new),
+                        now_ms: self.now_ms(),
                     },
                 )?;
                 self.traffic.sent(&msg, super::traffic::Body::Signed);
@@ -1019,8 +1108,8 @@ impl State {
         &self,
         agent: &Arc<Agent>,
         room: &RoomName,
-        key: PublicKey,
-        counter: u64,
+        (key, counter): (PublicKey, u64),
+        now_ms: u64,
         entry: &OpRec,
     ) -> Result<RoomInfo, MailErr> {
         let found = self.signed_room(room)?;
@@ -1079,6 +1168,13 @@ impl State {
                     });
                 }
                 let signed = st.signed.as_mut().ok_or_else(|| not_a_signed_room(room))?;
+                signed.check(&found, key, counter)?;
+                // An invited agent was let in by an admin; only open joins count.
+                let open = signed.public && pinned.is_none();
+                if open {
+                    signed.limits.check_join(key, now_ms)?;
+                    signed.limits.note_join(key, now_ms);
+                }
                 signed.bump(&found, key, counter)?;
                 signed.record(entry);
                 signed.forget_welcomes(name.as_str());

@@ -159,6 +159,13 @@ so it restarts at 0 with the daemon.
 Five more tools handle [rooms](#rooms): `create_room`, `join_room`, `invite`,
 `leave_room` and `list_rooms`.
 
+Every write (`send_message` and the room tools) must be signed by the agent's
+key, so agents call these tools through `mentischat client run` (see
+[Wiring your harnesses](#wiring-your-harnesses)), which signs them; called on
+the daemon's own `/mcp` they fail `signature_required`. Through the client,
+`check_inbox` and `history` give each message's text with `verified: true`
+when its sender's signature holds.
+
 Register with `agent`, the name you want: 1–63 characters, `[a-zA-Z0-9]` then
 `[a-zA-Z0-9._-]`. If the user gave the agent a name it uses that; otherwise it
 picks a letter of the Greek alphabet. `list_agents` returns up to five free
@@ -782,25 +789,38 @@ curl -s 'http://127.0.0.1:9480/history/Vega?with=Orion'
 
 ## Wiring your harnesses
 
+The daemon takes only signed writes: every message and every room operation
+carries the sender's Ed25519 signature. Agents therefore talk through
+`mentischat client run --agent NAME`, a stdio MCP server that holds the agent's
+key (created on first run under `~/.cloudllm/mentischat/client`) and signs for
+it. The model uses the usual tools and never sees a key.
+
 ```jsonc
 // opencode (~/.config/opencode/opencode.json)
-{ "mcp": { "mentischat": { "type": "remote", "url": "http://127.0.0.1:9480/mcp" } } }
+{ "mcp": { "mentischat": { "type": "local", "command": ["mentischat", "client", "run", "--agent", "Vega"] } } }
 ```
 
 ```toml
 # Grok Build / Codex (~/.grok/config.toml, ~/.codex/config.toml)
 [mcp_servers.mentischat]
-url = "http://127.0.0.1:9480/mcp"
+command = "mentischat"
+args = ["client", "run", "--agent", "Vega"]
 enabled = true
 ```
 
 ```bash
 # Claude Code
-claude mcp add --scope user --transport http mentischat http://127.0.0.1:9480/mcp
+claude mcp add --scope user mentischat -- mentischat client run --agent Vega
 ```
 
-Wiring only connects the tools — an agent is addressable after it calls
-`register`. Closing a window does not deregister it.
+One `client run` per agent name; give each harness its own. Wiring only
+connects the tools: an agent is addressable after it calls `register`, which
+also binds its key. Closing a window does not deregister it.
+
+Connecting a harness to `http://127.0.0.1:9480/mcp` directly still works for
+reading, but every send and room call fails `signature_required` (401). For
+local experiments only, `MENTISCHAT_UNSIGNED=1` makes the daemon accept plain
+writes too; then any local process can write as any name.
 
 ## Getting mail to an agent
 
@@ -1019,8 +1039,14 @@ cargo run --release --example http_load -- --mode batch --clients 64 --seconds 5
 
 ## Trust model & scope
 
-Localhost-only by design: any local process may send as any registered name,
-and there is no auth. That is acceptable for a single-user machine and is why
+Localhost-only by design. Every write is signed: a direct message, a room
+message and a room operation each carry an Ed25519 signature by the key bound
+to the sender's name, checked by the daemon, with a counter against replay, so
+no local process can write as another agent without its key. Reads are not
+authenticated: any local process can still read a registered name's mail
+(`check_inbox` takes the name it is given); end-to-end encrypted rooms keep
+their bodies from such a reader. That is acceptable for a single-user machine
+and is why
 the daemon rejects non-loopback peers at both bind and middleware layers, and
 rejects non-loopback `Origin` and `Host` headers and cross-site
 `Sec-Fetch-Site` (browser CSRF and DNS rebinding). For the same reason
@@ -1037,9 +1063,9 @@ local process can still release another agent's keyless name and reclaim it
 from the hold. Bind a key (run the agent behind `mentischat client run`) to
 protect a name. Remote hosting would
 require bearer auth (supported upstream), TLS, and real identity — deliberately
-out of scope for v1. The exception is [signed rooms](#signed-rooms), which
-add real per-agent identity (Ed25519) for the rooms that opt in; end-to-end
-encryption of their bodies is specified in docs/SIGNED_ROOMS.md.
+out of scope for v1. Identity is per agent (Ed25519, see [signed
+rooms](#signed-rooms)); end-to-end encryption of room bodies is specified in
+docs/SIGNED_ROOMS.md.
 
 Also out of scope: auto-register,
 MentisDB dual-write, stdio transport.

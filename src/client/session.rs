@@ -998,6 +998,137 @@ impl Client {
         Ok(stale)
     }
 
+    /// Send `body` to the agent `to` as a signed direct message.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Daemon`] (`unregistered`, `queue_full`, ...).
+    pub async fn send_direct(&mut self, to: &str, body: &str) -> Result<Value, ClientError> {
+        for attempt in 0..2 {
+            let counter = self.next_counter();
+            let sig = self.identity.keypair().sign(&crate::signed::direct_payload(
+                self.agent(),
+                to,
+                counter,
+                body,
+            ));
+            let request = json!({
+                "from": self.agent(), "to": to, "body": body,
+                "counter": counter, "signature": sig.to_hex(),
+            });
+            match self.daemon.call("POST", "/messages", Some(&request)).await {
+                Err(ClientError::Daemon { code, body, .. })
+                    if code == "stale_counter" && attempt == 0 =>
+                {
+                    let last = body.get("last").and_then(Value::as_u64).unwrap_or(0);
+                    self.last_counter = self.last_counter.max(last);
+                }
+                other => return other,
+            }
+        }
+        Err(ClientError::Transport("counter kept falling behind".into()))
+    }
+
+    /// Create the signed room `room` that is not end-to-end encrypted: every
+    /// operation and message is signed, bodies are plain text to the daemon.
+    /// `public` lists it and lets any agent with a key join.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Daemon`] (`room_exists`, `key_required`).
+    pub async fn create_signed_room(
+        &mut self,
+        room: &str,
+        description: &str,
+        public: bool,
+    ) -> Result<Value, ClientError> {
+        let op = SignedOp::Create {
+            description: description.to_string(),
+            public,
+        };
+        self.post_op(room, op).await
+    }
+
+    /// Invite `invitee` to a signed room that is not end-to-end encrypted,
+    /// pinning the key the daemon has bound to it (admins only).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Usage`] when `invitee` has no key;
+    /// [`ClientError::Daemon`] (`not_an_admin`, `banned`).
+    pub async fn invite_signed(&mut self, room: &str, invitee: &str) -> Result<Value, ClientError> {
+        let invitee_key = self.registered_key(invitee).await?;
+        let op = SignedOp::Invite {
+            invitee: invitee.to_string(),
+            invitee_key,
+        };
+        self.post_op(room, op).await
+    }
+
+    /// Join a signed room that is not end-to-end encrypted: a public one, or a
+    /// private one this client was invited to.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Daemon`] (`room_not_found`, `banned`, `rate_limited`).
+    pub async fn join_signed(&mut self, room: &str) -> Result<Value, ClientError> {
+        self.post_op(room, SignedOp::Join).await
+    }
+
+    /// Leave a signed room that is not end-to-end encrypted.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Daemon`] (`room_not_found`).
+    pub async fn leave_signed(&mut self, room: &str) -> Result<Value, ClientError> {
+        self.post_op(room, SignedOp::Leave).await
+    }
+
+    /// Send `text` to a signed room that is not end-to-end encrypted.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Daemon`] (`not_a_member`, `rate_limited`).
+    pub async fn send_signed(&mut self, room: &str, text: &str) -> Result<Value, ClientError> {
+        let op = SignedOp::Send {
+            body: text.to_string(),
+        };
+        self.post_op(room, op).await
+    }
+
+    /// Remove `target` from a signed room that is not end-to-end encrypted
+    /// (admins only). In a secure room use [`remove_member`](Self::remove_member).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Daemon`] (`not_an_admin`, `not_a_member`).
+    pub async fn remove_signed(&mut self, room: &str, target: &str) -> Result<Value, ClientError> {
+        let op = SignedOp::Remove {
+            target: target.to_string(),
+        };
+        self.post_op(room, op).await
+    }
+
+    /// The daemon's view of a signed room this client is in: members with
+    /// their keys, fingerprints and roles, admins, bans.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Daemon`] (`room_not_found`, `not_a_member`).
+    pub async fn room(&self, room: &str) -> Result<Value, ClientError> {
+        self.room_info(room).await
+    }
+
+    /// Who holds the name `agent`: key, fingerprint, provider, description.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Daemon`] (`unregistered`).
+    pub async fn whois(&self, agent: &str) -> Result<Value, ClientError> {
+        let path = format!("/agents/{}/whois", query_escape(agent));
+        self.daemon.call("GET", &path, None).await
+    }
+
     /// Make the member `target` an admin of the room (admins only).
     ///
     /// # Errors

@@ -84,9 +84,12 @@ async fn world() -> World {
 async fn world_with_capacity(capacity: usize) -> World {
     let dir = tempfile::tempdir().unwrap();
     let bus = Arc::new(
+        // As the daemon runs: every write must be signed, so everything the
+        // harness does goes through the proxy's signatures.
         Bus::new(&dir.path().join("daemon"))
             .unwrap()
-            .with_room_capacity(capacity),
+            .with_room_capacity(capacity)
+            .with_signatures_required(),
     );
     let app = mentischat::build_router(bus.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -247,44 +250,106 @@ async fn two_harnesses_converse_in_a_secure_room_with_the_usual_tools() {
     assert_eq!(page["messages"][0]["body"], "Reply when you can: noted");
 }
 
-/// Ordinary rooms and direct mail pass through the proxy exactly as they do
-/// without it, alongside a secure room.
+/// Rooms that are not secure and direct mail are signed by the proxy: the
+/// harness uses the usual tools with no keys, the daemon (which takes nothing
+/// unsigned) accepts them, and the reader sees plain text marked `verified`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn plain_rooms_and_direct_mail_pass_straight_through() {
+async fn rooms_and_direct_mail_are_signed_for_the_harness() {
     let w = world().await;
-    let (mut alice, mut bob) = (w.harness("alice"), w.harness("bob"));
-    alice.tool("register", json!({ "agent": "alice" })).await;
-    bob.tool("register", json!({ "agent": "bob" })).await;
+    let (mut alice, mut bob, mut carol) =
+        (w.harness("alice"), w.harness("bob"), w.harness("carol"));
+    for (h, n) in [
+        (&mut alice, "alice"),
+        (&mut bob, "bob"),
+        (&mut carol, "carol"),
+    ] {
+        let (err, v) = h.tool("register", json!({ "agent": n })).await;
+        assert!(!err, "{v}");
+    }
     let (err, room) = alice
         .tool("create_room", json!({ "agent": "alice", "room": "lobby" }))
         .await;
     assert!(!err, "{room}");
     assert!(
         room.get("secure").is_none(),
-        "a plain room is not marked: {room}"
+        "a room that is not secure is not marked: {room}"
     );
-    bob.tool("join_room", json!({ "agent": "bob", "room": "lobby" }))
+    assert_eq!(room["private"], false);
+    let (err, v) = bob
+        .tool("join_room", json!({ "agent": "bob", "room": "lobby" }))
         .await;
-    alice
+    assert!(!err, "{v}");
+    let (err, v) = alice
         .tool(
             "send_message",
             json!({ "from": "alice", "room": "lobby", "body": "hello lobby" }),
         )
         .await;
-    alice
+    assert!(!err, "{v}");
+    let (err, v) = alice
         .tool(
             "send_message",
             json!({ "from": "alice", "to": "bob", "body": "hello bob" }),
         )
         .await;
+    assert!(!err, "{v}");
     let (_, page) = bob.tool("check_inbox", json!({ "agent": "bob" })).await;
-    let bodies: Vec<&str> = page["messages"]
+    let seen: Vec<(&str, bool)> = page["messages"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|m| m["body"].as_str().unwrap())
+        .map(|m| (m["body"].as_str().unwrap(), m["verified"] == true))
         .collect();
-    assert_eq!(bodies, ["hello lobby", "hello bob"]);
+    assert_eq!(seen, [("hello lobby", true), ("hello bob", true)]);
+
+    // History shows the same text, checked, for both kinds.
+    let (_, page) = bob
+        .tool("history", json!({ "agent": "bob", "room": "lobby" }))
+        .await;
+    assert_eq!(page["messages"][0]["body"], "hello lobby");
+    assert_eq!(page["messages"][0]["verified"], true);
+
+    // A private room: the admin invites through the proxy, the invitee joins.
+    let (err, v) = alice
+        .tool(
+            "create_room",
+            json!({ "agent": "alice", "room": "den", "private": true }),
+        )
+        .await;
+    assert!(!err, "{v}");
+    let (err, v) = carol
+        .tool("join_room", json!({ "agent": "carol", "room": "den" }))
+        .await;
+    assert!(err, "not invited yet: {v}");
+    let (err, v) = alice
+        .tool(
+            "invite",
+            json!({ "agent": "alice", "room": "den", "invitee": "carol" }),
+        )
+        .await;
+    assert!(!err, "{v}");
+    let (err, v) = carol
+        .tool("join_room", json!({ "agent": "carol", "room": "den" }))
+        .await;
+    assert!(!err, "{v}");
+    // A participant cannot invite.
+    let (err, v) = carol
+        .tool(
+            "invite",
+            json!({ "agent": "carol", "room": "den", "invitee": "bob" }),
+        )
+        .await;
+    assert!(err);
+    assert_eq!(v["error"], "not_an_admin");
+
+    // The proxy signs only as its own agent.
+    let (err, v) = alice
+        .tool(
+            "send_message",
+            json!({ "from": "bob", "to": "carol", "body": "as bob" }),
+        )
+        .await;
+    assert!(err, "{v}");
 
     // A secure room next to them leaves them alone.
     alice
@@ -301,6 +366,30 @@ async fn plain_rooms_and_direct_mail_pass_straight_through() {
         .await;
     let (_, page) = bob.tool("check_inbox", json!({ "agent": "bob" })).await;
     assert_eq!(page["messages"][0]["body"], "still direct");
+    assert_eq!(page["messages"][0]["verified"], true);
+}
+
+/// Without the proxy, a harness talking to the daemon directly cannot write:
+/// plain sends and rooms are refused with `signature_required`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_the_proxy_nothing_unsigned_is_accepted() {
+    let w = world().await;
+    let mut alice = w.harness("alice");
+    alice.tool("register", json!({ "agent": "alice" })).await;
+    w.bus
+        .register(&mentischat::names::AgentName::parse("mallory").unwrap())
+        .await
+        .unwrap();
+    let err = w
+        .bus
+        .send(
+            &mentischat::names::AgentName::parse("mallory").unwrap(),
+            &mentischat::names::AgentName::parse("alice").unwrap(),
+            "pretend".into(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "signature_required");
 }
 
 /// The harness never receives anything that looks like key material or

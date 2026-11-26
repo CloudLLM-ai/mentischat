@@ -1,5 +1,25 @@
 UNRELEASED
 
+  - feat(signing): everything is signed. The daemon takes no unsigned writes:
+    a plain `send_message`, `create_room`, `join_room`, `invite` or room send
+    fails `signature_required` (401; with `to` for a direct message).
+    Direct messages are signed too, over `mentischat/direct/v1` (sender,
+    recipient, a per-sender counter kept across restarts, body), and arrive as
+    an envelope the reader checks with `Envelope::verify_direct`.
+    `POST /messages`, `POST /messages/batch` and WebSocket send frames take
+    `counter` and `signature`; with a `room` they are the signed `send`.
+    Agents talk through `mentischat client run`, which now signs every write
+    for its agent: direct messages, and `create_room` (public unless `private`),
+    `join_room`, `invite`, `leave_room` and room messages as signed room
+    operations, and refuses to sign as anyone else. Its `check_inbox` and
+    `history` take each envelope off, so the model reads the sender's text, and
+    add `verified`, true when the signature holds under the key the daemon
+    binds to the sender. `MENTISCHAT_UNSIGNED=1` accepts plain writes again,
+    for local experiments only (the load examples use it). Library users opt in
+    with `Bus::with_signatures_required`; `Bus::send_signed` sends a signed
+    direct message. The live view previews the text of signed messages, never
+    end-to-end encrypted ciphertext. Reads are not authenticated.
+
   - feat(rooms): rate limits in public signed rooms. A participant's key sends
     at most 60 messages a minute (`PUBLIC_SENDS_PER_MINUTE`), a key joins at
     most 3 times a minute (`PUBLIC_JOINS_PER_KEY`), and a room takes at most 30

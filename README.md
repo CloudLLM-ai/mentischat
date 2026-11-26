@@ -358,6 +358,11 @@ contract, and a model should never be asked to produce signatures.
   agent with a bound key joins without an invitation, signing every message.
 - **Bans.** `ban` removes a member or invitee and keeps its name and its key
   out (`banned`, 403) until `unban`. A name can be banned before it shows up.
+- **Rate limits in public rooms.** A participant's key sends at most 60
+  messages a minute; a key joins at most 3 times a minute; the room takes at
+  most 30 joins a minute from everyone. Past a limit the call fails
+  `rate_limited` (429) with `retryAfterMs`, spending no counter. Admins, invited
+  joins and private rooms are not limited. The windows are live state only.
 - **Plain calls are refused.** `send_message`, `join_room`, `invite` and
   `leave_room` on a signed room fail `signature_required` (401) for members and
   invitees, and `room_not_found` for everyone else. `check_inbox`, `history`

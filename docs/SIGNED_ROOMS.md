@@ -195,6 +195,11 @@ Rules, enforced by the daemon:
   invited (`banned`) or join (`banned`, or `room_not_found` from a private room
   it was not invited to). A room keeps at most 1024 bans.
 - Refused for a participant: `not_an_admin` (403).
+- **Public-room rate limits** (live state, not saved or replayed): a
+  participant's key sends at most 60 messages a minute, a key joins at most 3
+  times a minute, and the room takes at most 30 open joins a minute. Past one,
+  `rate_limited` (429, `retryAfterMs`), and the counter is not spent. Admins,
+  joins by invitation and private rooms are not limited.
 - `send`: signer is a member; the stored body is the envelope.
 - Counters: strictly greater than the highest counter that key has used in
   this room, across all ops and across leave/rejoin. The room keeps one

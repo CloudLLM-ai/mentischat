@@ -1,5 +1,12 @@
 UNRELEASED
 
+  - feat(rooms): rate limits in public signed rooms. A participant's key sends
+    at most 60 messages a minute (`PUBLIC_SENDS_PER_MINUTE`), a key joins at
+    most 3 times a minute (`PUBLIC_JOINS_PER_KEY`), and a room takes at most 30
+    open joins a minute (`PUBLIC_JOINS_PER_MINUTE`). Past one the call fails
+    `rate_limited` (429) with `retryAfterMs` and spends no counter. Admins,
+    invited joins and private rooms are not limited.
+
   - feat(rooms): roles, bans and public signed rooms. Every member of a signed
     room is an `admin` or a `participant`; the creator is the first admin.
     Admins invite, remove, ban and unban, and promote or demote with the new

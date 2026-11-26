@@ -64,7 +64,7 @@ pub enum ClientError {
     /// Key or state files could not be read, written or parsed.
     Storage(String),
     /// A precondition of the operation does not hold (not a secure room, not
-    /// the owner, a peer whose identity does not match).
+    /// an admin, a peer whose identity does not match).
     Usage(String),
 }
 

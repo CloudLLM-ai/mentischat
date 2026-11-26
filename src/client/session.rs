@@ -134,7 +134,8 @@ struct RoomLog {
     readd_requested_ms: u64,
     /// Highest daemon message id already processed.
     last_id: u64,
-    /// This client created the room (and so may remove members).
+    /// This client created the room. Kept so saved state still loads; roles
+    /// come from the daemon (`admins`).
     owner: bool,
     /// A Commit removed this client, or it left: the group is dead.
     ended: bool,
@@ -246,10 +247,17 @@ impl Client {
         self.identity.public()
     }
 
-    /// Whether this client created `room` (and so may remove members and is
-    /// the one asked to re-add members that fell behind).
-    pub fn owns(&self, room: &str) -> bool {
-        self.rooms.get(&folded(room)).is_some_and(|r| r.owner)
+    /// Whether this client is an admin of `room`, as the daemon says (and so
+    /// may remove members, and answers re-add requests from members that fell
+    /// behind).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Daemon`].
+    pub async fn is_admin(&self, room: &str) -> Result<bool, ClientError> {
+        let info = self.room_info(room).await?;
+        let admin = admins(&info).any(|a| a.eq_ignore_ascii_case(self.agent()));
+        Ok(admin)
     }
 
     /// True at most once per `every` for `room`: whether a re-add request
@@ -266,23 +274,18 @@ impl Client {
         self.persist().is_ok()
     }
 
-    /// The name of the member whose key is the room's owner key, as the daemon
-    /// lists it; `None` when the owner has left.
+    /// An admin of the room other than this client, as the daemon lists them:
+    /// the one to ask for a re-add. `None` when this client is the only one.
     ///
     /// # Errors
     ///
     /// [`ClientError::Daemon`].
-    pub async fn owner_name(&self, room: &str) -> Result<Option<String>, ClientError> {
+    pub async fn admin_name(&self, room: &str) -> Result<Option<String>, ClientError> {
         let info = self.room_info(room).await?;
-        let Some(owner) = info["owner"].as_str() else {
-            return Ok(None);
-        };
-        Ok(info["members"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .find(|m| m["publicKey"] == owner)
-            .and_then(|m| m["agent"].as_str().map(str::to_string)))
+        let other = admins(&info)
+            .find(|a| !a.eq_ignore_ascii_case(self.agent()))
+            .map(str::to_string);
+        Ok(other)
     }
 
     /// Whether `room` is one of this client's secure rooms.
@@ -494,7 +497,13 @@ impl Client {
                 "counter": counter, "signature": sig.to_hex(),
             });
             match &op {
-                SignedOp::Create { description } => body["description"] = json!(description),
+                SignedOp::Create {
+                    description,
+                    public,
+                } => {
+                    body["description"] = json!(description);
+                    body["public"] = json!(public);
+                }
                 SignedOp::Invite {
                     invitee,
                     invitee_key,
@@ -502,7 +511,14 @@ impl Client {
                     body["invitee"] = json!(invitee);
                     body["invitee_key"] = json!(invitee_key.to_hex());
                 }
-                SignedOp::Remove { target } => body["target"] = json!(target),
+                SignedOp::Remove { target }
+                | SignedOp::Promote { target }
+                | SignedOp::Demote { target }
+                | SignedOp::Unban { target } => body["target"] = json!(target),
+                SignedOp::Ban { target, target_key } => {
+                    body["target"] = json!(target);
+                    body["target_key"] = json!(target_key.map(|k| k.to_hex()));
+                }
                 SignedOp::Send { body: text } => body["body"] = json!(text),
                 SignedOp::Welcome { target, welcome } => {
                     body["target"] = json!(target);
@@ -563,7 +579,7 @@ impl Client {
     }
 
     /// Create the secure room `room` (signed, private, end-to-end encrypted)
-    /// with this client as its first member and owner.
+    /// with this client as its first member and admin.
     ///
     /// # Errors
     ///
@@ -571,6 +587,7 @@ impl Client {
     pub async fn create_room(&mut self, room: &str, description: &str) -> Result<(), ClientError> {
         let op = SignedOp::Create {
             description: description.to_string(),
+            public: false,
         };
         self.post_op(room, op).await?;
         let config = MlsGroupCreateConfig::builder()
@@ -656,7 +673,7 @@ impl Client {
     /// Commits the removal of the member's old leaf if it has one, then adds it
     /// again from a fresh KeyPackage and leaves it a Welcome, which it picks up
     /// with [`join_room`](Self::join_room). Any member may do it; the proxy has
-    /// the owner do it on request.
+    /// an admin do it on request.
     ///
     /// # Errors
     ///
@@ -889,18 +906,18 @@ impl Client {
         Ok(())
     }
 
-    /// Remove `target` from the room (owner only): commit its removal from the
+    /// Remove `target` from the room (admins only): commit its removal from the
     /// MLS group first, so it cannot read what follows, then remove it from the
     /// daemon's membership.
     ///
     /// # Errors
     ///
-    /// [`ClientError::Usage`] when this client is not the owner or `target` is
-    /// not in the group; the daemon and MLS errors of [`add_member`](Self::add_member).
+    /// [`ClientError::Usage`] when this client is not an admin; the daemon and
+    /// MLS errors of [`add_member`](Self::add_member).
     pub async fn remove_member(&mut self, room: &str, target: &str) -> Result<(), ClientError> {
-        if !self.rooms.get(&folded(room)).is_some_and(|r| r.owner) {
+        if !self.is_admin(room).await? {
             return Err(ClientError::Usage(
-                "only the room's owner removes members".into(),
+                "only the room's admins remove members".into(),
             ));
         }
         self.commit_removal(room, target).await?;
@@ -947,15 +964,16 @@ impl Client {
         })
     }
 
-    /// Owner only: remove from the MLS group every member the daemon no longer
-    /// lists (members that left or were dropped), so they lose access to what
-    /// follows. Invitees that have not joined yet are kept.
+    /// Admins only: remove from the MLS group every member the daemon no longer
+    /// lists (members that left, were removed or banned, or were dropped), so
+    /// they lose access to what follows. Invitees that have not joined yet are
+    /// kept.
     ///
     /// # Errors
     ///
     /// As [`remove_member`](Self::remove_member).
     pub async fn prune(&mut self, room: &str) -> Result<Vec<String>, ClientError> {
-        if !self.rooms.get(&folded(room)).is_some_and(|r| r.owner) {
+        if !self.is_admin(room).await? {
             return Ok(Vec::new());
         }
         self.sync(room).await?;
@@ -980,8 +998,75 @@ impl Client {
         Ok(stale)
     }
 
+    /// Make the member `target` an admin of the room (admins only).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Daemon`] (`not_an_admin`, `not_a_member`).
+    pub async fn promote(&mut self, room: &str, target: &str) -> Result<Value, ClientError> {
+        let op = SignedOp::Promote {
+            target: target.to_string(),
+        };
+        self.post_op(room, op).await
+    }
+
+    /// Make the admin `target` a participant (admins only; an admin may demote
+    /// itself).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Daemon`] (`not_an_admin`, `not_a_member`).
+    pub async fn demote(&mut self, room: &str, target: &str) -> Result<Value, ClientError> {
+        let op = SignedOp::Demote {
+            target: target.to_string(),
+        };
+        self.post_op(room, op).await
+    }
+
+    /// Ban `target` from the room (admins only): it is removed if it is a
+    /// member or invitee, and neither its name nor the key bound to it may
+    /// join again until [`unban`](Self::unban). In a secure room its leaf is
+    /// committed out of the MLS group first, so it cannot read what follows.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Daemon`] (`not_an_admin`, `key_conflict`, `room_full`),
+    /// and in a secure room the MLS errors of [`add_member`](Self::add_member).
+    pub async fn ban(&mut self, room: &str, target: &str) -> Result<Value, ClientError> {
+        let target_key = match self.registered_key(target).await {
+            Ok(key) => Some(key),
+            Err(ClientError::Usage(_)) => None,
+            Err(ClientError::Daemon { code, .. }) if code == "unregistered" => None,
+            Err(e) => return Err(e),
+        };
+        if self.is_secure(room) {
+            if !self.is_admin(room).await? {
+                return Err(ClientError::Usage("only the room's admins ban".into()));
+            }
+            self.commit_removal(room, target).await?;
+        }
+        let op = SignedOp::Ban {
+            target: target.to_string(),
+            target_key,
+        };
+        self.post_op(room, op).await
+    }
+
+    /// Lift the ban on `target` (admins only).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Daemon`] (`not_an_admin`, `not_a_member` when it is not
+    /// banned).
+    pub async fn unban(&mut self, room: &str, target: &str) -> Result<Value, ClientError> {
+        let op = SignedOp::Unban {
+            target: target.to_string(),
+        };
+        self.post_op(room, op).await
+    }
+
     /// Leave the room: a signed `leave` at the daemon and the local group is
-    /// closed. The owner's next [`prune`](Self::prune) takes the departed
+    /// closed. An admin's next [`prune`](Self::prune) takes the departed
     /// leaf out of the MLS group.
     ///
     /// # Errors
@@ -1452,4 +1537,13 @@ fn check_sender(processed: &ProcessedMessage, from: &str) -> Result<(), ClientEr
             "message from {from} is authenticated as another member"
         )))
     }
+}
+
+/// The admin names a room listing (`GET /signed/rooms/{room}`) gives.
+fn admins(info: &Value) -> impl Iterator<Item = &str> {
+    info["admins"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
 }

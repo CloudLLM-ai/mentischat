@@ -73,8 +73,21 @@ fn op_body(keys: &Keypair, agent: &str, room: &str, counter: u64, op: &SignedOp)
             v["invitee"] = json!(invitee);
             v["invitee_key"] = json!(invitee_key.to_hex());
         }
-        SignedOp::Remove { target } => v["target"] = json!(target),
-        SignedOp::Create { description } => v["description"] = json!(description),
+        SignedOp::Remove { target }
+        | SignedOp::Promote { target }
+        | SignedOp::Demote { target }
+        | SignedOp::Unban { target } => v["target"] = json!(target),
+        SignedOp::Ban { target, target_key } => {
+            v["target"] = json!(target);
+            v["target_key"] = json!(target_key.map(|k| k.to_hex()));
+        }
+        SignedOp::Create {
+            description,
+            public,
+        } => {
+            v["description"] = json!(description);
+            v["public"] = json!(public);
+        }
         SignedOp::Welcome { target, welcome } => {
             v["target"] = json!(target);
             v["welcome"] = json!(mentischat::signed::hex_encode(welcome));
@@ -130,6 +143,7 @@ async fn a_signed_conversation_over_rest() {
 
     let create = SignedOp::Create {
         description: "ops room".into(),
+        public: false,
     };
     let (s, v) = call(
         &app,
@@ -214,6 +228,7 @@ async fn malformed_signed_requests_are_client_errors() {
         1,
         &SignedOp::Create {
             description: String::new(),
+            public: false,
         },
     );
 

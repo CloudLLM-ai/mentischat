@@ -130,6 +130,11 @@ fn parse_op(params: &Value) -> Result<SignedOp, MailboxError> {
                 Some(Value::String(s)) => s.clone(),
                 Some(_) => return Err(MailboxError::InvalidDescription),
             },
+            public: match params.get("public") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(b)) => *b,
+                Some(_) => return Err(MailboxError::InvalidBody),
+            },
         },
         OpKind::Invite => SignedOp::Invite {
             invitee: own("invitee")?,
@@ -138,6 +143,22 @@ fn parse_op(params: &Value) -> Result<SignedOp, MailboxError> {
         OpKind::Join => SignedOp::Join,
         OpKind::Leave => SignedOp::Leave,
         OpKind::Remove => SignedOp::Remove {
+            target: own("target")?,
+        },
+        OpKind::Promote => SignedOp::Promote {
+            target: own("target")?,
+        },
+        OpKind::Demote => SignedOp::Demote {
+            target: own("target")?,
+        },
+        OpKind::Ban => SignedOp::Ban {
+            target: own("target")?,
+            target_key: match params.get("target_key") {
+                None | Some(Value::Null) => None,
+                Some(_) => Some(public_key(params, "target_key")?),
+            },
+        },
+        OpKind::Unban => SignedOp::Unban {
             target: own("target")?,
         },
         OpKind::Send => SignedOp::Send { body: own("body")? },
@@ -151,8 +172,9 @@ fn parse_op(params: &Value) -> Result<SignedOp, MailboxError> {
 
 /// `POST /signed/ops`: one signed room operation. `agent`, `room`, `op`,
 /// `counter` and `signature` are required, plus the fields the op signs:
-/// `description` (create, optional), `invitee` and `invitee_key` (invite),
-/// `target` (remove), `body` (send).
+/// `description` and `public` (create, both optional), `invitee` and
+/// `invitee_key` (invite), `target` (remove, promote, demote, ban, unban),
+/// `target_key` (ban, optional), `body` (send).
 ///
 /// # Errors
 ///

@@ -88,6 +88,7 @@ impl Actor {
 fn create_op() -> SignedOp {
     SignedOp::Create {
         description: String::new(),
+        public: false,
     }
 }
 
@@ -453,7 +454,7 @@ async fn signed_messages_arrive_as_verifiable_envelopes() {
         .unwrap();
     let alice_entry = info.members.iter().find(|m| m.agent == "alice").unwrap();
     assert_eq!(alice_entry.public_key, env.key.to_hex());
-    assert_eq!(info.owner, Some(alice.keys.public().to_hex()));
+    assert_eq!(info.admins, ["alice"]);
     assert_eq!(
         info.members
             .iter()
@@ -783,10 +784,10 @@ async fn a_valid_signature_does_not_make_a_stranger_a_member() {
     assert_eq!(code(err), "room_not_found");
 }
 
-/// Only the owner removes; the removed member stops receiving and cannot
-/// send; the owner cannot remove itself.
+/// Only an admin removes; the removed member stops receiving and cannot
+/// send; an admin cannot remove itself.
 #[tokio::test]
-async fn only_the_owner_removes_and_the_removed_are_out() {
+async fn only_an_admin_removes_and_the_removed_are_out() {
     let (_d, bus) = fresh_bus("remove");
     let (alice, bob) = alice_and_bob(&bus).await;
     let carol = Actor::new("carol", 3);
@@ -802,7 +803,7 @@ async fn only_the_owner_removes_and_the_removed_are_out() {
         .do_op(&bus, "ops", 2, remove("carol"))
         .await
         .unwrap_err();
-    assert_eq!(code(err), "not_a_member", "a plain member cannot remove");
+    assert_eq!(code(err), "not_an_admin", "a participant cannot remove");
     let err = alice
         .do_op(&bus, "ops", 4, remove("alice"))
         .await
@@ -810,7 +811,7 @@ async fn only_the_owner_removes_and_the_removed_are_out() {
     assert_eq!(
         code(err),
         "not_a_member",
-        "the owner leaves rather than removes itself"
+        "an admin leaves rather than removes itself"
     );
 
     alice.do_op(&bus, "ops", 5, remove("bob")).await.unwrap();
@@ -882,9 +883,10 @@ async fn leaving_is_signed_and_the_last_member_deletes_the_room() {
         .unwrap();
 }
 
-/// When the owner leaves nobody holds removal rights; the room carries on.
+/// When the last admin leaves, the member seated longest becomes the admin;
+/// the room carries on and can still be managed.
 #[tokio::test]
-async fn an_ownerless_room_keeps_working_but_cannot_remove() {
+async fn the_longest_seated_member_is_admin_once_the_last_admin_leaves() {
     let (_d, bus) = fresh_bus("ownerless");
     let (alice, bob) = alice_and_bob(&bus).await;
     alice.do_op(&bus, "ops", 3, SignedOp::Leave).await.unwrap();
@@ -892,8 +894,9 @@ async fn an_ownerless_room_keeps_working_but_cannot_remove() {
         .signed_room_info(&name("bob"), &room("ops"))
         .await
         .unwrap();
-    assert_eq!(info.owner, None);
+    assert_eq!(info.admins, ["bob"]);
     bob.say(&bus, "ops", 2, "carrying on").await.unwrap();
+    // Alice is gone, so there is nobody to remove.
     let err = bob
         .do_op(
             &bus,

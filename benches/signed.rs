@@ -83,6 +83,7 @@ fn room_pair(rt: &tokio::runtime::Runtime, dir: &std::path::Path) -> (Bus, Keypa
         };
         let create = SignedOp::Create {
             description: String::new(),
+            public: false,
         };
         bus.signed_op(op("alice", &keys, 1, create))
             .await

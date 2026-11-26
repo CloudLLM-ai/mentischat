@@ -83,6 +83,7 @@ fn vectors() -> Vec<(&'static str, Vec<u8>, String)> {
             "create",
             SignedOp::Create {
                 description: "the den".into(),
+                public: false,
             }
             .payload(room, agent, counter),
         ),

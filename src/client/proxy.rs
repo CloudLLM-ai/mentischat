@@ -21,9 +21,9 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::{Client, ClientError, Daemon, UpdatePolicy};
 
-/// How often a client that fell behind asks the owner to re-add it.
+/// How often a client that fell behind asks an admin to re-add it.
 const READD_REQUEST_EVERY: std::time::Duration = std::time::Duration::from_secs(5 * 60);
-/// Body prefix of the direct message asking a room's owner for a re-add.
+/// Body prefix of the direct message asking a room's admin for a re-add.
 pub const READD_REQUEST_PREFIX: &str = "mentischat/readd ";
 
 /// MCP protocol version answered when the client names none.
@@ -41,9 +41,9 @@ const INSTRUCTIONS: &str = "This is the mentischat mailbox through a local clien
 ///
 /// A client that missed Commits past the daemon's retention
 /// ([`ClientError::Behind`]) is brought back automatically: it sends the room's
-/// owner a direct message `mentischat/readd <room>`, the owner's proxy
+/// admin a direct message `mentischat/readd <room>`, the admin's proxy
 /// consumes it (the harness never sees it) and re-adds the sender, and the
-/// sender's next `check_inbox` joins from the Welcome the owner left.
+/// sender's next `check_inbox` joins from the Welcome the admin left.
 ///
 /// # Errors
 ///
@@ -395,7 +395,7 @@ async fn join(client: &mut Client, daemon: Daemon, args: &Value) -> Value {
 }
 
 /// Bring one secure room up to date: sync, recover if the client fell behind,
-/// prune departed members (owner), and refresh the key if the policy says so.
+/// prune departed members (admins), and refresh the key if the policy says so.
 /// A failure here must not hide the rest of the inbox, so it is only logged.
 ///
 /// Returns a warning for the harness when the daemon showed an older room than
@@ -431,8 +431,8 @@ async fn refresh_room(
     None
 }
 
-/// A client that fell behind: join from a Welcome if the owner has left one,
-/// otherwise ask the owner (by direct message, at most every few minutes).
+/// A client that fell behind: join from a Welcome if an admin has left one,
+/// otherwise ask an admin (by direct message, at most every few minutes).
 async fn recover(client: &mut Client, daemon: Daemon, room: &str) {
     match client.join_room(room).await {
         Ok(()) => return tracing::info!(room = %room, "re-added to secure room"),
@@ -442,22 +442,22 @@ async fn recover(client: &mut Client, daemon: Daemon, room: &str) {
     if !client.readd_due(room, READD_REQUEST_EVERY) {
         return;
     }
-    match client.owner_name(room).await {
-        Ok(Some(owner)) => {
+    match client.admin_name(room).await {
+        Ok(Some(admin)) => {
             let args = json!({
-                "from": client.agent(), "to": owner,
+                "from": client.agent(), "to": admin,
                 "body": format!("{READD_REQUEST_PREFIX}{room}"),
             });
             forward(daemon, "send_message", &args).await;
         }
-        Ok(None) => tracing::warn!(room = %room, "the room has no owner to ask for a re-add"),
-        Err(e) => tracing::warn!(room = %room, error = %e, "could not find the room's owner"),
+        Ok(None) => tracing::warn!(room = %room, "the room has no other admin to ask for a re-add"),
+        Err(e) => tracing::warn!(room = %room, error = %e, "could not find the room's admins"),
     }
 }
 
-/// Handle re-add requests among the forwarded direct messages: the owner of the
+/// Handle re-add requests among the forwarded direct messages: an admin of the
 /// room re-adds the sender, and the request is dropped from what the harness
-/// sees. A request for a room this client does not own is left alone.
+/// sees. A request for a room this client is not an admin of is left alone.
 async fn answer_readd_requests(client: &mut Client, messages: Vec<Value>) -> Vec<Value> {
     let mut kept = Vec::with_capacity(messages.len());
     for message in messages {
@@ -466,7 +466,9 @@ async fn answer_readd_requests(client: &mut Client, messages: Vec<Value>) -> Vec
             .and_then(|b| b.strip_prefix(READD_REQUEST_PREFIX))
             .filter(|_| message["room"].is_null());
         match (request, message["from"].as_str()) {
-            (Some(room), Some(from)) if client.owns(room) => {
+            (Some(room), Some(from))
+                if client.is_secure(room) && client.is_admin(room).await.unwrap_or(false) =>
+            {
                 if let Err(e) = client.readd_member(room, from).await {
                     tracing::warn!(room = %room, from = %from, error = %e, "re-add failed");
                 }

@@ -668,13 +668,21 @@ fn restore_room(state: &State, ids: &mut HashSet<u64>, rec: RoomRec) -> usize {
         state.release_bytes(reserved);
         return skipped + 1;
     }
-    let signed = replayed.map(|r| seat_signed(state, &mut st, r));
+    let signed = replayed.map(|r| {
+        let public = r.public;
+        (seat_signed(state, &mut st, r), public)
+    });
     if signed.is_none() {
         restore_invites(&mut st, rec.invited);
     }
     st.publish_oldest();
     let invited: Vec<String> = st.invited.iter().cloned().collect();
-    let private = rec.private || signed.is_some();
+    // A signed room's visibility comes from its verified `create`, not the file.
+    let private = match &signed {
+        Some((_, public)) => !public,
+        None => rec.private,
+    };
+    let signed = signed.map(|(description, _)| description);
     let description = match signed {
         Some(description) => description,
         None => rec.description,
@@ -703,19 +711,23 @@ fn restore_room(state: &State, ids: &mut HashSet<u64>, rec: RoomRec) -> usize {
 
 /// Install a replayed signed room's state in `st`, trimmed to what is really
 /// here: only members that were seated keep their pinned key (the rest left
-/// the roster, as `leave_all_rooms` would have had them leave), only invitees
-/// still on the roster keep their invitation and Welcome, and the owner is
-/// cleared if the owner is gone. Returns the room's description.
+/// the roster, as `leave_all_rooms` would have had them leave, and with them
+/// their roles), only invitees still on the roster keep their invitation and
+/// Welcome. Returns the room's description.
 fn seat_signed(state: &State, st: &mut RoomState, replayed: Replayed) -> Option<String> {
     let Replayed {
         state: mut signed,
         description,
+        ..
     } = replayed;
-    signed.pins.retain(|name, _| st.members.contains_key(name));
-    if let Some(owner) = signed.owner {
-        if !signed.pins.values().any(|k| *k == owner) {
-            signed.owner = None;
-        }
+    let gone: Vec<String> = signed
+        .pins
+        .keys()
+        .filter(|name| !st.members.contains_key(name.as_str()))
+        .cloned()
+        .collect();
+    for name in gone {
+        signed.unseat(&name);
     }
     signed
         .invitations

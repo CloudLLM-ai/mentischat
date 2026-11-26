@@ -73,9 +73,9 @@ pub use model::{
 };
 pub use notify::{MailDigest, NotifySession};
 pub use signed::{
-    KeyBinding, KeyPackageOffer, KeyPackageStock, SignedMember, SignedOutcome, SignedRequest,
-    SignedRoomInfo, MAX_KEY_PACKAGES, MAX_KEY_PACKAGE_BYTES, MAX_WELCOME_BYTES, TAKES_PER_MINUTE,
-    TAKES_PER_REQUESTER,
+    Ban, KeyBinding, KeyPackageOffer, KeyPackageStock, Role, SignedMember, SignedOutcome,
+    SignedRequest, SignedRoomInfo, MAX_BANS, MAX_KEY_PACKAGES, MAX_KEY_PACKAGE_BYTES,
+    MAX_WELCOME_BYTES, TAKES_PER_MINUTE, TAKES_PER_REQUESTER,
 };
 pub use signed_persist::{verify_signed_record, RecordSummary};
 pub use snapshot::{remove_snapshot, SnapshotError};

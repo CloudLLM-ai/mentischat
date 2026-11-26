@@ -79,6 +79,7 @@ async fn primed(keys: &Keypair) -> Arc<Bus> {
     bus.register_key(&a, key, &sig).await.unwrap();
     let create = SignedOp::Create {
         description: String::new(),
+        public: false,
     };
     let payload = create.payload("r", "a", 1);
     bus.signed_op(SignedRequest {

@@ -124,6 +124,21 @@ pub enum MailboxError {
         /// The room it tried to use.
         room: String,
     },
+    /// A signed room operation only an admin may make: invite, remove,
+    /// promote, demote, ban, unban.
+    NotAnAdmin {
+        /// The member that is not an admin.
+        agent: String,
+        /// The room.
+        room: String,
+    },
+    /// The agent, or the key bound to it, is banned from the room.
+    Banned {
+        /// The banned agent.
+        agent: String,
+        /// The room.
+        room: String,
+    },
     /// The daemon already holds [`crate::bus::MAX_ROOMS`] rooms.
     RoomsFull {
         /// How many rooms the daemon holds.
@@ -227,6 +242,8 @@ impl MailboxError {
             Self::RoomNotFound { .. } => "room_not_found",
             Self::RoomExists { .. } => "room_exists",
             Self::NotAMember { .. } => "not_a_member",
+            Self::NotAnAdmin { .. } => "not_an_admin",
+            Self::Banned { .. } => "banned",
             Self::RoomsFull { .. } => "rooms_full",
             Self::TooManyRooms { .. } => "too_many_rooms",
             Self::RoomFull { .. } => "room_full",
@@ -266,7 +283,9 @@ impl MailboxError {
             | Self::RoomNotFound { .. }
             | Self::NoKeyPackage { .. }
             | Self::NotFound => StatusCode::NOT_FOUND,
-            Self::NotAMember { .. } => StatusCode::FORBIDDEN,
+            Self::NotAMember { .. } | Self::NotAnAdmin { .. } | Self::Banned { .. } => {
+                StatusCode::FORBIDDEN
+            }
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             Self::QueueFull { .. }
             | Self::TooManyWaiters { .. }
@@ -353,7 +372,9 @@ impl MailboxError {
             | Self::SignatureRequired { room }
             | Self::RoomNotFound { room }
             | Self::RoomExists { room } => json!({ "error": self.code(), "room": room }),
-            Self::NotAMember { agent, room } => {
+            Self::NotAMember { agent, room }
+            | Self::NotAnAdmin { agent, room }
+            | Self::Banned { agent, room } => {
                 json!({ "error": self.code(), "agent": agent, "room": room })
             }
             Self::RoomsFull { rooms } => json!({ "error": self.code(), "rooms": rooms }),

@@ -1,13 +1,13 @@
 //! Persistence of signed rooms: the signed records themselves, replayed and
 //! re-verified on restore.
 //!
-//! A signed room's state (members, pinned keys, owner, invitations, pending
+//! A signed room's state (members, pinned keys, admins, bans, invitations, pending
 //! Welcomes, epoch) is not saved as such. What is saved is the **journal**, the
 //! signed operations that built it, each with the signer's key and signature,
 //! plus the counter watermarks. On restore the journal is replayed from an empty
 //! room through the same rules the live daemon applies, and every signature is
 //! checked again, so a snapshot edited on disk cannot add a member, change an
-//! owner, move an epoch or raise a pinned key: the first record that does not
+//! admin, lift a ban, move an epoch or raise a pinned key: the first record that does not
 //! verify or does not follow from the ones before rejects that room (and only
 //! that room).
 //!
@@ -35,6 +35,9 @@ use crate::signed::{
     hex_decode_vec, hex_encode, mls_commit_epoch, Envelope, OpKind, PublicKey, Signature, SignedOp,
 };
 
+/// The `kind` of [`OpRec::dropped`].
+const DROPPED: &str = "drop";
+
 /// Most journal records a signed room keeps; past it the room is not saved.
 pub(super) const MAX_JOURNAL: usize = 8192;
 /// Most Welcome bytes a room holds (see `signed.rs`).
@@ -52,13 +55,20 @@ pub(super) struct OpRec {
     pub counter: u64,
     /// The signature, hex.
     pub signature: String,
-    /// The operation: `create`, `invite`, `join`, `leave`, `remove`, `welcome`
-    /// or `send` (a Commit).
+    /// The operation: `create`, `invite`, `join`, `leave`, `remove`,
+    /// `promote`, `demote`, `ban`, `unban`, `welcome` or `send` (a Commit); or
+    /// `drop`, the daemon's own unsigned record that `target` left the roster.
     pub kind: String,
     pub description: Option<String>,
+    /// `create`: set, and true, for a public room.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public: Option<bool>,
     pub invitee: Option<String>,
     pub invitee_key: Option<String>,
     pub target: Option<String>,
+    /// `ban`: the key banned with the name, hex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_key: Option<String>,
     /// A Welcome, hex.
     pub welcome: Option<String>,
     /// A Commit message body.
@@ -81,14 +91,22 @@ impl OpRec {
             signature: signature.to_hex(),
             kind: op.kind().as_str().to_string(),
             description: None,
+            public: None,
             invitee: None,
             invitee_key: None,
             target: None,
+            target_key: None,
             welcome: None,
             body: None,
         };
         match op {
-            SignedOp::Create { description } => rec.description = Some(description.clone()),
+            SignedOp::Create {
+                description,
+                public,
+            } => {
+                rec.description = Some(description.clone());
+                rec.public = public.then_some(true);
+            }
             SignedOp::Invite {
                 invitee,
                 invitee_key,
@@ -97,7 +115,14 @@ impl OpRec {
                 rec.invitee_key = Some(invitee_key.to_hex());
             }
             SignedOp::Join | SignedOp::Leave => {}
-            SignedOp::Remove { target } => rec.target = Some(target.clone()),
+            SignedOp::Remove { target }
+            | SignedOp::Promote { target }
+            | SignedOp::Demote { target }
+            | SignedOp::Unban { target } => rec.target = Some(target.clone()),
+            SignedOp::Ban { target, target_key } => {
+                rec.target = Some(target.clone());
+                rec.target_key = target_key.map(|k| k.to_hex());
+            }
             SignedOp::Welcome { target, welcome } => {
                 rec.target = Some(target.clone());
                 rec.welcome = Some(hex_encode(welcome));
@@ -107,6 +132,28 @@ impl OpRec {
         rec
     }
 
+    /// The daemon's record that the member `name` (folded) left the room
+    /// because it left the roster. Unsigned: it can only take a member out,
+    /// which someone able to edit the snapshot can do anyway by dropping the
+    /// member from it.
+    pub(super) fn dropped(name: &str) -> Self {
+        Self {
+            agent: String::new(),
+            key: String::new(),
+            counter: 0,
+            signature: String::new(),
+            kind: DROPPED.to_string(),
+            description: None,
+            public: None,
+            invitee: None,
+            invitee_key: None,
+            target: Some(name.to_string()),
+            target_key: None,
+            welcome: None,
+            body: None,
+        }
+    }
+
     /// Whether every optional field set on this record belongs to `kind`.
     ///
     /// [`OpRec::new`] sets only the fields its operation signs, so a record
@@ -114,21 +161,26 @@ impl OpRec {
     /// rather than ignored: a stray field is not covered by the signature, and
     /// a journal that verifies should have exactly the bytes that were signed.
     fn has_only_fields_of(&self, kind: OpKind) -> bool {
-        let (description, invitee, target, welcome, body) = match kind {
-            OpKind::Create => (true, false, false, false, false),
-            OpKind::Invite => (false, true, false, false, false),
-            OpKind::Remove => (false, false, true, false, false),
-            OpKind::Welcome => (false, false, true, true, false),
-            OpKind::Send => (false, false, false, false, true),
-            _ => (false, false, false, false, false),
-        };
-        let invitee_key = matches!(kind, OpKind::Invite);
-        (description || self.description.is_none())
-            && (invitee || self.invitee.is_none())
-            && (invitee_key || self.invitee_key.is_none())
-            && (target || self.target.is_none())
-            && (welcome || self.welcome.is_none())
-            && (body || self.body.is_none())
+        let targeted = matches!(
+            kind,
+            OpKind::Remove
+                | OpKind::Promote
+                | OpKind::Demote
+                | OpKind::Ban
+                | OpKind::Unban
+                | OpKind::Welcome
+        );
+        let allowed = |field: bool, set: bool| field || !set;
+        allowed(kind == OpKind::Create, self.description.is_some())
+            && allowed(kind == OpKind::Create, self.public.is_some())
+            && allowed(kind == OpKind::Invite, self.invitee.is_some())
+            && allowed(kind == OpKind::Invite, self.invitee_key.is_some())
+            && allowed(targeted, self.target.is_some())
+            && allowed(kind == OpKind::Ban, self.target_key.is_some())
+            && allowed(kind == OpKind::Welcome, self.welcome.is_some())
+            && allowed(kind == OpKind::Send, self.body.is_some())
+            // Only `Some(true)` is ever written: a private room has no flag.
+            && self.public != Some(false)
     }
 
     /// The operation, key and signature this record holds, or `None` when a
@@ -144,6 +196,7 @@ impl OpRec {
         let op = match kind {
             OpKind::Create => SignedOp::Create {
                 description: text(&self.description)?,
+                public: self.public == Some(true),
             },
             OpKind::Invite => SignedOp::Invite {
                 invitee: text(&self.invitee)?,
@@ -152,6 +205,22 @@ impl OpRec {
             OpKind::Join => SignedOp::Join,
             OpKind::Leave => SignedOp::Leave,
             OpKind::Remove => SignedOp::Remove {
+                target: text(&self.target)?,
+            },
+            OpKind::Promote => SignedOp::Promote {
+                target: text(&self.target)?,
+            },
+            OpKind::Demote => SignedOp::Demote {
+                target: text(&self.target)?,
+            },
+            OpKind::Ban => SignedOp::Ban {
+                target: text(&self.target)?,
+                target_key: match &self.target_key {
+                    None => None,
+                    Some(k) => Some(k.parse().ok()?),
+                },
+            },
+            OpKind::Unban => SignedOp::Unban {
                 target: text(&self.target)?,
             },
             OpKind::Welcome => SignedOp::Welcome {
@@ -185,6 +254,8 @@ pub(super) struct Replayed {
     pub state: SignedState,
     /// The description the room was created with.
     pub description: Option<String>,
+    /// Whether the room is public.
+    pub public: bool,
 }
 
 impl SignedState {
@@ -242,6 +313,14 @@ pub(super) fn replay(
     let mut description = None;
     let mut seen_keys: HashSet<PublicKey> = HashSet::new();
     for (index, record) in rec.journal.iter().enumerate() {
+        if record.kind == DROPPED {
+            if index == 0 {
+                return Err("first record is not create");
+            }
+            replay_dropped(&mut state, record)?;
+            state.journal.push(record.clone());
+            continue;
+        }
         let (op, key, signature) = record.decode().ok_or("malformed record")?;
         let agent = AgentName::parse(&record.agent).map_err(|_| "bad agent name")?;
         let payload = op.payload(room, agent.as_str(), record.counter);
@@ -255,14 +334,19 @@ pub(super) fn replay(
             return Err("counter does not increase");
         }
         let name = agent.folded();
-        if let SignedOp::Create { description: d } = &op {
+        if let SignedOp::Create {
+            description: d,
+            public,
+        } = &op
+        {
             if index != 0 {
                 return Err("create is not first");
             }
             description = Some(validate_description(d.clone()).map_err(|_| "bad description")?)
                 .filter(|d| !d.is_empty());
-            state.owner = Some(key);
-            state.pins.insert(name, key);
+            state.public = *public;
+            state.seat(&name, key);
+            state.admins.insert(name);
         } else if index == 0 {
             return Err("first record is not create");
         } else {
@@ -282,7 +366,40 @@ pub(super) fn replay(
     }
     verify_retained(room, retained, &seen_keys, &mut state)?;
     merge_saved_watermarks(&mut state, &rec.watermarks)?;
-    Ok(Replayed { state, description })
+    let public = state.public;
+    Ok(Replayed {
+        state,
+        description,
+        public,
+    })
+}
+
+/// A [`OpRec::dropped`] record: it carries a member name and nothing else, and
+/// takes that member out.
+fn replay_dropped(state: &mut SignedState, record: &OpRec) -> Result<(), &'static str> {
+    let clean = record.agent.is_empty()
+        && record.key.is_empty()
+        && record.signature.is_empty()
+        && record.counter == 0
+        && record.description.is_none()
+        && record.public.is_none()
+        && record.invitee.is_none()
+        && record.invitee_key.is_none()
+        && record.target_key.is_none()
+        && record.welcome.is_none()
+        && record.body.is_none();
+    let target = record
+        .target
+        .as_deref()
+        .and_then(|t| AgentName::parse(t).ok())
+        .map(|t| t.folded())
+        .filter(|_| clean)
+        .ok_or("malformed drop record")?;
+    if !state.pins.contains_key(&target) {
+        return Err("drop of a non-member");
+    }
+    state.unseat(&target);
+    Ok(())
 }
 
 /// The rules of each operation after the first, as the live daemon applies them.
@@ -302,41 +419,48 @@ fn apply(
             let invitee = AgentName::parse(invitee)
                 .map_err(|_| "bad invitee")?
                 .folded();
-            if !pinned || state.pins.contains_key(&invitee) {
-                return Err("invite by a non-member or of a member");
+            if !pinned || !state.is_admin(name) || state.pins.contains_key(&invitee) {
+                return Err("invite by a non-admin or of a member");
+            }
+            if state.is_banned(&invitee, Some(*invitee_key)) {
+                return Err("invite of a banned agent");
             }
             state.invitations.insert(invitee, *invitee_key);
             Ok(())
         }
         SignedOp::Join => {
-            if state.pins.contains_key(name) || state.invitations.get(name) != Some(&key) {
+            let invitation = state.invitations.get(name).copied();
+            let admitted = match invitation {
+                Some(pinned) => pinned == key,
+                None => state.public,
+            };
+            if state.pins.contains_key(name) || !admitted || state.is_banned(name, Some(key)) {
                 return Err("join without a matching invitation");
             }
             state.invitations.remove(name);
             state.welcomes.remove(name);
-            state.pins.insert(name.to_string(), key);
+            state.seat(name, key);
             Ok(())
         }
         SignedOp::Leave => {
             if !pinned {
                 return Err("leave by a non-member");
             }
-            state.pins.remove(name);
-            if state.owner == Some(key) {
-                state.owner = None;
-            }
+            state.unseat(name);
             Ok(())
         }
-        SignedOp::Remove { target } => {
-            let target = AgentName::parse(target).map_err(|_| "bad target")?.folded();
-            let known = state.pins.contains_key(&target) || state.invitations.contains_key(&target);
-            if !pinned || state.owner != Some(key) || target == name || !known {
-                return Err("remove not allowed");
+        SignedOp::Remove { .. }
+        | SignedOp::Promote { .. }
+        | SignedOp::Demote { .. }
+        | SignedOp::Ban { .. }
+        | SignedOp::Unban { .. } => {
+            if !pinned {
+                return Err("admin operation by a non-member");
             }
-            state.pins.remove(&target);
-            state.invitations.remove(&target);
-            state.welcomes.remove(&target);
-            Ok(())
+            state
+                .manage(name, op)
+                .map(|_| ())
+                .map_err(|_| "admin operation not allowed")
         }
         SignedOp::Welcome { target, welcome } => {
             let target = AgentName::parse(target).map_err(|_| "bad target")?.folded();
@@ -409,8 +533,12 @@ fn merge_saved_watermarks(
 pub struct RecordSummary {
     /// Folded names of the members the records leave in the room, sorted.
     pub members: Vec<String>,
-    /// The owner's key (hex) while the owner is a member.
-    pub owner: Option<String>,
+    /// Folded names of the admins among them, sorted.
+    pub admins: Vec<String>,
+    /// Whether the room is public.
+    pub public: bool,
+    /// Folded names banned, sorted.
+    pub banned: Vec<String>,
     /// The epoch the Commit chain reaches.
     pub epoch: u64,
     /// Folded names invited and not yet joined, sorted.
@@ -471,9 +599,16 @@ pub fn verify_signed_record(room: &str, json: &[u8]) -> Result<RecordSummary, &'
     members.sort_unstable();
     let mut invited: Vec<String> = state.invitations.keys().cloned().collect();
     invited.sort_unstable();
+    let admins = members
+        .iter()
+        .filter(|m| state.is_admin(m))
+        .cloned()
+        .collect();
     Ok(RecordSummary {
+        admins,
+        public: state.public,
+        banned: state.banned.keys().cloned().collect(),
         members,
-        owner: state.owner.map(|k| k.to_hex()),
         epoch: state.epoch,
         invited,
         records: rec.journal.len(),

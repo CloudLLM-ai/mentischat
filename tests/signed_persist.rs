@@ -88,6 +88,7 @@ async fn busy(bus: &Bus) -> (Actor, Actor, Actor, Actor) {
     }
     let create = SignedOp::Create {
         description: "the den".into(),
+        public: false,
     };
     alice.op(bus, "den", 1, create).await.unwrap();
     alice.op(bus, "den", 2, alice.invite(&bob)).await.unwrap();
@@ -660,6 +661,7 @@ async fn an_overlong_journal_is_not_saved() {
     alice.enroll(&bus).await;
     let create = SignedOp::Create {
         description: String::new(),
+        public: false,
     };
     alice.op(&bus, "den", 1, create).await.unwrap();
     for i in 0..8200u64 {
@@ -690,6 +692,7 @@ async fn write_journal_seeds() {
     }
     let create = SignedOp::Create {
         description: "d".into(),
+        public: false,
     };
     alice.op(&bus, "r", 1, create).await.unwrap();
     alice.op(&bus, "r", 2, alice.invite(&bob)).await.unwrap();

@@ -521,7 +521,7 @@ impl State {
         for room in rooms {
             let emptied = {
                 let mut st = room.inner.lock();
-                st.drop_pin(key.as_str());
+                st.drop_unsigned(key.as_str());
                 st.members.remove(key.as_str()).is_some() && st.members.is_empty()
             };
             if emptied {

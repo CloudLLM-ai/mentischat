@@ -77,6 +77,7 @@ async fn den_with_invited_bob(bus: &Bus) -> (Actor, Actor) {
     bob.enroll(bus).await;
     let create = SignedOp::Create {
         description: String::new(),
+        public: false,
     };
     alice.op(bus, "den", 1, create).await.unwrap();
     let invite = SignedOp::Invite {

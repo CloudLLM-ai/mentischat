@@ -33,7 +33,15 @@ impl Actor {
             "kind": op.kind().as_str(),
         });
         match op {
-            SignedOp::Create { description } => record["description"] = json!(description),
+            SignedOp::Create {
+                description,
+                public,
+            } => {
+                record["description"] = json!(description);
+                if *public {
+                    record["public"] = json!(true);
+                }
+            }
             SignedOp::Invite {
                 invitee,
                 invitee_key,
@@ -42,7 +50,16 @@ impl Actor {
                 record["invitee_key"] = json!(invitee_key.to_hex());
             }
             SignedOp::Join | SignedOp::Leave => {}
-            SignedOp::Remove { target } => record["target"] = json!(target),
+            SignedOp::Remove { target }
+            | SignedOp::Promote { target }
+            | SignedOp::Demote { target }
+            | SignedOp::Unban { target } => record["target"] = json!(target),
+            SignedOp::Ban { target, target_key } => {
+                record["target"] = json!(target);
+                if let Some(key) = target_key {
+                    record["target_key"] = json!(key.to_hex());
+                }
+            }
             SignedOp::Welcome { target, welcome } => {
                 record["target"] = json!(target);
                 record["welcome"] = json!(hex_encode(welcome));
@@ -63,6 +80,7 @@ impl Actor {
 fn create(description: &str) -> SignedOp {
     SignedOp::Create {
         description: description.into(),
+        public: false,
     }
 }
 
@@ -91,7 +109,7 @@ fn test_a_valid_journal_replays_to_its_room() {
     ])
     .expect("replays");
     assert_eq!(summary.members, ["alice", "bob"]);
-    assert_eq!(summary.owner, Some(alice.keys.public().to_hex()));
+    assert_eq!(summary.admins, ["alice"]);
     assert_eq!(summary.epoch, 1);
     assert!(summary.invited.is_empty());
     assert_eq!(summary.records, 4);
@@ -104,10 +122,9 @@ fn test_a_valid_journal_replays_to_its_room() {
     assert_eq!(pending.invited, ["bob"]);
 }
 
-/// An owner who leaves takes the ownership with them; the room lives on with
-/// the others and no owner.
+/// The last admin leaving makes the member seated longest the admin.
 #[test]
-fn test_owner_leaving_clears_the_owner() {
+fn test_last_admin_leaving_hands_the_room_to_the_longest_seated() {
     let (alice, bob) = (actor("alice", 1), actor("bob", 2));
     let summary = verify(vec![
         alice.rec(1, &create("")),
@@ -117,7 +134,7 @@ fn test_owner_leaving_clears_the_owner() {
     ])
     .expect("replays");
     assert_eq!(summary.members, ["bob"]);
-    assert_eq!(summary.owner, None);
+    assert_eq!(summary.admins, ["bob"]);
 }
 
 /// The owner can remove a member and a member's Welcome is kept; both replay.
@@ -177,11 +194,11 @@ fn test_every_replay_rule_rejects_with_its_reason() {
     );
     assert_eq!(
         rejected(vec![first(), carol.rec(1, &carol.invite(&bob))]),
-        "invite by a non-member or of a member"
+        "invite by a non-admin or of a member"
     );
     assert_eq!(
         rejected(extend(with_bob(), alice.rec(3, &alice.invite(&bob)))),
-        "invite by a non-member or of a member"
+        "invite by a non-admin or of a member"
     );
     assert_eq!(
         rejected(vec![first(), carol.rec(1, &SignedOp::Join)]),
@@ -196,14 +213,14 @@ fn test_every_replay_rule_rejects_with_its_reason() {
     };
     assert_eq!(
         rejected(extend(with_bob(), bob.rec(2, &remove_alice))),
-        "remove not allowed"
+        "admin operation not allowed"
     );
     let remove_self = SignedOp::Remove {
         target: "alice".into(),
     };
     assert_eq!(
         rejected(vec![first(), alice.rec(2, &remove_self)]),
-        "remove not allowed"
+        "admin operation not allowed"
     );
     let welcome_unknown = SignedOp::Welcome {
         target: "carol".into(),

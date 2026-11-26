@@ -111,6 +111,8 @@ async fn trio(h: &Harness) -> (Client, Client, Client) {
     alice.create_room("den", "secret den").await.unwrap();
     alice.add_member("den", "bob").await.unwrap();
     bob.join_room("den").await.unwrap();
+    // Only admins add members.
+    alice.promote("den", "bob").await.unwrap();
     bob.add_member("den", "carol").await.unwrap();
     carol.join_room("den").await.unwrap();
     alice.sync("den").await.unwrap();

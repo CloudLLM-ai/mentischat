@@ -1,9 +1,9 @@
 //! Signed rooms: key binding, pinned membership, replay counters.
 //!
 //! A signed room is an ordinary room (same log, cursors and caps) whose
-//! [`RoomState`] also holds a [`SignedState`]: the owner's key, the key pinned
-//! for each member and each pending invitation, and one counter watermark per
-//! key. Every operation that changes it, and every send, arrives with an
+//! [`RoomState`] also holds a [`SignedState`]: who is admin, the key pinned
+//! for each member and each pending invitation, the bans, and one counter
+//! watermark per key. Every operation that changes it, and every send, arrives with an
 //! Ed25519 signature the daemon checks (see [`crate::signed`]); the plain
 //! tools and routes are refused with `signature_required`.
 //!
@@ -13,7 +13,7 @@
 //! agent lock is never taken under a room's here, and the room lock order of
 //! `rooms.rs` is unchanged.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -51,14 +51,33 @@ pub(super) enum SendGate<'a> {
     },
 }
 
+/// Most bans a signed room keeps.
+pub const MAX_BANS: usize = 4 * MAX_ROOM_MEMBERS;
+
 /// The extra state of a signed room.
+///
+/// # Roles
+///
+/// Every member is an admin or a participant. The founder starts as the only
+/// admin; admins promote, demote, invite, remove, ban and unban. When no member
+/// is an admin (the last one left, was removed or dropped off the roster), the
+/// member that has been in the room longest is the admin, so a room is never
+/// left without one. That rule is computed from the join order, not stored, so
+/// a replayed journal gives every member the same role it had.
 #[derive(Debug)]
 pub(super) struct SignedState {
-    /// The founder's key while the founder is a member; only the owner may
-    /// remove others.
-    pub(super) owner: Option<PublicKey>,
+    /// Listed and open to any agent with a bound key that is not banned.
+    pub(super) public: bool,
+    /// Members made admin, by folded name: the founder and those promoted.
+    pub(super) admins: HashSet<String>,
     /// The key pinned for each member, by folded name.
     pub(super) pins: HashMap<String, PublicKey>,
+    /// When each member joined (an increasing number), by folded name.
+    pub(super) seats: HashMap<String, u64>,
+    /// The next join number.
+    next_seat: u64,
+    /// Banned names, by folded name, with the key banned with each.
+    pub(super) banned: BTreeMap<String, Option<PublicKey>>,
     /// The key each pending invitation pinned, by folded name.
     pub(super) invitations: HashMap<String, PublicKey>,
     /// Highest counter each key has signed in this room.
@@ -74,13 +93,54 @@ pub(super) struct SignedState {
     pub(super) overflow: bool,
 }
 
+/// Why [`SignedState::manage`] refused an operation, before it is put in
+/// the room's words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Deny {
+    /// The signer is not an admin.
+    NotAdmin,
+    /// The target is not a member (or, for `remove`, an invitee; for `demote`,
+    /// an admin; for `unban`, banned).
+    NoTarget,
+    /// An admin acting on itself where that is not allowed (remove, ban).
+    SelfTarget,
+    /// The key a `ban` names is not the key pinned for the target.
+    WrongKey,
+    /// The room already keeps [`MAX_BANS`] bans.
+    Full,
+}
+
+impl Deny {
+    /// The error a caller gets.
+    fn into_err(self, signer: &str, target: &str, room: &str) -> MailErr {
+        match self {
+            Self::NotAdmin => MailErr::NotAnAdmin {
+                agent: signer.to_string(),
+                room: room.to_string(),
+            },
+            Self::NoTarget | Self::SelfTarget => MailErr::NotAMember {
+                agent: target.to_string(),
+                room: room.to_string(),
+            },
+            Self::WrongKey => MailErr::KeyConflict {
+                agent: target.to_string(),
+            },
+            Self::Full => MailErr::RoomFull {
+                room: room.to_string(),
+                members: MAX_BANS as i64,
+            },
+        }
+    }
+}
+
 impl SignedState {
-    /// A room founded by `owner` (folded name `name`) at `counter`.
-    fn founded(name: &str, owner: PublicKey, counter: u64, entry: &OpRec) -> Self {
+    /// A room founded by `founder` (folded name) at `counter`.
+    fn founded(founder: &str, key: PublicKey, public: bool, counter: u64, entry: &OpRec) -> Self {
         let mut state = Self::empty();
-        state.owner = Some(owner);
-        state.pins.insert(name.to_string(), owner);
-        state.watermarks.insert(owner, counter);
+        state.public = public;
+        state.seat(founder, key);
+        state.admins.insert(founder.to_string());
+        state.watermarks.insert(key, counter);
         state.record(entry);
         state
     }
@@ -88,8 +148,12 @@ impl SignedState {
     /// A room with nothing in it, the starting point of a replay.
     pub(super) fn empty() -> Self {
         Self {
-            owner: None,
+            public: false,
+            admins: HashSet::new(),
             pins: HashMap::new(),
+            seats: HashMap::new(),
+            next_seat: 0,
+            banned: BTreeMap::new(),
             invitations: HashMap::new(),
             watermarks: HashMap::new(),
             epoch: 0,
@@ -97,6 +161,114 @@ impl SignedState {
             journal: Vec::new(),
             overflow: false,
         }
+    }
+
+    /// Pin `key` for the member `name` (folded), seated after everyone else.
+    pub(super) fn seat(&mut self, name: &str, key: PublicKey) {
+        self.pins.insert(name.to_string(), key);
+        self.seats.insert(name.to_string(), self.next_seat);
+        self.next_seat += 1;
+    }
+
+    /// Forget the member `name` (folded): its pin, its seat and its role.
+    pub(super) fn unseat(&mut self, name: &str) {
+        self.pins.remove(name);
+        self.seats.remove(name);
+        self.admins.remove(name);
+    }
+
+    /// Whether the member `name` (folded) is an admin: one made admin, or,
+    /// while no member is, the member seated first.
+    pub(super) fn is_admin(&self, name: &str) -> bool {
+        if !self.pins.contains_key(name) {
+            return false;
+        }
+        if self.admins.iter().any(|a| self.pins.contains_key(a)) {
+            return self.admins.contains(name);
+        }
+        self.seats
+            .iter()
+            .filter(|(n, _)| self.pins.contains_key(n.as_str()))
+            .min_by_key(|(n, seat)| (**seat, n.as_str()))
+            .is_some_and(|(n, _)| n == name)
+    }
+
+    /// Whether `name` (folded), or `key`, is banned.
+    pub(super) fn is_banned(&self, name: &str, key: Option<PublicKey>) -> bool {
+        self.banned.contains_key(name)
+            || key.is_some_and(|k| self.banned.values().any(|b| *b == Some(k)))
+    }
+
+    /// Apply an admin operation (`remove`, `promote`, `demote`, `ban`,
+    /// `unban`) by the member `signer` (folded) to this state, or say why not.
+    /// The same rules for the live daemon and for a replayed journal. Returns
+    /// the folded target, which the caller takes out of the room's member and
+    /// invitee lists for `remove` and `ban`.
+    pub(super) fn manage(&mut self, signer: &str, op: &SignedOp) -> Result<String, Deny> {
+        let target = op
+            .target()
+            .and_then(|t| AgentName::parse(t).ok())
+            .map(|t| t.folded())
+            .ok_or(Deny::NoTarget)?;
+        if !self.is_admin(signer) {
+            return Err(Deny::NotAdmin);
+        }
+        let member = self.pins.contains_key(&target);
+        let invited = self.invitations.contains_key(&target);
+        match op {
+            SignedOp::Remove { .. } => {
+                if target == signer {
+                    return Err(Deny::SelfTarget);
+                }
+                if !member && !invited {
+                    return Err(Deny::NoTarget);
+                }
+                self.evict(&target);
+            }
+            SignedOp::Promote { .. } => {
+                if !member {
+                    return Err(Deny::NoTarget);
+                }
+                self.admins.insert(target.clone());
+            }
+            SignedOp::Demote { .. } => {
+                if !self.admins.remove(&target) {
+                    return Err(Deny::NoTarget);
+                }
+            }
+            SignedOp::Ban { target_key, .. } => {
+                if target == signer {
+                    return Err(Deny::SelfTarget);
+                }
+                let pinned = self
+                    .pins
+                    .get(&target)
+                    .or_else(|| self.invitations.get(&target));
+                if pinned.is_some_and(|k| Some(*k) != *target_key) {
+                    return Err(Deny::WrongKey);
+                }
+                if !self.banned.contains_key(&target) && self.banned.len() >= MAX_BANS {
+                    return Err(Deny::Full);
+                }
+                self.evict(&target);
+                self.banned.insert(target.clone(), *target_key);
+            }
+            SignedOp::Unban { .. } => {
+                if self.banned.remove(&target).is_none() {
+                    return Err(Deny::NoTarget);
+                }
+            }
+            _ => return Err(Deny::NoTarget),
+        }
+        Ok(target)
+    }
+
+    /// Take `name` (folded) out as a member or invitee, with its Welcome.
+    fn evict(&mut self, name: &str) {
+        self.unseat(name);
+        self.invitations.remove(name);
+        self.welcomes.remove(name);
+        self.forget_welcomes(name);
     }
 
     /// Whether `counter` from `key` is above the key's watermark (the first
@@ -134,7 +306,9 @@ impl RoomState {
             return Ok(());
         }
         let key = Key::fold(&agent.name);
-        if self.members.contains_key(key.as_str()) || self.invited.contains(key.as_str()) {
+        let public = self.signed.as_ref().is_some_and(|s| s.public);
+        if public || self.members.contains_key(key.as_str()) || self.invited.contains(key.as_str())
+        {
             Err(MailErr::SignatureRequired {
                 room: room.name.to_string(),
             })
@@ -226,13 +400,38 @@ impl RoomState {
         }
     }
 
-    /// Forget the key pinned for a member that left the room.
+    /// `agent`, a member of this signed room, must be an admin.
+    fn require_admin(&self, room: &Room, agent: &Agent) -> Result<(), MailErr> {
+        let name = Key::fold(&agent.name);
+        if self
+            .signed
+            .as_ref()
+            .is_some_and(|s| s.is_admin(name.as_str()))
+        {
+            Ok(())
+        } else {
+            Err(MailErr::NotAnAdmin {
+                agent: agent.name.to_string(),
+                room: room.name.to_string(),
+            })
+        }
+    }
+
+    /// Forget the key pinned for a member that left the room, and its role.
     pub(super) fn drop_pin(&mut self, folded: &str) {
         if let Some(signed) = self.signed.as_mut() {
-            if let Some(key) = signed.pins.remove(folded) {
-                if signed.owner == Some(key) {
-                    signed.owner = None;
-                }
+            signed.unseat(folded);
+        }
+    }
+
+    /// Take a member out of a signed room without a signature of its own (it
+    /// left the roster: deregistered or idle), and journal that it went, so a
+    /// replay seats the same members in the same order.
+    pub(super) fn drop_unsigned(&mut self, folded: &str) {
+        if let Some(signed) = self.signed.as_mut() {
+            if signed.pins.contains_key(folded) {
+                signed.unseat(folded);
+                signed.record(&OpRec::dropped(folded));
             }
         }
     }
@@ -256,6 +455,16 @@ pub struct KeyBinding {
     pub public_key: String,
 }
 
+/// A member's role in a signed room.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Role {
+    /// Invites, removes, bans, unbans, promotes and demotes.
+    Admin,
+    /// Sends and reads.
+    Participant,
+}
+
 /// One member of a signed room with the key its operations must verify under.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -264,6 +473,18 @@ pub struct SignedMember {
     pub agent: String,
     /// Its pinned public key, 64 lowercase hex digits.
     pub public_key: String,
+    /// Admin or participant.
+    pub role: Role,
+}
+
+/// A ban in a signed room.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Ban {
+    /// The banned name, folded to lowercase.
+    pub agent: String,
+    /// The key banned with it, 64 lowercase hex digits, when it had one.
+    pub public_key: Option<String>,
 }
 
 /// A signed room's membership as the daemon enforces it.
@@ -272,8 +493,11 @@ pub struct SignedMember {
 pub struct SignedRoomInfo {
     /// The room's name.
     pub room: String,
-    /// The owner's key while the owner is a member; only it may remove.
-    pub owner: Option<String>,
+    /// Listed and open to any agent with a key that is not banned; private
+    /// rooms take only the invited.
+    pub public: bool,
+    /// The admins' names, sorted.
+    pub admins: Vec<String>,
     /// How many MLS Commits the room has accepted: the epoch the next one
     /// must name.
     pub epoch: u64,
@@ -282,6 +506,8 @@ pub struct SignedRoomInfo {
     /// Names invited and not yet joined, sorted: a client pruning departed
     /// members must not mistake an invitee for one.
     pub invited: Vec<String>,
+    /// The bans, sorted by name.
+    pub banned: Vec<Ban>,
     /// The highest counter the daemon has accepted from the asking member's key
     /// in this room. A client remembers the highest counter the daemon accepted
     /// from it; a lower answer means the room was rolled back.
@@ -456,12 +682,15 @@ impl Bus {
             )),
         };
         let need = || entry.as_ref().ok_or(MailErr::InvalidBody);
-        match req.op {
-            SignedOp::Create { description } => {
+        match req.op.clone() {
+            SignedOp::Create {
+                description,
+                public,
+            } => {
                 let description =
                     Some(validate_description(description)?).filter(|d| !d.is_empty());
                 state
-                    .signed_create(&agent, room, key, counter, description, need()?)
+                    .signed_create(&agent, room, (key, counter), public, description, need()?)
                     .map(SignedOutcome::Room)
             }
             SignedOp::Invite {
@@ -496,10 +725,28 @@ impl Bus {
             SignedOp::Leave => state
                 .signed_leave(&agent, room, key, counter, need()?)
                 .map(SignedOutcome::Left),
-            SignedOp::Remove { target } => {
-                let target = AgentName::parse(&target)?;
+            SignedOp::Remove { .. }
+            | SignedOp::Promote { .. }
+            | SignedOp::Demote { .. }
+            | SignedOp::Unban { .. } => state
+                .signed_manage(&agent, room, (key, counter), &req.op, need()?)
+                .map(SignedOutcome::Room),
+            SignedOp::Ban {
+                ref target,
+                target_key,
+            } => {
+                let name = AgentName::parse(target)?;
+                // A name on the roster is banned with the key bound to it; a
+                // name that is not can be banned ahead of time, as signed.
+                if let Ok(found) = state.agent(name.as_str(), &name.folded()) {
+                    if found.inner.lock().key != target_key {
+                        return Err(MailErr::KeyConflict {
+                            agent: found.name.to_string(),
+                        });
+                    }
+                }
                 state
-                    .signed_remove(&agent, room, key, counter, &target, need()?)
+                    .signed_manage(&agent, room, (key, counter), &req.op, need()?)
                     .map(SignedOutcome::Room)
             }
             SignedOp::Welcome { target, welcome } => {
@@ -702,13 +949,14 @@ impl State {
         &self,
         agent: &Arc<Agent>,
         room: &RoomName,
-        key: PublicKey,
-        counter: u64,
+        (key, counter): (PublicKey, u64),
+        public: bool,
         description: Option<String>,
         entry: &OpRec,
     ) -> Result<RoomInfo, MailErr> {
-        let signed = SignedState::founded(Key::fold(&agent.name).as_str(), key, counter, entry);
-        self.create_room_with(agent, room, true, description, Some(signed))
+        let founder = Key::fold(&agent.name);
+        let signed = SignedState::founded(founder.as_str(), key, public, counter, entry);
+        self.create_room_with(agent, room, !public, description, Some(signed))
     }
 
     /// The signed state of a live signed room; anything else is
@@ -730,6 +978,17 @@ impl State {
         let mut st = found.inner.lock();
         let invitee_name = Key::fold(&invitee.name);
         st.require_signed_member(&found, agent, room, key)?;
+        st.require_admin(&found, agent)?;
+        if st
+            .signed
+            .as_ref()
+            .is_some_and(|s| s.is_banned(invitee_name.as_str(), Some(invitee_key)))
+        {
+            return Err(MailErr::Banned {
+                agent: invitee.name.to_string(),
+                room: found.name.to_string(),
+            });
+        }
         if !st.members.contains_key(invitee_name.as_str()) {
             let already = st.invited.contains(invitee_name.as_str());
             if !already && st.members.len() + st.invited.len() >= MAX_ROOM_MEMBERS {
@@ -792,11 +1051,23 @@ impl State {
                 signed.welcomes.remove(name.as_str());
                 signed.forget_welcomes(name.as_str());
             } else {
-                let pinned = st
-                    .signed
-                    .as_ref()
-                    .and_then(|s| s.invitations.get(name.as_str()).copied());
+                let signed = st.signed.as_ref().ok_or_else(|| not_a_signed_room(room))?;
+                let pinned = signed.invitations.get(name.as_str()).copied();
+                if signed.is_banned(name.as_str(), Some(key)) {
+                    // A private room still does not admit it exists.
+                    return Err(if signed.public || pinned.is_some() {
+                        MailErr::Banned {
+                            agent: agent.name.to_string(),
+                            room: found.name.to_string(),
+                        }
+                    } else {
+                        not_a_signed_room(room)
+                    });
+                }
                 match pinned {
+                    // A public room takes any agent under its bound key, the
+                    // key the signature was checked against.
+                    None if signed.public => {}
                     None => return Err(not_a_signed_room(room)),
                     Some(pinned) if pinned != key => return Err(MailErr::InvalidSignature),
                     Some(_) => {}
@@ -813,7 +1084,7 @@ impl State {
                 signed.forget_welcomes(name.as_str());
                 signed.invitations.remove(name.as_str());
                 signed.welcomes.remove(name.as_str());
-                signed.pins.insert(name.as_str().to_string(), key);
+                signed.seat(name.as_str(), key);
                 st.invited.remove(name.as_str());
                 st.members.insert(name.as_str().to_string(), member);
             }
@@ -853,49 +1124,42 @@ impl State {
         })
     }
 
-    fn signed_remove(
+    /// An admin operation: `remove`, `promote`, `demote`, `ban` or `unban`
+    /// (see [`SignedState::manage`]).
+    fn signed_manage(
         &self,
         agent: &Arc<Agent>,
         room: &RoomName,
-        key: PublicKey,
-        counter: u64,
-        target: &AgentName,
+        (key, counter): (PublicKey, u64),
+        op: &SignedOp,
         entry: &OpRec,
     ) -> Result<RoomInfo, MailErr> {
         let found = self.signed_room(room)?;
         let name = Key::fold(&agent.name);
-        let target_key = Key::fold(target.as_str());
-        let info = {
+        let shown = op.target().unwrap_or_default().to_string();
+        let (info, evicted) = {
             let mut st = found.inner.lock();
             st.require_signed_member(&found, agent, room, key)?;
-            let is_owner = st.signed.as_ref().is_some_and(|s| s.owner == Some(key));
-            // Only the owner removes others; it removes itself by leaving.
-            if !is_owner || target_key.as_str() == name.as_str() {
-                return Err(MailErr::NotAMember {
-                    agent: agent.name.to_string(),
-                    room: found.name.to_string(),
-                });
-            }
-            if !st.members.contains_key(target_key.as_str())
-                && !st.invited.contains(target_key.as_str())
-            {
-                return Err(MailErr::NotAMember {
-                    agent: target.to_string(),
-                    room: found.name.to_string(),
-                });
-            }
             let signed = st.signed.as_mut().ok_or_else(|| not_a_signed_room(room))?;
-            signed.bump(&found, key, counter)?;
+            signed.check(&found, key, counter)?;
+            let target = signed
+                .manage(name.as_str(), op)
+                .map_err(|deny| deny.into_err(&agent.name, &shown, &found.name))?;
+            signed.watermarks.insert(key, counter);
             signed.record(entry);
-            signed.forget_welcomes(target_key.as_str());
-            st.drop_pin(target_key.as_str());
-            st.drop_invitation(target_key.as_str());
-            st.invited.remove(target_key.as_str());
-            st.members.remove(target_key.as_str());
-            st.info(&found)
+            let evicted = matches!(op, SignedOp::Remove { .. } | SignedOp::Ban { .. });
+            if evicted {
+                st.invited.remove(target.as_str());
+                st.members.remove(target.as_str());
+            }
+            (st.info(&found), evicted.then_some(target))
         };
-        if let Ok(gone) = self.agent(target.as_str(), target_key.as_str()) {
-            gone.inner.lock().rooms.retain(|r| !Arc::ptr_eq(r, &found));
+        if let Some(target) = evicted {
+            if let Ok(gone) = self.agent(&target, &target) {
+                let mut gone = gone.inner.lock();
+                gone.rooms.retain(|r| !Arc::ptr_eq(r, &found));
+                gone.invited_to.remove(Key::fold(&found.name).as_str());
+            }
         }
         Ok(info)
     }
@@ -975,6 +1239,11 @@ impl State {
                 signed.pins.get(folded).map(|k| SignedMember {
                     agent: m.name.to_string(),
                     public_key: k.to_hex(),
+                    role: if signed.is_admin(folded) {
+                        Role::Admin
+                    } else {
+                        Role::Participant
+                    },
                 })
             })
             .collect();
@@ -985,12 +1254,27 @@ impl State {
         });
         let mut invited: Vec<String> = signed.invitations.keys().cloned().collect();
         invited.sort_unstable();
+        let admins = members
+            .iter()
+            .filter(|m| m.role == Role::Admin)
+            .map(|m| m.agent.clone())
+            .collect();
+        let banned = signed
+            .banned
+            .iter()
+            .map(|(name, key)| Ban {
+                agent: name.clone(),
+                public_key: key.map(|k| k.to_hex()),
+            })
+            .collect();
         Ok(SignedRoomInfo {
             room: found.name.to_string(),
-            owner: signed.owner.map(|k| k.to_hex()),
+            public: signed.public,
+            admins,
             epoch: signed.epoch,
             members,
             invited,
+            banned,
             your_counter: signed
                 .pins
                 .get(Key::fold(&agent.name).as_str())

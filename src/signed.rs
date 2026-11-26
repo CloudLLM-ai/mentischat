@@ -292,8 +292,16 @@ pub enum OpKind {
     Join,
     /// Leave the room.
     Leave,
-    /// Owner removes a member.
+    /// An admin removes a member (a kick).
     Remove,
+    /// An admin makes a member an admin.
+    Promote,
+    /// An admin makes an admin a participant.
+    Demote,
+    /// An admin bans an agent: it is removed and cannot join again.
+    Ban,
+    /// An admin lifts a ban.
+    Unban,
     /// Send a message to the room.
     Send,
     /// Hand an invited agent its MLS Welcome (end-to-end encrypted rooms).
@@ -306,7 +314,7 @@ pub enum OpKind {
     Deregister,
 }
 
-/// An `op` name that is not one of the eleven.
+/// An `op` name that is not one of the known operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnknownOp;
 
@@ -328,6 +336,10 @@ impl OpKind {
             Self::Join => "join",
             Self::Leave => "leave",
             Self::Remove => "remove",
+            Self::Promote => "promote",
+            Self::Demote => "demote",
+            Self::Ban => "ban",
+            Self::Unban => "unban",
             Self::Send => "send",
             Self::Welcome => "welcome",
             Self::PublishKeyPackages => "key_packages",
@@ -354,6 +366,10 @@ impl FromStr for OpKind {
             "join" => Self::Join,
             "leave" => Self::Leave,
             "remove" => Self::Remove,
+            "promote" => Self::Promote,
+            "demote" => Self::Demote,
+            "ban" => Self::Ban,
+            "unban" => Self::Unban,
             "send" => Self::Send,
             "welcome" => Self::Welcome,
             "key_packages" => Self::PublishKeyPackages,
@@ -368,10 +384,13 @@ impl FromStr for OpKind {
 /// covers beyond room, signer and counter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignedOp {
-    /// Create a signed room.
+    /// Create a signed room, its creator its first admin.
     Create {
         /// The room's description, empty when none.
         description: String,
+        /// Listed, and open to any agent with a bound key that is not banned.
+        /// A private room is unlisted and takes only the invited.
+        public: bool,
     },
     /// Invite `invitee`, whose key must be `invitee_key`.
     Invite {
@@ -384,9 +403,32 @@ pub enum SignedOp {
     Join,
     /// Leave the room.
     Leave,
-    /// Owner removes `target`.
+    /// An admin removes `target`, a member or an invitee.
     Remove {
         /// The member removed.
+        target: String,
+    },
+    /// An admin makes the member `target` an admin.
+    Promote {
+        /// The member promoted.
+        target: String,
+    },
+    /// An admin makes the admin `target` a participant.
+    Demote {
+        /// The admin demoted.
+        target: String,
+    },
+    /// An admin bans `target`: a member or invitee is removed, and neither the
+    /// name nor its key may join again until an `unban`.
+    Ban {
+        /// The banned name.
+        target: String,
+        /// The key bound to `target`, when it has one; banned with the name.
+        target_key: Option<PublicKey>,
+    },
+    /// An admin lifts the ban on `target`.
+    Unban {
+        /// The name whose ban is lifted.
         target: String,
     },
     /// Send `body` to the room.
@@ -412,6 +454,10 @@ impl SignedOp {
             Self::Join => OpKind::Join,
             Self::Leave => OpKind::Leave,
             Self::Remove { .. } => OpKind::Remove,
+            Self::Promote { .. } => OpKind::Promote,
+            Self::Demote { .. } => OpKind::Demote,
+            Self::Ban { .. } => OpKind::Ban,
+            Self::Unban { .. } => OpKind::Unban,
             Self::Send { .. } => OpKind::Send,
             Self::Welcome { .. } => OpKind::Welcome,
         }
@@ -420,10 +466,34 @@ impl SignedOp {
     /// The exact bytes the signer signs: the domain tag, then the op name,
     /// room and signer (both folded), the counter, and the op's own fields,
     /// each variable field behind a 4-byte big-endian length.
+    ///
+    /// A public `create` appends one byte, 1, after the description; a private
+    /// one signs exactly what it signed before rooms could be public. `ban`
+    /// signs the target, then 0, or 1 followed by the target's 32-byte key.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mentischat::signed::SignedOp;
+    ///
+    /// let private = SignedOp::Create { description: "d".into(), public: false };
+    /// let public = SignedOp::Create { description: "d".into(), public: true };
+    /// let (a, b) = (private.payload("r", "a", 1), public.payload("r", "a", 1));
+    /// assert_eq!(b.len(), a.len() + 1);
+    /// assert!(b.starts_with(&a));
+    /// ```
     pub fn payload(&self, room: &str, signer: &str, counter: u64) -> Vec<u8> {
         let mut out = header(self.kind(), room, signer, counter, self.fields_len());
         match self {
-            Self::Create { description } => put(&mut out, description.as_bytes()),
+            Self::Create {
+                description,
+                public,
+            } => {
+                put(&mut out, description.as_bytes());
+                if *public {
+                    out.push(1);
+                }
+            }
             Self::Invite {
                 invitee,
                 invitee_key,
@@ -432,7 +502,20 @@ impl SignedOp {
                 out.extend_from_slice(invitee_key.as_bytes());
             }
             Self::Join | Self::Leave => {}
-            Self::Remove { target } => put(&mut out, target.to_ascii_lowercase().as_bytes()),
+            Self::Remove { target }
+            | Self::Promote { target }
+            | Self::Demote { target }
+            | Self::Unban { target } => put(&mut out, target.to_ascii_lowercase().as_bytes()),
+            Self::Ban { target, target_key } => {
+                put(&mut out, target.to_ascii_lowercase().as_bytes());
+                match target_key {
+                    None => out.push(0),
+                    Some(key) => {
+                        out.push(1);
+                        out.extend_from_slice(key.as_bytes());
+                    }
+                }
+            }
             Self::Send { body } => put(&mut out, body.as_bytes()),
             Self::Welcome { target, welcome } => {
                 put(&mut out, target.to_ascii_lowercase().as_bytes());
@@ -442,12 +525,30 @@ impl SignedOp {
         out
     }
 
+    /// The name this operation acts on, for those that act on another member.
+    pub fn target(&self) -> Option<&str> {
+        match self {
+            Self::Remove { target }
+            | Self::Promote { target }
+            | Self::Demote { target }
+            | Self::Ban { target, .. }
+            | Self::Unban { target }
+            | Self::Welcome { target, .. } => Some(target),
+            Self::Invite { invitee, .. } => Some(invitee),
+            Self::Create { .. } | Self::Join | Self::Leave | Self::Send { .. } => None,
+        }
+    }
+
     fn fields_len(&self) -> usize {
         match self {
-            Self::Create { description } => description.len(),
+            Self::Create { description, .. } => description.len() + 1,
             Self::Invite { invitee, .. } => invitee.len() + 36,
             Self::Join | Self::Leave => 0,
-            Self::Remove { target } => target.len(),
+            Self::Remove { target }
+            | Self::Promote { target }
+            | Self::Demote { target }
+            | Self::Unban { target } => target.len(),
+            Self::Ban { target, .. } => target.len() + 37,
             Self::Send { body } => body.len(),
             Self::Welcome { target, welcome } => target.len() + welcome.len() + 8,
         }

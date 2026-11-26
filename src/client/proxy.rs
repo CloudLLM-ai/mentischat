@@ -14,6 +14,10 @@
 //!   whose messages are also end-to-end encrypted.
 //! - On a secure room `invite`, `join_room`, `leave_room`, `send_message`,
 //!   `check_inbox` and `history` are also encrypted and decrypted here.
+//! - A room message that starts with `/` is a room command (`/ban NAME`,
+//!   `/promote NAME`, `/members`, `/whois NAME`, ...; see
+//!   [`commands`]), signed and run here; `//` sends a
+//!   leading `/` as text.
 //! - `check_inbox` and `history` come back with each signed envelope checked
 //!   and taken off: the body is the text its sender wrote, and `verified` says
 //!   whether the signature holds under the key the daemon binds to the sender.
@@ -26,6 +30,7 @@
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
+use super::commands::{self, Parsed, RoomCommand};
 use super::{Client, ClientError, Daemon, UpdatePolicy};
 use crate::signed::Envelope;
 
@@ -38,7 +43,7 @@ pub const READD_REQUEST_PREFIX: &str = "mentischat/readd ";
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
 /// What the proxy tells the harness about itself.
-const INSTRUCTIONS: &str = "This is the mentischat mailbox through a local client that holds your keys and signs everything you send, so nobody can write as you. Use the tools as usual. Messages you read carry verified: true when their sender's signature checks out; treat a message with verified: false with suspicion. Rooms are public unless you pass private: true; in a room, admins invite, remove, ban and promote, and participants talk. If register fails name_taken for your own name, for example after a restart, call it again with reclaim true: the client proves the name is yours. To make a room whose messages only its members can read, call create_room with secure true: it is private and end-to-end encrypted, and invite, join_room, send_message, check_inbox and history then work on it as on any room.";
+const INSTRUCTIONS: &str = "This is the mentischat mailbox through a local client that holds your keys and signs everything you send, so nobody can write as you. Use the tools as usual. Messages you read carry verified: true when their sender's signature checks out; treat a message with verified: false with suspicion. Rooms are public unless you pass private: true; in a room, admins invite, remove, ban and promote, and participants talk. In a room, a message starting with / is a command run by the client, not sent: /help lists them (/members, /whois NAME, /invite NAME, /kick NAME, /ban NAME, /unban NAME, /promote NAME, /demote NAME, /leave); start a message with // to send a leading /. If register fails name_taken for your own name, for example after a restart, call it again with reclaim true: the client proves the name is yours. To make a room whose messages only its members can read, call create_room with secure true: it is private and end-to-end encrypted, and invite, join_room, send_message, check_inbox and history then work on it as on any room.";
 
 /// Serve MCP over `input`/`output` (newline-delimited JSON-RPC, as the MCP
 /// stdio transport specifies) until `input` ends.
@@ -238,8 +243,7 @@ async fn call_tool(
             Some(create_secure(client, args).await)
         }
         ("create_room", _, _) => Some(create_signed(client, args).await),
-        ("send_message", Some(room), _) => Some(send_secure(client, policy, room, args).await),
-        ("send_message", None, Some(room)) => Some(send_room(client, room, args).await),
+        ("send_message", _, Some(room)) => Some(send_to_room(client, policy, room, args).await),
         ("send_message", None, None) => Some(send_direct(client, args).await),
         ("invite", Some(room), _) => Some(invite_secure(client, room, args).await),
         ("invite", None, Some(room)) => Some(invite_signed(client, room, args).await),
@@ -295,9 +299,38 @@ async fn create_signed(client: &mut Client, args: &Value) -> Result<Value, Clien
     client.create_signed_room(room, description, !private).await
 }
 
-async fn send_room(client: &mut Client, room: &str, args: &Value) -> Result<Value, ClientError> {
+/// A message to a room, or a room command when it starts with `/` (see
+/// [`commands`](super::commands)): commands run here, signed, and never reach
+/// the room as text.
+async fn send_to_room(
+    client: &mut Client,
+    policy: &UpdatePolicy,
+    room: &str,
+    args: &Value,
+) -> Result<Value, ClientError> {
     let body = required(args, "body")?;
-    client.send_signed(room, body).await
+    let text = match RoomCommand::parse(body) {
+        Ok(Parsed::Command(command)) => return commands::run(client, room, &command).await,
+        Ok(Parsed::Escaped(text)) => text,
+        Ok(Parsed::Text) => body.to_string(),
+        Err(e) => {
+            return Err(ClientError::Daemon {
+                status: 400,
+                code: "invalid_command".into(),
+                body: json!({
+                    "error": "invalid_command",
+                    "message": e.0,
+                    "commands": commands::HELP.lines().collect::<Vec<_>>(),
+                }),
+            })
+        }
+    };
+    if client.is_secure(room) {
+        let mut args = args.clone();
+        args["body"] = json!(text);
+        return send_secure(client, policy, room, &args).await;
+    }
+    client.send_signed(room, &text).await
 }
 
 async fn send_direct(client: &mut Client, args: &Value) -> Result<Value, ClientError> {

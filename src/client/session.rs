@@ -298,6 +298,19 @@ impl Client {
         self.rooms.keys().cloned().collect()
     }
 
+    /// The secure rooms whose group is still live (not left or removed from):
+    /// the groups that know this client's key.
+    pub fn live_secure_rooms(&self) -> Vec<String> {
+        let mut rooms: Vec<String> = self
+            .rooms
+            .iter()
+            .filter(|(_, log)| !log.ended)
+            .map(|(room, _)| room.clone())
+            .collect();
+        rooms.sort();
+        rooms
+    }
+
     fn persist(&self) -> Result<(), ClientError> {
         let values = self
             .provider

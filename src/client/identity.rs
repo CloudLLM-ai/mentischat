@@ -163,6 +163,64 @@ impl Identity {
         })
     }
 
+    /// Begin replacing this identity's key: a fresh random key written beside
+    /// the current one as `identity.key.next` (`0600`), returned as an
+    /// identity that is not yet in use. [`finish_rotation`](Self::finish_rotation)
+    /// makes it the key once the daemon has accepted it; until then the
+    /// current key stays.
+    ///
+    /// A `.next` left by a rotation that crashed half way is returned as it
+    /// is, so the caller can find out whether the daemon took it.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Storage`] when the file cannot be read or written.
+    pub fn stage_rotation(&self) -> Result<Self, ClientError> {
+        let path = self.next_path();
+        let seed = match fs::read_to_string(&path) {
+            Ok(text) => {
+                refuse_loose_permissions(&path)?;
+                hex_decode::<32>(text.trim())
+                    .map_err(|e| ClientError::Storage(format!("{}: {e}", path.display())))?
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let seed = fresh_seed()?;
+                write_private(&path, format!("{}\n", hex_encode(&seed)).as_bytes())?;
+                seed
+            }
+            Err(e) => return Err(ClientError::Storage(format!("{}: {e}", path.display()))),
+        };
+        Ok(Self {
+            agent: self.agent.clone(),
+            keys: Keypair::from_seed(seed),
+            seed,
+            dir: self.dir.clone(),
+        })
+    }
+
+    /// Make the staged key ([`stage_rotation`](Self::stage_rotation)) this
+    /// identity's key: `identity.key.next` is renamed over `identity.key`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Storage`] when the rename fails.
+    pub fn finish_rotation(&mut self, next: Self) -> Result<(), ClientError> {
+        let path = self.dir.join("identity.key");
+        fs::rename(self.next_path(), &path)
+            .map_err(|e| ClientError::Storage(format!("{}: {e}", path.display())))?;
+        *self = next;
+        Ok(())
+    }
+
+    /// Drop a staged key the daemon did not take.
+    pub fn abandon_rotation(&self) {
+        let _ = fs::remove_file(self.next_path());
+    }
+
+    fn next_path(&self) -> PathBuf {
+        self.dir.join("identity.key.next")
+    }
+
     /// The agent name this identity acts as.
     pub fn agent(&self) -> &str {
         &self.agent

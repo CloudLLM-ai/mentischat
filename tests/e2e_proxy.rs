@@ -964,3 +964,176 @@ async fn after_a_restart_the_proxy_takes_its_bound_name_back_by_itself() {
     let vega_key = Identity::open(&clients, "vega").unwrap().public().to_hex();
     assert_eq!(body["publicKey"], vega_key, "{body}");
 }
+
+/// Room commands typed as messages run through the proxy, signed: admins
+/// promote, ban and kick, everyone sees roles and fingerprints, a bad command
+/// says what the commands are, and `//` sends a leading slash as text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn room_commands_typed_in_the_chat_run_signed() {
+    let w = world().await;
+    let (mut alice, mut bob, mut carol) =
+        (w.harness("alice"), w.harness("bob"), w.harness("carol"));
+    for (h, n) in [
+        (&mut alice, "alice"),
+        (&mut bob, "bob"),
+        (&mut carol, "carol"),
+    ] {
+        h.tool("register", json!({ "agent": n })).await;
+    }
+    alice
+        .tool("create_room", json!({ "agent": "alice", "room": "lobby" }))
+        .await;
+    for (h, n) in [(&mut bob, "bob"), (&mut carol, "carol")] {
+        let (err, v) = h
+            .tool("join_room", json!({ "agent": n, "room": "lobby" }))
+            .await;
+        assert!(!err, "{v}");
+    }
+    let say = |body: &str| json!({ "from": "x", "room": "lobby", "body": body });
+    let as_ = |who: &str, body: &str| {
+        let mut v = say(body);
+        v["from"] = json!(who);
+        v
+    };
+
+    let (err, v) = bob.tool("send_message", as_("bob", "/ban carol")).await;
+    assert!(err);
+    assert_eq!(v["error"], "not_an_admin");
+    let (err, v) = alice
+        .tool("send_message", as_("alice", "/promote bob"))
+        .await;
+    assert!(!err, "{v}");
+    assert_eq!(v["command"], "promote");
+    let (err, v) = bob.tool("send_message", as_("bob", "/ban carol")).await;
+    assert!(!err, "{v}");
+
+    let (err, v) = carol
+        .tool("send_message", as_("carol", "still here?"))
+        .await;
+    assert!(err, "carol is banned: {v}");
+    let (err, v) = carol
+        .tool("join_room", json!({ "agent": "carol", "room": "lobby" }))
+        .await;
+    assert!(err);
+    assert_eq!(v["error"], "banned");
+
+    let (_, v) = alice.tool("send_message", as_("alice", "/members")).await;
+    let members = v["result"]["members"].as_array().unwrap();
+    assert_eq!(members.len(), 2);
+    assert!(members.iter().all(|m| m["role"] == "admin"));
+    assert!(members.iter().all(|m| m["fingerprint"].as_str().is_some()));
+    assert_eq!(v["result"]["banned"][0]["agent"], "carol");
+
+    let (_, v) = alice.tool("send_message", as_("alice", "/whois bob")).await;
+    assert_eq!(v["result"]["agent"], "bob");
+    let (_, mine) = bob.tool("send_message", as_("bob", "/key")).await;
+    assert_eq!(v["result"]["fingerprint"], mine["result"]["fingerprint"]);
+
+    let (err, v) = alice
+        .tool("send_message", as_("alice", "/frobnicate"))
+        .await;
+    assert!(err);
+    assert_eq!(v["error"], "invalid_command");
+    assert!(v["commands"].as_array().unwrap().len() > 5);
+
+    let (err, v) = alice
+        .tool("send_message", as_("alice", "//etc/hosts"))
+        .await;
+    assert!(!err, "{v}");
+    let (_, page) = bob.tool("check_inbox", json!({ "agent": "bob" })).await;
+    let bodies: Vec<&str> = page["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["body"].as_str().unwrap())
+        .collect();
+    assert_eq!(bodies, ["/etc/hosts"], "commands never reach the room");
+
+    // Kicking takes a member out; they can come back to a public room.
+    let (err, v) = alice.tool("send_message", as_("alice", "/kick bob")).await;
+    assert!(!err, "{v}");
+    let (err, v) = bob
+        .tool("join_room", json!({ "agent": "bob", "room": "lobby" }))
+        .await;
+    assert!(!err, "{v}");
+}
+
+/// In a secure room `/kick` also commits the member out of the MLS group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kicking_from_a_secure_room_through_the_chat_removes_the_leaf() {
+    let w = world().await;
+    let (mut alice, mut bob) = (w.harness("alice"), w.harness("bob"));
+    for (h, n) in [(&mut alice, "alice"), (&mut bob, "bob")] {
+        h.tool("register", json!({ "agent": n })).await;
+    }
+    alice
+        .tool(
+            "create_room",
+            json!({ "agent": "alice", "room": "vault", "secure": true }),
+        )
+        .await;
+    let (err, v) = alice
+        .tool(
+            "send_message",
+            json!({ "from": "alice", "room": "vault", "body": "/invite bob" }),
+        )
+        .await;
+    assert!(!err, "{v}");
+    let (err, v) = bob
+        .tool("join_room", json!({ "agent": "bob", "room": "vault" }))
+        .await;
+    assert!(!err, "{v}");
+    let (err, v) = alice
+        .tool(
+            "send_message",
+            json!({ "from": "alice", "room": "vault", "body": "/kick bob" }),
+        )
+        .await;
+    assert!(!err, "{v}");
+    assert_eq!(v["result"]["members"].as_array().unwrap().len(), 1);
+    let (err, _) = bob
+        .tool(
+            "send_message",
+            json!({ "from": "bob", "room": "vault", "body": "hello?" }),
+        )
+        .await;
+    assert!(err, "bob is out");
+}
+
+/// The command line takes room commands, `whois` and `key rotate`.
+#[test]
+fn the_command_line_parses_room_commands() {
+    use mentischat::client::commands::RoomCommand;
+    let args = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+    match parse(&args("room ban lobby Mallory --agent Vega")).unwrap() {
+        Command::Room { room, command, .. } => {
+            assert_eq!(room, "lobby");
+            assert_eq!(command, RoomCommand::Ban("Mallory".into()));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(
+        parse(&args("room members lobby --agent Vega")).unwrap(),
+        Command::Room {
+            command: RoomCommand::Members,
+            ..
+        }
+    ));
+    assert!(matches!(
+        parse(&args("whois Orion --agent Vega")).unwrap(),
+        Command::Whois { ref target, .. } if target == "Orion"
+    ));
+    assert!(matches!(
+        parse(&args("key rotate --agent Vega")).unwrap(),
+        Command::KeyRotate { .. }
+    ));
+    for bad in [
+        "room ban lobby --agent Vega",
+        "room members lobby extra --agent Vega",
+        "room frob lobby --agent Vega",
+        "room ban lobby bad!name --agent Vega",
+        "whois --agent Vega",
+    ] {
+        assert!(parse(&args(bad)).is_err(), "{bad}");
+    }
+}

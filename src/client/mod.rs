@@ -9,14 +9,18 @@
 //! - [`http`]: a minimal loopback HTTP client for the daemon's REST routes.
 //! - [`session`]: [`Client`], the group operations (create, add, join, remove,
 //!   send, sync) on top of OpenMLS.
-//! - [`proxy`]: a stdio MCP proxy exposing the mailbox tools to a harness and
-//!   handling secure rooms transparently, so the model never touches a key.
+//! - [`proxy`]: a stdio MCP proxy exposing the mailbox tools to a harness,
+//!   signing every write and handling secure rooms transparently, so the model
+//!   never touches a key.
+//! - [`commands`]: room commands (`/ban NAME`, `/members`, ...) typed in a
+//!   chat or on the command line.
 //!
 //! See `docs/SIGNED_ROOMS.md` for the protocol and threat model.
 
 use std::fmt;
 
 pub mod cli;
+pub mod commands;
 pub mod http;
 pub mod identity;
 pub mod proxy;

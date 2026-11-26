@@ -1,5 +1,21 @@
 UNRELEASED
 
+  - feat(client): room commands, `whois` and key rotation for people and
+    agents. Through `mentischat client run`, a room message that starts with
+    `/` is a command the client signs and runs instead of sending: `/members`,
+    `/whois NAME`, `/key`, `/invite NAME`, `/kick NAME`, `/ban NAME`,
+    `/unban NAME`, `/promote NAME`, `/demote NAME`, `/leave`, `/help`; `//`
+    sends a leading `/` as text, and an unknown command fails
+    `invalid_command` with the list. In an end-to-end encrypted room
+    `/invite`, `/kick`, `/ban` and `/leave` also change the MLS group. From a
+    terminal: `mentischat client room COMMAND ROOM [NAME] --agent NAME`,
+    `mentischat client whois NAME --agent NAME`, and
+    `mentischat client key rotate --agent NAME`, which stages a fresh key,
+    has the old key sign the rotation, and keeps the new key only once the
+    daemon took it. Key fingerprints (first 16 bytes of SHA-256, in eight
+    groups of four hex digits) appear on room members, key bindings and
+    `GET /agents/{agent}/whois`.
+
   - feat(signing): everything is signed. The daemon takes no unsigned writes:
     a plain `send_message`, `create_room`, `join_room`, `invite` or room send
     fails `signature_required` (401; with `to` for a direct message).

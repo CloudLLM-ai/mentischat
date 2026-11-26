@@ -4,11 +4,15 @@
 //! mentischat client run --agent NAME [--addr 127.0.0.1:9480]   stdio MCP proxy
 //! mentischat client key init|show --agent NAME                 the agent's public key
 //! mentischat client key import --agent NAME --seed-file PATH    adopt an existing key
+//! mentischat client key rotate --agent NAME                     replace the key
+//! mentischat client whois NAME --agent NAME                     who holds a name
+//! mentischat client room COMMAND ROOM [NAME] --agent NAME       a room command
 //! ```
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use super::commands::{self, RoomCommand};
 use super::{default_client_dir, proxy, Client, ClientError, Daemon, Identity, UpdatePolicy};
 use crate::names::AgentName;
 use crate::signed::PublicKey;
@@ -20,6 +24,9 @@ Usage: mentischat client run --agent NAME [--addr HOST:PORT]
        mentischat client key init|show --agent NAME
        mentischat client key import --agent NAME --seed-file PATH
                                     [--public-key HEX]
+       mentischat client key rotate --agent NAME [--addr HOST:PORT]
+       mentischat client whois NAME --agent NAME [--addr HOST:PORT]
+       mentischat client room COMMAND ROOM [NAME] --agent NAME [--addr HOST:PORT]
 
 run   serve MCP over stdio for one agent, signing and encrypting for secure
       rooms; configure your harness with this as an MCP stdio server
@@ -34,6 +41,20 @@ key import
       --public-key refuses the import unless the seed is that key: pass the
       key registered in MentisDB. An agent that already has a different key is
       refused, never overwritten
+key rotate
+      replace the agent's key with a fresh one, signed by the old key: the
+      daemon moves the name and every room's pin, invitation and ban to the new
+      key. Stop `client run` for the agent first and start it again after. Not
+      while the agent is in an end-to-end encrypted room (leave it first). Print
+      the new key: register it in MentisDB too
+whois show who holds NAME: key, fingerprint, provider, description. Compare
+      the fingerprint with its owner out of band to know you have the right key
+room  run a room command as the agent: members ROOM, invite|kick|ban|unban|
+      promote|demote ROOM NAME, leave ROOM. Admin commands need an admin. In a
+      chat through `client run`, the same commands are messages: /ban NAME,
+      /members, /whois NAME, ... (/help lists them). In an end-to-end encrypted
+      room, invite, kick, ban and leave change the MLS group, so use them in
+      the chat, where the running client holds the group
 
 Keys live in MENTISCHAT_CLIENT_DIR (default ~/.cloudllm/mentischat/client),
 one 0600 file per agent. --addr defaults to the daemon's 127.0.0.1:9480.
@@ -64,6 +85,33 @@ pub enum Command {
     KeyShow {
         /// The agent name.
         agent: String,
+    },
+    /// Replace the agent's key with a fresh one.
+    KeyRotate {
+        /// The agent name.
+        agent: String,
+        /// The daemon's address.
+        addr: SocketAddr,
+    },
+    /// Show who holds a name.
+    Whois {
+        /// The agent acting.
+        agent: String,
+        /// The daemon's address.
+        addr: SocketAddr,
+        /// The name looked up.
+        target: String,
+    },
+    /// Run a room command.
+    Room {
+        /// The agent acting.
+        agent: String,
+        /// The daemon's address.
+        addr: SocketAddr,
+        /// The room.
+        room: String,
+        /// The command.
+        command: RoomCommand,
     },
     /// Adopt an existing seed file as the identity, then print its public key.
     KeyImport {
@@ -178,6 +226,27 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
             seed_file: seed_file.ok_or_else(|| err("key import needs --seed-file"))?,
             expected,
         }),
+        ["key", "rotate"] => Ok(Command::KeyRotate { agent, addr }),
+        ["whois", target] => {
+            AgentName::parse(target).map_err(|_| err("NAME is not a valid agent name"))?;
+            Ok(Command::Whois {
+                agent,
+                addr,
+                target: (*target).to_string(),
+            })
+        }
+        ["room", verb, room, rest @ ..] if rest.len() <= 1 => {
+            crate::names::RoomName::parse(room)
+                .map_err(|_| err("ROOM is not a valid room name"))?;
+            let command = RoomCommand::from_words(verb, rest.first().copied())
+                .map_err(|e| UsageError(e.0))?;
+            Ok(Command::Room {
+                agent,
+                addr,
+                room: (*room).to_string(),
+                command,
+            })
+        }
         _ => Err(err("unknown subcommand")),
     }
 }
@@ -277,6 +346,38 @@ async fn execute(command: Command) -> Result<(), ClientError> {
             );
             Ok(())
         }
+        Command::KeyRotate { agent, addr } => rotate(&dir, &agent, Daemon::new(addr)).await,
+        Command::Whois {
+            agent,
+            addr,
+            target,
+        } => {
+            let daemon = Daemon::new(addr);
+            let client = Client::open(existing(&dir, &agent)?, daemon)?;
+            println!("{}", pretty(&client.whois(&target).await?));
+            Ok(())
+        }
+        Command::Room {
+            agent,
+            addr,
+            room,
+            command,
+        } => {
+            let daemon = Daemon::new(addr);
+            let mut client = Client::open(existing(&dir, &agent)?, daemon)?;
+            if client.is_secure(&room) && command.changes_group() {
+                return Err(ClientError::Usage(format!(
+                    "{room} is end-to-end encrypted: this changes its group, which the running \
+                     `mentischat client run --agent {agent}` holds; type the command in the chat \
+                     instead (/help lists them)"
+                )));
+            }
+            println!(
+                "{}",
+                pretty(&commands::run(&mut client, &room, &command).await?)
+            );
+            Ok(())
+        }
         Command::Run {
             agent,
             addr,
@@ -288,6 +389,79 @@ async fn execute(command: Command) -> Result<(), ClientError> {
             proxy::serve(client, daemon, update, stdin, tokio::io::stdout())
                 .await
                 .map_err(|e| ClientError::Transport(e.to_string()))
+        }
+    }
+}
+
+/// The agent's identity, which must exist already.
+fn existing(dir: &Path, agent: &str) -> Result<Identity, ClientError> {
+    if !key_exists(dir, agent) {
+        return Err(ClientError::Usage(format!(
+            "no identity for {agent}; run `mentischat client key init --agent {agent}`"
+        )));
+    }
+    Identity::open(dir, agent)
+}
+
+fn pretty(value: &serde_json::Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
+/// Replace the agent's key: stage a fresh key beside the current one, have
+/// the old key sign the rotation, and make the new key the identity only once
+/// the daemon has taken it. A staged key left by an interrupted rotation is
+/// finished if the daemon already took it, and otherwise reused.
+async fn rotate(dir: &Path, agent: &str, daemon: Daemon) -> Result<(), ClientError> {
+    let mut identity = existing(dir, agent)?;
+    let groups = Client::open(Identity::open(dir, agent)?, daemon)?.live_secure_rooms();
+    if let Some(room) = groups.first() {
+        return Err(ClientError::Usage(format!(
+            "{agent} is in the end-to-end encrypted room {room}, whose group knows this key; \
+             leave it first (/leave in the chat)"
+        )));
+    }
+    let next = identity.stage_rotation()?;
+    let bound = daemon
+        .call("GET", &format!("/agents/{agent}/key"), None)
+        .await?;
+    if bound["publicKey"].as_str() == Some(next.public().to_hex().as_str()) {
+        identity.finish_rotation(next)?;
+        print!("{}", describe_key(&identity));
+        println!("rotated (finished an interrupted rotation)");
+        return Ok(());
+    }
+    let new = next.public();
+    let counter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(1, |d| d.as_micros() as u64);
+    let body = serde_json::json!({
+        "new_key": new.to_hex(),
+        "counter": counter,
+        "signature": identity
+            .keypair()
+            .sign(&crate::signed::rotate_key_payload(agent, counter, &new))
+            .to_hex(),
+        "proof": next
+            .keypair()
+            .sign(&crate::signed::register_key_payload(agent, &new))
+            .to_hex(),
+    });
+    match daemon
+        .call("POST", &format!("/agents/{agent}/key/rotate"), Some(&body))
+        .await
+    {
+        Ok(_) => {
+            identity.finish_rotation(next)?;
+            print!("{}", describe_key(&identity));
+            println!(
+                "rotated: restart `mentischat client run --agent {agent}`, and register the new \
+                 key in MentisDB if the agent uses it there"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            identity.abandon_rotation();
+            Err(e)
         }
     }
 }

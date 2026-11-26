@@ -453,3 +453,48 @@ fn test_client_run_refuses_a_non_loopback_daemon() {
     assert_eq!(code, Some(2));
     assert!(err.contains("loopback"), "{err}");
 }
+
+/// `mentischat client key rotate` replaces the agent's key on the daemon and
+/// in its key file, through the real binaries.
+#[test]
+fn test_client_key_rotate_replaces_the_key_everywhere() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let clients = dir.path().join("clients");
+    let daemon = Running::start(command(&dir.path().join("daemon")));
+    let client = |args: &[&str]| {
+        Command::new(BIN)
+            .arg("client")
+            .args(args)
+            .env("MENTISCHAT_CLIENT_DIR", &clients)
+            .stdin(Stdio::null())
+            .output()
+            .expect("client runs")
+    };
+    let out = client(&["key", "init", "--agent", "Vega"]);
+    assert!(out.status.success(), "{out:?}");
+    let seed_file = clients.join("vega").join("identity.key");
+    let seed = |path: &Path| {
+        let text = std::fs::read_to_string(path).unwrap();
+        Keypair::from_seed(mentischat::signed::hex_decode::<32>(text.trim()).unwrap())
+    };
+    let old = seed(&seed_file);
+    enroll(daemon.addr, "Vega", &old);
+
+    let addr = daemon.addr.to_string();
+    let out = client(&["key", "rotate", "--agent", "Vega", "--addr", &addr]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let new = seed(&seed_file);
+    assert_ne!(new.public(), old.public());
+    assert!(!clients.join("vega").join("identity.key.next").exists());
+    let (status, body) = http(daemon.addr, "GET", "/agents/Vega/key", None);
+    assert_eq!(status, 200);
+    assert!(body.contains(&new.public().to_hex()), "{body}");
+    let (status, body) = http(daemon.addr, "GET", "/agents/Vega/whois", None);
+    assert_eq!(status, 200);
+    assert!(body.contains(&new.public().fingerprint()), "{body}");
+    assert_eq!(daemon.terminate().code(), Some(0));
+}

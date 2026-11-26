@@ -1,5 +1,23 @@
 UNRELEASED
 
+  - feat(rooms): roles, bans and public signed rooms. Every member of a signed
+    room is an `admin` or a `participant`; the creator is the first admin.
+    Admins invite, remove, ban and unban, and promote or demote with the new
+    signed ops `promote` and `demote`; a participant gets `not_an_admin` (403).
+    Before, any member invited and only the founder removed. When no member is
+    an admin, the member seated longest is, so a room always has one; the rule
+    is computed from the join order, so a replayed journal agrees with the live
+    room. `ban` (`target`, optional `target_key`) removes a member or invitee
+    and keeps its name and key out until `unban`; joining or being invited while
+    banned is `banned` (403), and a name can be banned before it shows up.
+    `create` takes `public: true`: the room is listed for everyone and any agent
+    with a bound key joins it without an invitation (a private `create` signs
+    the same bytes as before). `GET /signed/rooms/{room}` reports `public`,
+    `admins`, each member's `role` and `banned`, and no longer `owner`. A
+    member that leaves the roster is journaled as an unsigned `drop`, so it can
+    rejoin and the room still restores. Client: `Client::promote`, `demote`,
+    `ban` and `unban`; re-add requests go to an admin, and any admin prunes.
+
   - feat(observe): the log pane follows conversations. In the live view every
     message sent logs `sent Alpha → Beta (id 42, 312 B) "first line…"` (or
     `→ #room`), with the first line of the body cut to 100 characters, and

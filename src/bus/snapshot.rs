@@ -139,6 +139,10 @@ struct AgentRec {
     key: Option<KeyRec>,
     #[serde(default)]
     key_counter: u64,
+    /// Highest counter the agent signed a direct message with, so a captured
+    /// signed message cannot be sent again after a restart.
+    #[serde(default)]
+    direct_counter: u64,
     /// Ordinary KeyPackages on offer, hex. Opaque; clients validate them on use.
     #[serde(default)]
     key_packages: Vec<String>,
@@ -252,6 +256,7 @@ pub(super) fn capture(state: &State) -> Snapshot {
                         signature: p.to_hex(),
                     }),
                     key_counter: st.key_counter,
+                    direct_counter: st.direct_counter,
                     key_packages: st.key_packages.iter().map(|p| hex_encode(p)).collect(),
                     last_resort: st.last_resort.as_deref().map(hex_encode),
                 }
@@ -472,6 +477,7 @@ fn restore_agents(state: &State, agents: Vec<AgentRec>) -> usize {
         }
         let (key_rec, key_counter, packages, last_resort) =
             (rec.key, rec.key_counter, rec.key_packages, rec.last_resort);
+        let direct_counter = rec.direct_counter;
         let provider = rec.provider.map(|p| Provider::parse(&p));
         let description = rec.description.map(super::validate_description);
         skipped += usize::from(matches!(provider, Some(Err(_))));
@@ -488,6 +494,7 @@ fn restore_agents(state: &State, agents: Vec<AgentRec>) -> usize {
             rec.last_seen_ms,
         );
         skipped += restore_keys(&agent, key_rec, key_counter, packages, last_resort);
+        agent.inner.lock().direct_counter = direct_counter;
         state.add_agent(key, Arc::new(agent));
     }
     skipped

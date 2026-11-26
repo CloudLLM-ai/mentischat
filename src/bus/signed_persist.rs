@@ -259,7 +259,8 @@ impl OpRec {
             | OpKind::PublishKeyPackages
             | OpKind::Reclaim
             | OpKind::Deregister
-            | OpKind::RotateKey => return None,
+            | OpKind::RotateKey
+            | OpKind::Direct => return None,
         };
         Some((op, key, signature))
     }

@@ -154,6 +154,8 @@ pub(super) struct AgentState {
     /// Highest counter this agent has signed for a KeyPackage publish or a
     /// reclaim.
     pub key_counter: u64,
+    /// Highest counter this agent has signed a direct message with.
+    pub direct_counter: u64,
     /// Serialized MLS KeyPackages others may take to add this agent to an
     /// end-to-end encrypted room, oldest first. Opaque to the daemon.
     pub key_packages: VecDeque<Vec<u8>>,
@@ -221,6 +223,7 @@ impl Agent {
                 key: None,
                 key_proof: None,
                 key_counter: 0,
+                direct_counter: 0,
                 key_packages: VecDeque::new(),
                 last_resort: None,
                 package_takes: VecDeque::new(),
@@ -476,6 +479,9 @@ pub(super) struct State {
     /// ([`Bus::with_key_registry`](super::Bus::with_key_registry)): names it
     /// holds stay reserved for their keys while off the roster.
     pub keyring: Option<super::keyring::KeyRing>,
+    /// Every send and every room operation must be signed
+    /// ([`Bus::with_signatures_required`](super::Bus::with_signatures_required)).
+    pub require_signatures: bool,
 }
 
 impl State {
@@ -500,6 +506,7 @@ impl State {
             sent_by_gone: AtomicU64::new(0),
             closed: AtomicBool::new(false),
             keyring: None,
+            require_signatures: false,
         }
     }
 

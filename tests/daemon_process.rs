@@ -14,6 +14,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use common::process::{command, http, wait_exit, Running, BIN};
+use mentischat::signed::{direct_payload, register_key_payload, Keypair};
 
 /// Run `mentischat <args>` to completion: `(exit code, stdout, stderr)`.
 fn run_args(args: &[&str]) -> (Option<i32>, String, String) {
@@ -54,6 +55,41 @@ fn register(addr: SocketAddr, agent: &str) -> (u16, String) {
         "/agents",
         Some(&format!(r#"{{"agent":"{agent}"}}"#)),
     )
+}
+
+/// The key an agent signs with in these tests: `seed` fills the secret.
+fn keys(seed: u8) -> Keypair {
+    Keypair::from_seed([seed; 32])
+}
+
+/// Register `agent` and bind `keys` to it.
+fn enroll(addr: SocketAddr, agent: &str, keys: &Keypair) {
+    assert_eq!(register(addr, agent).0, 200);
+    let key = keys.public();
+    let sig = keys.sign(&register_key_payload(agent, &key));
+    let body = format!(
+        r#"{{"public_key":"{}","signature":"{}"}}"#,
+        key.to_hex(),
+        sig.to_hex()
+    );
+    let (status, reply) = http(addr, "PUT", &format!("/agents/{agent}/key"), Some(&body));
+    assert_eq!(status, 200, "{reply}");
+}
+
+/// `POST /messages` signed by `keys` at `counter`.
+fn send_signed(
+    addr: SocketAddr,
+    keys: &Keypair,
+    (from, to): (&str, &str),
+    counter: u64,
+    body: &str,
+) -> (u16, String) {
+    let sig = keys.sign(&direct_payload(from, to, counter, body));
+    let json = serde_json::json!({
+        "from": from, "to": to, "body": body,
+        "counter": counter, "signature": sig.to_hex(),
+    });
+    http(addr, "POST", "/messages", Some(&json.to_string()))
 }
 
 fn snapshot_file(dir: &Path) -> std::path::PathBuf {
@@ -106,14 +142,9 @@ fn test_sigterm_wipes_the_mailbox_and_exits_zero() {
 
     let (status, body) = http(addr, "GET", "/health", None);
     assert_eq!(status, 200, "{body}");
-    assert_eq!(register(addr, "Vega").0, 200);
-    assert_eq!(register(addr, "Orion").0, 200);
-    let (status, body) = http(
-        addr,
-        "POST",
-        "/messages",
-        Some(r#"{"from":"Vega","to":"Orion","body":"hello"}"#),
-    );
+    enroll(addr, "Vega", &keys(1));
+    enroll(addr, "Orion", &keys(2));
+    let (status, body) = send_signed(addr, &keys(1), ("Vega", "Orion"), 1, "hello");
     assert_eq!(status, 200, "{body}");
 
     let status = daemon.terminate();
@@ -122,6 +153,44 @@ fn test_sigterm_wipes_the_mailbox_and_exits_zero() {
         !snapshot_file(dir.path()).exists(),
         "a clean stop wipes the mailbox on disk"
     );
+}
+
+/// The daemon takes only signed sends and room operations unless
+/// `MENTISCHAT_UNSIGNED=1`; any other value stops it at startup.
+#[test]
+fn test_the_daemon_requires_signatures_unless_told_otherwise() {
+    let plain = r#"{"from":"Vega","to":"Orion","body":"hi"}"#;
+    let room = r#"{"agent":"Vega","room":"lobby"}"#;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let strict = Running::start(command(dir.path()));
+    assert_eq!(register(strict.addr, "Vega").0, 200);
+    assert_eq!(register(strict.addr, "Orion").0, 200);
+    let (status, body) = http(strict.addr, "POST", "/messages", Some(plain));
+    assert_eq!(status, 401, "{body}");
+    assert!(body.contains("signature_required"), "{body}");
+    let (status, body) = http(strict.addr, "POST", "/rooms", Some(room));
+    assert_eq!(status, 401, "{body}");
+    assert_eq!(strict.terminate().code(), Some(0));
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut cmd = command(dir.path());
+    cmd.env("MENTISCHAT_UNSIGNED", "1");
+    let loose = Running::start(cmd);
+    assert_eq!(register(loose.addr, "Vega").0, 200);
+    assert_eq!(register(loose.addr, "Orion").0, 200);
+    assert_eq!(http(loose.addr, "POST", "/messages", Some(plain)).0, 200);
+    assert_eq!(http(loose.addr, "POST", "/rooms", Some(room)).0, 200);
+    assert_eq!(loose.terminate().code(), Some(0));
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut cmd = command(dir.path());
+    cmd.env("MENTISCHAT_UNSIGNED", "yes");
+    let status = cmd
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(2));
 }
 
 /// Binding the port is the single-instance lock: a second daemon on the same
@@ -160,16 +229,10 @@ fn test_persist_survives_a_restart() {
         cmd
     };
     let first = Running::start(persisted());
-    assert_eq!(register(first.addr, "Vega").0, 200);
-    assert_eq!(register(first.addr, "Orion").0, 200);
+    enroll(first.addr, "Vega", &keys(1));
+    enroll(first.addr, "Orion", &keys(2));
     assert_eq!(
-        http(
-            first.addr,
-            "POST",
-            "/messages",
-            Some(r#"{"from":"Vega","to":"Orion","body":"survive me"}"#),
-        )
-        .0,
+        send_signed(first.addr, &keys(1), ("Vega", "Orion"), 1, "survive me").0,
         200
     );
     assert_eq!(first.terminate().code(), Some(0));

@@ -86,6 +86,10 @@ impl fmt::Display for Sent<'_> {
         }
         write!(f, " (id {}, {}", msg.id, Size(msg.body.len()))?;
         match (self.body, self.mode) {
+            (Body::Signed, TrafficLog::WithPreviews) => match signed_text(&msg.body) {
+                Some(text) => write!(f, ", signed) \"{}\"", preview(text)),
+                None => write!(f, ", signed)"),
+            },
             (Body::Signed, _) => write!(f, ", signed)"),
             (Body::Plain, TrafficLog::WithPreviews) => {
                 write!(f, ") \"{}\"", preview(&msg.body))
@@ -122,6 +126,13 @@ impl fmt::Display for Size {
             write!(f, "{:.1} KB", self.0 as f64 / 1024.0)
         }
     }
+}
+
+/// The text a signed body carries, unless it is end-to-end encrypted (an MLS
+/// message, which is ciphertext and never previewed).
+fn signed_text(body: &str) -> Option<&str> {
+    let text = crate::signed::Envelope::parse(body).ok()?.body;
+    (!text.starts_with("mls/")).then_some(text)
 }
 
 /// The first line of the trimmed `body`, control characters turned to

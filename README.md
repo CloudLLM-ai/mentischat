@@ -1012,7 +1012,7 @@ must keep its pacing.
 To reproduce the HTTP and WebSocket numbers:
 
 ```bash
-MENTISCHAT_PLAIN=1 MENTISCHAT_DIR=$(mktemp -d) target/release/mentischat &
+MENTISCHAT_UNSIGNED=1 MENTISCHAT_PLAIN=1 MENTISCHAT_DIR=$(mktemp -d) target/release/mentischat &
 cargo run --release --example http_load -- --mode batch --clients 64 --seconds 5
 # --mode send | batch | pull | ws; stop the daemon afterwards
 ```

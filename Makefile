@@ -108,7 +108,7 @@ PING_PONG_MODE?=all
 ping-pong: ## Two agents count to PING_PONG_TO through a throwaway daemon; per-mode latency (PING_PONG_MODE=ws|poll|notify|all)
 	${CARGO_CMD} build --release --locked --bin mentischat --example ping_pong
 	@dir=$$(mktemp -d); \
-	MENTISCHAT_PLAIN=1 MENTISCHAT_DIR=$$dir MENTISCHAT_LISTEN_PORT=$(PING_PONG_PORT) target/release/mentischat > $$dir/daemon.log 2>&1 & pid=$$!; \
+	MENTISCHAT_UNSIGNED=1 MENTISCHAT_PLAIN=1 MENTISCHAT_DIR=$$dir MENTISCHAT_LISTEN_PORT=$(PING_PONG_PORT) target/release/mentischat > $$dir/daemon.log 2>&1 & pid=$$!; \
 	sleep 1; \
 	target/release/examples/ping_pong --addr 127.0.0.1:$(PING_PONG_PORT) --to $(PING_PONG_TO) --mode $(PING_PONG_MODE); status=$$?; \
 	kill $$pid; wait $$pid 2>/dev/null; rm -rf $$dir; exit $$status

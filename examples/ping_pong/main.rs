@@ -4,7 +4,7 @@
 //! through MentisChat.
 //!
 //! ```text
-//! MENTISCHAT_PLAIN=1 MENTISCHAT_DIR=$(mktemp -d) MENTISCHAT_LISTEN_PORT=19580 \
+//! MENTISCHAT_UNSIGNED=1 MENTISCHAT_PLAIN=1 MENTISCHAT_DIR=$(mktemp -d) MENTISCHAT_LISTEN_PORT=19580 \
 //!     target/release/mentischat &
 //! cargo run --release --example ping_pong -- --addr 127.0.0.1:19580
 //! ```

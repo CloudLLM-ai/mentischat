@@ -399,6 +399,11 @@ pub async fn history(bus: &Bus, params: &Value) -> Result<HistoryPage, MailboxEr
 /// `to`, or to the room `room`, exactly one of the two (both is
 /// `invalid_body`). `from` is validated before the target, so when both are
 /// bad the error names `from`.
+///
+/// With `counter` and `signature` (together; REST and WebSocket only, the MCP
+/// tool does not list them) the send is signed: a direct message by
+/// [`Bus::send_signed`], a room message as the signed `send` operation. A
+/// daemon that requires signatures takes no other kind.
 pub async fn send_message(bus: &Bus, params: &Value) -> Result<Value, MailboxError> {
     let from = required_name(params, "from")?;
     let room = optional_room(params.get("room"))?;
@@ -409,14 +414,50 @@ pub async fn send_message(bus: &Bus, params: &Value) -> Result<Value, MailboxErr
             .map(str::to_string)
             .ok_or(MailboxError::InvalidBody)
     };
+    let signed = send_proof(params)?;
     if let Some(room) = room {
         if optional_name(params.get("to"))?.is_some() {
             return Err(MailboxError::InvalidBody);
         }
-        return Ok(to_wire(bus.send_room(&from, &room, body(params)?).await?));
+        let body = body(params)?;
+        return Ok(match signed {
+            Some((counter, signature)) => to_wire(
+                bus.signed_op(crate::bus::SignedRequest {
+                    agent: from,
+                    room,
+                    counter,
+                    op: crate::signed::SignedOp::Send { body },
+                    signature,
+                })
+                .await?,
+            ),
+            None => to_wire(bus.send_room(&from, &room, body).await?),
+        });
     }
     let to = required_name(params, "to")?;
-    Ok(to_wire(bus.send(&from, &to, body(params)?).await?))
+    Ok(match signed {
+        Some((counter, signature)) => to_wire(
+            bus.send_signed(&from, &to, body(params)?, counter, &signature)
+                .await?,
+        ),
+        None => to_wire(bus.send(&from, &to, body(params)?).await?),
+    })
+}
+
+/// The `counter` and `signature` of a signed send, both or neither.
+fn send_proof(params: &Value) -> Result<Option<(u64, crate::signed::Signature)>, MailboxError> {
+    let given = |key: &str| params.get(key).filter(|v| !v.is_null());
+    match (given("counter"), given("signature")) {
+        (None, None) => Ok(None),
+        (Some(counter), Some(signature)) => Ok(Some((
+            uint(counter).ok_or(MailboxError::InvalidBody)?,
+            signature
+                .as_str()
+                .and_then(|s| s.parse().ok())
+                .ok_or(MailboxError::InvalidSignature)?,
+        ))),
+        _ => Err(MailboxError::InvalidBody),
+    }
 }
 
 /// Most messages in one `POST /messages/batch` or WebSocket `batch` frame.

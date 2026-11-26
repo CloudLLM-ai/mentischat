@@ -318,6 +318,18 @@ impl Room {
 }
 
 impl State {
+    /// `signature_required` for a plain room call when the bus requires
+    /// signatures (a room restored from before then is still unsigned).
+    fn refuse_when_required(&self, room: &RoomName) -> Result<(), MailErr> {
+        if self.require_signatures {
+            Err(MailErr::SignatureRequired {
+                room: room.to_string(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
     /// A room under `key`, treating a retired one as absent.
     pub(super) fn live_room(&self, room: &RoomName) -> Result<Arc<Room>, MailErr> {
         self.rooms
@@ -348,6 +360,11 @@ impl State {
         description: Option<String>,
         signed: Option<SignedState>,
     ) -> Result<RoomInfo, MailErr> {
+        if signed.is_none() && self.require_signatures {
+            return Err(MailErr::SignatureRequired {
+                room: room.to_string(),
+            });
+        }
         if self.rooms.len() >= MAX_ROOMS {
             return Err(MailErr::RoomsFull {
                 rooms: self.rooms.len() as i64,
@@ -423,6 +440,7 @@ impl State {
                 });
             }
             st.refuse_unsigned(&found, agent)?;
+            self.refuse_when_required(room)?;
             if !st.members.contains_key(key.as_str()) {
                 if st.members.len() >= MAX_ROOM_MEMBERS {
                     return Err(MailErr::RoomFull {
@@ -466,6 +484,7 @@ impl State {
             return Err(not_in_room(&found, &st, agent, room));
         }
         st.refuse_unsigned(&found, agent)?;
+        self.refuse_when_required(room)?;
         let invitee_key = Key::fold(&invitee.name);
         if !st.members.contains_key(invitee_key.as_str())
             && !st.invited.contains(invitee_key.as_str())
@@ -663,6 +682,9 @@ impl State {
             let mut st = found.inner.lock();
             if st.retired || st.member(sender).is_none() {
                 return Err(not_in_room(&found, &st, sender, room));
+            }
+            if matches!(gate, SendGate::Unsigned) {
+                self.refuse_when_required(room)?;
             }
             st.admit_send(&found, sender, &gate)?;
             self.make_room(&mut st, body.len() + super::MESSAGE_OVERHEAD_BYTES)?;

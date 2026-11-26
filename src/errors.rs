@@ -164,6 +164,12 @@ pub enum MailboxError {
         /// The signed room.
         room: String,
     },
+    /// The daemon requires signatures and a direct message came without one:
+    /// send it signed (the client proxy does), with `counter` and `signature`.
+    UnsignedSend {
+        /// The recipient.
+        to: String,
+    },
     /// A `deregister` of a name whose registration bound a key, without a
     /// proof signed by that key.
     ProofRequired {
@@ -256,7 +262,7 @@ impl MailboxError {
             Self::RoomsFull { .. } => "rooms_full",
             Self::TooManyRooms { .. } => "too_many_rooms",
             Self::RoomFull { .. } => "room_full",
-            Self::SignatureRequired { .. } => "signature_required",
+            Self::SignatureRequired { .. } | Self::UnsignedSend { .. } => "signature_required",
             Self::ProofRequired { .. } => "proof_required",
             Self::InvalidSignature => "invalid_signature",
             Self::InvalidKey => "invalid_key",
@@ -287,6 +293,7 @@ impl MailboxError {
             | Self::InvalidKey
             | Self::InvalidLimit => StatusCode::BAD_REQUEST,
             Self::SignatureRequired { .. }
+            | Self::UnsignedSend { .. }
             | Self::ProofRequired { .. }
             | Self::InvalidSignature => StatusCode::UNAUTHORIZED,
             Self::Unregistered { .. }
@@ -369,6 +376,7 @@ impl MailboxError {
             | Self::ProofRequired { agent } => {
                 json!({ "error": self.code(), "agent": agent })
             }
+            Self::UnsignedSend { to } => json!({ "error": self.code(), "to": to }),
             Self::RateLimited { retry_after_ms } => {
                 json!({ "error": self.code(), "retryAfterMs": retry_after_ms })
             }

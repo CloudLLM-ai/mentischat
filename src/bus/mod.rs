@@ -266,6 +266,24 @@ impl Bus {
         self
     }
 
+    /// Require a signature on every send and every room operation: plain
+    /// direct sends fail `signature_required` (with `to`), and plain
+    /// `create_room`, `join_room`, `invite` and room sends fail
+    /// `signature_required` (with `room`). Signed direct messages go through
+    /// [`send_signed`](Self::send_signed), room operations through
+    /// [`signed_op`](Self::signed_op). Reading (`check_inbox`, `history`,
+    /// streams) and leaving are unchanged. The daemon turns this on; a library
+    /// bus is permissive unless asked.
+    pub fn with_signatures_required(mut self) -> Self {
+        self.state.require_signatures = true;
+        self
+    }
+
+    /// Whether [`with_signatures_required`](Self::with_signatures_required) is on.
+    pub fn signatures_required(&self) -> bool {
+        self.state.require_signatures
+    }
+
     /// Milliseconds since the Unix epoch by this bus's clock.
     fn now_ms(&self) -> u64 {
         self.clock.now_ms()
@@ -591,8 +609,12 @@ impl Bus {
         body: String,
     ) -> Result<SendReceipt, MailErr> {
         let body_json_len = validate_body(&body)?;
+        let state = self.open()?;
+        if state.require_signatures {
+            return Err(MailErr::UnsignedSend { to: to.to_string() });
+        }
         let body = body.into_boxed_str();
-        let (msg, heard) = self.open()?.send(
+        let (msg, heard) = state.send(
             from.as_str(),
             to.as_str(),
             body,
@@ -600,6 +622,74 @@ impl Bus {
             self.now_ms(),
         )?;
         self.traffic.sent(&msg, traffic::Body::Plain);
+        Ok(SendReceipt::new(&msg, Reach::Direct(heard)))
+    }
+
+    /// Send `body` from `from` to `to` signed: `signature` is the key bound to
+    /// `from` over [`direct_payload`](crate::signed::direct_payload) at
+    /// `counter`, strictly above every counter `from` has signed a direct
+    /// message with. The recipient receives the body as an
+    /// [`Envelope`](crate::signed::Envelope) it can check with
+    /// [`Envelope::verify_direct`](crate::signed::Envelope::verify_direct)
+    /// against the sender's key. Otherwise as [`send`](Self::send).
+    ///
+    /// # Errors
+    ///
+    /// As [`send`](Self::send), plus `key_required` (the sender has no key),
+    /// `invalid_signature` and `stale_counter` (with the last counter used).
+    pub async fn send_signed(
+        &self,
+        from: &AgentName,
+        to: &AgentName,
+        body: String,
+        counter: u64,
+        signature: &crate::signed::Signature,
+    ) -> Result<SendReceipt, MailErr> {
+        validate_body(&body)?;
+        let (state, sender) = self.active(from)?;
+        let key = sender
+            .inner
+            .lock()
+            .key
+            .ok_or_else(|| MailErr::KeyRequired {
+                agent: sender.name.to_string(),
+            })?;
+        key.verify(
+            &crate::signed::direct_payload(from.as_str(), to.as_str(), counter, &body),
+            signature,
+        )
+        .map_err(|_| MailErr::InvalidSignature)?;
+        {
+            let mut st = sender.inner.lock();
+            if counter <= st.direct_counter {
+                return Err(MailErr::StaleCounter {
+                    room: String::new(),
+                    last: st.direct_counter,
+                });
+            }
+            st.direct_counter = counter;
+        }
+        let envelope = crate::signed::Envelope::encode(counter, &key, signature, &body);
+        let body_json_len = log::json_len(&envelope);
+        let sent = state.send(
+            from.as_str(),
+            to.as_str(),
+            envelope.into_boxed_str(),
+            body_json_len,
+            self.now_ms(),
+        );
+        let (msg, heard) = match sent {
+            Ok(sent) => sent,
+            Err(e) => {
+                // Not delivered: the counter may be used again.
+                let mut st = sender.inner.lock();
+                if st.direct_counter == counter {
+                    st.direct_counter = counter.saturating_sub(1);
+                }
+                return Err(e);
+            }
+        };
+        self.traffic.sent(&msg, traffic::Body::Signed);
         Ok(SendReceipt::new(&msg, Reach::Direct(heard)))
     }
 

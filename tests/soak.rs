@@ -260,7 +260,9 @@ fn start_daemon(dir: &std::path::Path, port: u16) -> Running {
         .env("MENTISCHAT_LISTEN_PORT", port.to_string())
         // Short enough that read mail expires several times during a long run,
         // so a leak in the expiry path would show.
-        .env("MENTISCHAT_READ_TTL", "20");
+        .env("MENTISCHAT_READ_TTL", "20")
+        // A load test of the mailbox engine, not of signing: plain sends.
+        .env("MENTISCHAT_UNSIGNED", "1");
     Running::start(cmd)
 }
 

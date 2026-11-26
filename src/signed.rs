@@ -342,6 +342,8 @@ pub enum OpKind {
     Deregister,
     /// Replace the key bound to a name, signed by the key being replaced.
     RotateKey,
+    /// Send a direct message to one agent.
+    Direct,
 }
 
 /// An `op` name that is not one of the known operations.
@@ -376,6 +378,7 @@ impl OpKind {
             Self::Reclaim => "reclaim",
             Self::Deregister => "deregister",
             Self::RotateKey => "rotate_key",
+            Self::Direct => "direct",
         }
     }
 }
@@ -407,6 +410,7 @@ impl FromStr for OpKind {
             "reclaim" => Self::Reclaim,
             "deregister" => Self::Deregister,
             "rotate_key" => Self::RotateKey,
+            "direct" => Self::Direct,
             _ => return Err(UnknownOp),
         })
     }
@@ -725,6 +729,34 @@ pub fn mls_commit_epoch(body: &str) -> Option<u64> {
     canonical.then(|| epoch.parse().ok()).flatten()
 }
 
+/// The bytes signed to send `body` directly to the agent `to`: the domain tag
+/// `mentischat/direct/v1`, an empty room, the signer, the counter (the
+/// sender's own, strictly increasing across its direct messages), then the
+/// recipient (folded) and the body, each length-prefixed.
+///
+/// # Examples
+///
+/// ```
+/// use mentischat::signed::direct_payload;
+///
+/// let p = direct_payload("Vega", "Orion", 7, "hi");
+/// assert!(p.starts_with(b"mentischat/direct/v1\0"));
+/// assert_eq!(p, direct_payload("vega", "orion", 7, "hi"));
+/// assert_ne!(p, direct_payload("vega", "lyra", 7, "hi"));
+/// ```
+pub fn direct_payload(signer: &str, to: &str, counter: u64, body: &str) -> Vec<u8> {
+    let mut out = header(
+        OpKind::Direct,
+        "",
+        signer,
+        counter,
+        to.len() + body.len() + 8,
+    );
+    put(&mut out, to.to_ascii_lowercase().as_bytes());
+    put(&mut out, body.as_bytes());
+    out
+}
+
 /// The `send` payload for a borrowed body: [`SignedOp::payload`] without
 /// copying the body into a `SignedOp` first.
 pub fn send_payload(room: &str, signer: &str, counter: u64, body: &str) -> Vec<u8> {
@@ -857,6 +889,32 @@ impl<'a> Envelope<'a> {
             signature: sig.parse().map_err(EnvelopeError::Field)?,
             body,
         })
+    }
+
+    /// Check the signature as a direct message from `from` to `to`.
+    ///
+    /// # Errors
+    ///
+    /// [`BadSignature`] when it was not made over this body, sender, recipient
+    /// and counter by the key in the header.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mentischat::signed::{direct_payload, Envelope, Keypair};
+    ///
+    /// let kp = Keypair::from_seed([4; 32]);
+    /// let sig = kp.sign(&direct_payload("a", "b", 3, "hey"));
+    /// let text = Envelope::encode(3, &kp.public(), &sig, "hey");
+    /// let env = Envelope::parse(&text).unwrap();
+    /// assert!(env.verify_direct("a", "b").is_ok());
+    /// assert!(env.verify_direct("a", "c").is_err());
+    /// ```
+    pub fn verify_direct(&self, from: &str, to: &str) -> Result<(), BadSignature> {
+        self.key.verify(
+            &direct_payload(from, to, self.counter, self.body),
+            &self.signature,
+        )
     }
 
     /// Check the signature as a `send` by `from` to `room`.

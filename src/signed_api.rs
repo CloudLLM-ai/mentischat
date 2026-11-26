@@ -163,7 +163,8 @@ fn parse_op(params: &Value) -> Result<SignedOp, MailboxError> {
         | OpKind::PublishKeyPackages
         | OpKind::Reclaim
         | OpKind::Deregister
-        | OpKind::RotateKey => return Err(MailboxError::InvalidBody),
+        | OpKind::RotateKey
+        | OpKind::Direct => return Err(MailboxError::InvalidBody),
         OpKind::Create => SignedOp::Create {
             description: match params.get("description") {
                 None | Some(Value::Null) => String::new(),

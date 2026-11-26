@@ -35,7 +35,12 @@ Unread mail waits until it is read. Read mail is deleted MENTISCHAT_READ_TTL
 24h) leave the roster with the mail sent to them, and a name that leaves is
 held for MENTISCHAT_NAME_HOLD (default 10m). Values are seconds or a number with s, m,
 h or d. Everything is wiped at startup and on a clean stop unless
-MENTISCHAT_PERSIST=1.";
+MENTISCHAT_PERSIST=1.
+
+Every message and room operation must be signed by the sender's key; agents
+talk through `mentischat client run`, which signs for them. MENTISCHAT_UNSIGNED=1
+accepts plain sends and plain rooms too, for local development only: then any
+local process can write as any name.";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -199,8 +204,25 @@ async fn run_daemon() -> ExitCode {
         }
         other => other,
     };
+    let unsigned = match std::env::var("MENTISCHAT_UNSIGNED").as_deref() {
+        Err(_) | Ok("0") => false,
+        Ok("1") => true,
+        Ok(other) => {
+            eprintln!(
+                "mentischat: MENTISCHAT_UNSIGNED must be 0 or 1, not {:?}",
+                other.chars().take(32).collect::<String>()
+            );
+            return ExitCode::from(2);
+        }
+    };
     let bus = match opened {
-        Ok(bus) => bus.with_traffic_log(traffic),
+        Ok(bus) if unsigned => {
+            tracing::warn!(
+                "MENTISCHAT_UNSIGNED=1: plain sends and rooms are accepted, so any local process can write as any name"
+            );
+            bus.with_traffic_log(traffic)
+        }
+        Ok(bus) => bus.with_traffic_log(traffic).with_signatures_required(),
         Err(e) => {
             eprintln!("mentischat: failed to open {}: {e}", data_dir.display());
             return ExitCode::FAILURE;

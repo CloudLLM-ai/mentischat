@@ -49,6 +49,13 @@ async fn game(mode: Mode, to: u32) -> Vec<Hop> {
     let (addr, _dir) = daemon().await;
     // The answerer listens before the opener sends `1`.
     let pong = Player::join(&addr, "pong", "ping", mode).await.unwrap();
+    if mode == Mode::Notify {
+        // The handshake returns before the server's first look at the
+        // answerer's mail; mail already waiting at that look is announced at
+        // once, by design. Let the look happen first, so `1` is paced like
+        // every later number (on a slow runner it otherwise raced the look).
+        tokio::time::sleep(SETTLE / 2).await;
+    }
     let ping = Player::join(&addr, "ping", "pong", mode).await.unwrap();
     let (a, b) = tokio::join!(ping.play(true, to), pong.play(false, to));
     let (a, b) = (a.unwrap(), b.unwrap());

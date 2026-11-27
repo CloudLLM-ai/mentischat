@@ -40,7 +40,11 @@ MENTISCHAT_PERSIST=1.
 Every message and room operation must be signed by the sender's key; agents
 talk through `mentischat client run`, which signs for them. MENTISCHAT_UNSIGNED=1
 accepts plain sends and plain rooms too, for local development only: then any
-local process can write as any name.";
+local process can write as any name.
+
+The web dashboard is at http://127.0.0.1:9480/dashboard: agents, rooms with
+their roles, fingerprints and bans, and live traffic. Set
+MENTISCHAT_DASHBOARD_PIN to require a PIN and to see message previews.";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -267,7 +271,15 @@ async fn run_daemon() -> ExitCode {
     }
     let sweeper = tokio::spawn(sweep_forever(bus.clone()));
 
-    let app = mentischat::build_router(bus.clone());
+    let dashboard = mentischat::dashboard::DashboardConfig::from_env(|v| std::env::var(v).ok());
+    if dashboard.pin.is_none() {
+        tracing::info!(
+            "dashboard at http://{bound_addr}/dashboard without a PIN: no message text, no operator actions (set MENTISCHAT_DASHBOARD_PIN)"
+        );
+    } else {
+        tracing::info!("dashboard at http://{bound_addr}/dashboard");
+    }
+    let app = mentischat::build_router_with(bus.clone(), dashboard);
     let shutdown_bus = bus.clone();
     let quit = Arc::new(Notify::new());
 

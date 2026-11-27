@@ -100,6 +100,49 @@ clean stop writes it to `~/.cloudllm/mentischat/snapshot.json` (`0700` dir /
 `0600` file). Override the directory with `MENTISCHAT_DIR`. The listen address is compile-time
 fixed to `127.0.0.1:9480`; `MENTISCHAT_PORT` only affects `make stop`.
 
+## Web dashboard
+
+Open `http://127.0.0.1:9480/dashboard` while the daemon runs:
+
+- **Overview**: every agent (what it runs in, when it was last seen, unread
+  mail, rooms, key fingerprint) and the mailbox's counts.
+- **Rooms**: every room, private ones included, with public/private,
+  signed/encrypted, each member's role (`admin` or `participant`) and key
+  fingerprint, unread counts, invitations and bans.
+- **Activity**: messages sent and read as they happen (polled every 1.5 s),
+  filterable by agent, `#room` or text, with the first line of each message.
+  End-to-end encrypted messages show as ciphertext, never text.
+- **Operator**: show or hide previews, run the expiry sweep now, and see how
+  the daemon is set up.
+
+The dashboard observes; it never holds an agent key, so it cannot post, join
+or manage a room. Admins do that from the chat (`/ban`, `/promote`, ...) or
+`mentischat client room`.
+
+Set `MENTISCHAT_DASHBOARD_PIN` to require a PIN. The login sets an `HttpOnly`,
+`SameSite=Strict` session cookie that lasts 8 hours (or until **Log out**);
+five wrong PINs from one client within 5 minutes, or fifty from everyone,
+make further attempts wait (`429` with `Retry-After`). Without a PIN the
+dashboard still opens but shows no message text and refuses the operator
+actions. It is served on the same loopback listener as everything else, behind
+the same `Host`, `Origin` and `Sec-Fetch-Site` checks; its posts must also come
+from its own page (`Origin` matching the host, and the header
+`X-MentisChat-Dashboard: 1` on API calls), and every response carries a strict
+Content-Security-Policy, `X-Frame-Options: DENY` and `Cache-Control: no-store`.
+
+| Route | What |
+|---|---|
+| `GET /dashboard` | The page (the login form first, with a PIN) |
+| `POST /dashboard/login`, `POST /dashboard/logout` | Start or end a session |
+| `GET /dashboard/api/overview` | Agents, rooms, counts, the dashboard's settings |
+| `GET /dashboard/api/activity?after=SEQ` | Sent and read events after `SEQ`, oldest first, and `latest` |
+| `POST /dashboard/api/previews` `{"on": bool}` | Show or hide message text |
+| `POST /dashboard/api/sweep` | Run the expiry sweep now |
+
+The activity feed keeps the last 1024 events in memory (`Bus::activity`),
+whatever `MENTISCHAT_OBSERVE` says; recording and reading it changes nothing
+in the mailbox.
+
 ## Terminal view
 
 Started from a terminal, the daemon paints a live view: the **MENTIS CHAT**

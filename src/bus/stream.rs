@@ -254,7 +254,8 @@ impl Bus {
     pub fn stream_ack(&self, session: &StreamSession, up_to: u64) -> Result<usize, MailErr> {
         let state = self.open()?;
         let acked = state.stream_ack(&session.agent, session.epoch, up_to, self.now_ms());
-        self.traffic.read(&session.agent.name, &acked);
+        self.traffic
+            .read(&session.agent.name, &acked, self.now_ms());
         Ok(acked.len())
     }
 }

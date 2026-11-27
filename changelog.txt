@@ -1,5 +1,21 @@
 UNRELEASED
 
+  - feat(dashboard): a web dashboard at `http://127.0.0.1:9480/dashboard`, in
+    the MentisDB dashboard's style. Overview of every agent with its key
+    fingerprint; every room with public/private, signed/encrypted, members'
+    roles and fingerprints, invitations and bans; a live activity feed of
+    messages sent and read, filterable by agent, room or text, with the first
+    line of each message (never of end-to-end encrypted ones); and operator
+    actions that need no agent key: show or hide previews, sweep now. It never
+    holds an agent key, so it cannot post or manage rooms.
+    `MENTISCHAT_DASHBOARD_PIN` requires a PIN (session cookie `HttpOnly`,
+    `SameSite=Strict`, 8 h, logout; wrong PINs rate limited per client and in
+    total); without one the dashboard shows no text and takes no action. Posts
+    must come from the dashboard's own page; responses carry a strict CSP,
+    `X-Frame-Options: DENY` and `Cache-Control: no-store`. Library:
+    `build_router_with` and `dashboard::DashboardConfig`, `Bus::operator_view`
+    and `Bus::activity` (the last 1024 events, in memory).
+
   - feat(client): room commands, `whois` and key rotation for people and
     agents. Through `mentischat client run`, a room message that starts with
     `/` is a command the client signs and runs instead of sending: `/members`,

@@ -1,0 +1,460 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MentisChat Dashboard</title>
+<style>
+  :root {
+    --bg: #0d1117; --surface: #161b22; --surface-hover: #1c2128; --surface-active: #21262d;
+    --border: #30363d; --text: #e6edf3; --text-body: #c9d1d9; --muted: #8b949e; --faint: #484f58;
+    --accent: #58a6ff; --primary: #1f6feb; --primary-hover: #388bfd;
+    --ok: #3fb950; --err: #f85149; --warn: #e3b341; --orange: #f0883e; --purple: #bc8cff;
+    --code: #79c0ff;
+    --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    --mono: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  html { font-size: 14px; }
+  body { margin: 0; background: var(--bg); color: var(--text-body); font-family: var(--font); line-height: 1.6; }
+  a { color: var(--accent); text-decoration: none; }
+  code, .mono { font-family: var(--mono); font-size: 0.85em; }
+
+  nav {
+    position: sticky; top: 0; z-index: 10; height: 56px; display: flex; align-items: center; gap: 6px;
+    padding: 0 24px; background: var(--surface); border-bottom: 1px solid var(--border);
+  }
+  .brand { display: flex; align-items: center; gap: 8px; margin-right: 18px; color: var(--text); font-weight: 600; font-size: 1.05rem; }
+  .brand small { color: var(--muted); font-weight: 400; font-size: 0.8rem; }
+  nav a.link { color: var(--text-body); padding: 6px 12px; border-radius: 6px; transition: background .15s; }
+  nav a.link:hover, nav a.link.active { background: var(--surface-active); color: var(--text); }
+  nav .spacer { flex: 1; }
+
+  #app { max-width: 1400px; margin: 0 auto; padding: 24px; }
+  h1 { font-size: 1.4rem; font-weight: 600; color: var(--text); margin: 0 0 16px; }
+  h2 { font-size: 1.1rem; font-weight: 600; color: var(--text); margin: 24px 0 10px; }
+
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 20px; }
+  .stat { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 12px 16px; }
+  .stat .label { text-transform: uppercase; letter-spacing: 0.5px; font-size: 0.78rem; color: var(--muted); }
+  .stat .value { font-size: 1.4rem; font-weight: 600; color: var(--text); }
+
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 16px; margin-bottom: 16px; }
+  .card-title {
+    text-transform: uppercase; letter-spacing: 0.5px; font-size: 0.9rem; font-weight: 700; color: var(--muted);
+    border-bottom: 1px solid var(--border); padding-bottom: 8px; margin: 0 0 12px;
+  }
+  .table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 6px; }
+  table { width: 100%; border-collapse: collapse; }
+  th {
+    text-align: left; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.5px; color: var(--accent);
+    background: var(--surface); padding: 8px 12px; border-bottom: 1px solid var(--border); white-space: nowrap;
+  }
+  td { padding: 8px 12px; border-bottom: 1px solid var(--surface-hover); vertical-align: top; }
+  tr:last-child td { border-bottom: 0; }
+  tr.clickable { cursor: pointer; }
+  tr.clickable:hover td { background: var(--surface-hover); }
+  .muted { color: var(--muted); }
+  .empty { color: var(--muted); padding: 24px; text-align: center; }
+
+  .badge {
+    display: inline-block; padding: 0 8px; border-radius: 12px; font-size: 0.75rem; font-weight: 500;
+    border: 1px solid; white-space: nowrap; margin-right: 4px;
+  }
+  .badge-green { color: var(--ok); background: rgba(63,185,80,.15); border-color: rgba(63,185,80,.3); }
+  .badge-blue { color: var(--accent); background: rgba(88,166,255,.15); border-color: rgba(88,166,255,.3); }
+  .badge-purple { color: var(--purple); background: rgba(188,140,255,.15); border-color: rgba(188,140,255,.3); }
+  .badge-yellow { color: var(--warn); background: rgba(227,179,65,.15); border-color: rgba(227,179,65,.3); }
+  .badge-red { color: var(--err); background: rgba(248,81,73,.15); border-color: rgba(248,81,73,.3); }
+  .badge-gray { color: var(--muted); background: rgba(139,148,158,.12); border-color: rgba(139,148,158,.3); }
+  .badge-orange { color: var(--orange); background: rgba(240,136,62,.15); border-color: rgba(240,136,62,.3); }
+
+  .btn {
+    padding: 6px 14px; font-size: 0.85rem; font-weight: 500; border-radius: 6px; cursor: pointer;
+    border: 1px solid var(--border); background: transparent; color: var(--text-body); transition: background .15s;
+    font-family: inherit;
+  }
+  .btn:hover { background: var(--surface-active); }
+  .btn-primary { background: var(--primary); border-color: var(--primary); color: #fff; }
+  .btn-primary:hover { background: var(--primary-hover); }
+  .btn-sm { padding: 3px 10px; font-size: 0.8rem; }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
+
+  .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
+  .toolbar input, .toolbar select {
+    background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px;
+    padding: 6px 10px; font-size: 0.85rem; font-family: inherit;
+  }
+  .toolbar input:focus, .toolbar select:focus { outline: none; border-color: var(--accent); }
+  .toolbar input { min-width: 220px; }
+
+  .feed { list-style: none; margin: 0; padding: 0; border: 1px solid var(--border); border-radius: 6px; }
+  .feed li { display: grid; grid-template-columns: 92px 18px minmax(0, 1fr) auto; gap: 10px; padding: 7px 12px; border-bottom: 1px solid var(--surface-hover); align-items: baseline; }
+  .feed li:last-child { border-bottom: 0; }
+  .feed li.fresh { animation: fresh 1.2s ease-out; }
+  @keyframes fresh { from { background: rgba(88,166,255,.12); } to { background: transparent; } }
+  .feed .time { color: var(--muted); font-family: var(--mono); font-size: 0.8rem; }
+  .feed .kind-sent { color: var(--accent); }
+  .feed .kind-read { color: var(--ok); }
+  .feed .who { color: var(--text); }
+  .feed .preview { display: block; color: var(--text-body); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .feed .meta { color: var(--muted); font-size: 0.8rem; white-space: nowrap; }
+  .feed .room { color: var(--purple); }
+
+  .notice { padding: 10px 14px; border-radius: 6px; margin-bottom: 16px; }
+  .notice-warn { color: var(--warn); background: rgba(227,179,65,.1); border: 1px solid rgba(227,179,65,.3); }
+  .notice-err { color: var(--err); background: rgba(248,81,73,.1); border: 1px solid rgba(248,81,73,.3); }
+  .two-col { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; }
+  .kv { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; }
+  .kv dt { color: var(--muted); }
+  .kv dd { margin: 0; color: var(--text); }
+  .switch { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
+  .feedback { margin-left: 10px; font-size: 0.85rem; }
+  .fp { font-family: var(--mono); font-size: 0.78rem; color: var(--code); white-space: nowrap; }
+
+  @media (max-width: 860px) { .two-col { grid-template-columns: 1fr; } }
+  @media (max-width: 600px) {
+    nav { padding: 0 12px; height: auto; min-height: 56px; flex-wrap: wrap; }
+    #app { padding: 12px; }
+    .feed li { grid-template-columns: 70px 14px minmax(0, 1fr); }
+    .feed .meta { grid-column: 3; }
+    .toolbar input { min-width: 0; flex: 1; }
+  }
+</style>
+</head>
+<body>
+<nav>
+  <span class="brand">💬 MentisChat <small id="version"></small></span>
+  <a class="link" href="#overview" data-view="overview">Overview</a>
+  <a class="link" href="#rooms" data-view="rooms">Rooms</a>
+  <a class="link" href="#activity" data-view="activity">Activity</a>
+  <a class="link" href="#operator" data-view="operator">Operator</a>
+  <span class="spacer"></span>
+  <span id="signing"></span>
+  <form id="logout" method="POST" action="/dashboard/logout" hidden>
+    <button class="btn btn-sm" type="submit">Log out</button>
+  </form>
+</nav>
+<main id="app"></main>
+<script>
+'use strict';
+
+// Every request goes through here: one fetch, the CSRF header, and a 401
+// sends the browser to the login form.
+async function api(path, opts = {}) {
+  const headers = { ...(opts.headers || {}), 'X-MentisChat-Dashboard': '1' };
+  if (opts.body && !headers['Content-Type']) headers['Content-Type'] = 'application/json';
+  const r = await fetch('/dashboard/api' + path, { credentials: 'same-origin', ...opts, headers });
+  if (r.status === 401) { location.href = '/dashboard/login'; throw new Error('login required'); }
+  const text = await r.text();
+  let body = null;
+  try { body = JSON.parse(text); } catch (_) {}
+  if (!r.ok) throw new Error((body && (body.message || body.error)) || text || r.statusText);
+  return body;
+}
+
+function esc(v) {
+  return String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+const $ = id => document.getElementById(id);
+const app = $('app');
+
+const state = {
+  view: 'overview',
+  room: null,
+  overview: null,
+  feed: [],
+  latest: 0,
+  paused: false,
+  filter: '',
+  kind: 'all',
+  previews: false,
+  pin: false,
+};
+let renderSeq = 0;
+
+function ago(secs) {
+  if (secs < 60) return secs + 's ago';
+  if (secs < 3600) return Math.floor(secs / 60) + 'm ago';
+  if (secs < 86400) return Math.floor(secs / 3600) + 'h ago';
+  return Math.floor(secs / 86400) + 'd ago';
+}
+function bytes(n) { return n < 1024 ? n + ' B' : (n / 1024).toFixed(1) + ' KB'; }
+function clock(iso) { const d = new Date(iso); return isNaN(d) ? '' : d.toLocaleTimeString(); }
+function fp(f) { return f ? `<span class="fp" title="${esc(f)}">${esc(f.split(' ').slice(0, 2).join(' '))}…</span>` : '<span class="muted">no key</span>'; }
+function role(r) {
+  if (r === 'admin') return '<span class="badge badge-orange">admin</span>';
+  if (r === 'participant') return '<span class="badge badge-gray">participant</span>';
+  return '<span class="badge badge-gray">unsigned</span>';
+}
+function roomBadges(r) {
+  return (r.public ? '<span class="badge badge-blue">public</span>' : '<span class="badge badge-purple">private</span>')
+    + (r.encrypted ? '<span class="badge badge-green">encrypted</span>' : r.signed ? '<span class="badge badge-gray">signed</span>' : '<span class="badge badge-red">unsigned</span>');
+}
+
+function setNav() {
+  document.querySelectorAll('nav a.link').forEach(a => a.classList.toggle('active', a.dataset.view === state.view));
+}
+
+function route() {
+  renderSeq++;
+  const [view, arg] = (location.hash.slice(1) || 'overview').split('/');
+  state.view = ['overview', 'rooms', 'activity', 'operator'].includes(view) ? view : 'overview';
+  state.room = state.view === 'rooms' && arg ? decodeURIComponent(arg) : null;
+  setNav();
+  render();
+}
+
+function render() {
+  if (state.view === 'activity') return renderActivity();
+  if (!state.overview) { app.innerHTML = '<p class="muted">Loading…</p>'; return; }
+  if (state.view === 'rooms') return state.room ? renderRoom() : renderRooms();
+  if (state.view === 'operator') return renderOperator();
+  renderOverview();
+}
+
+function renderOverview() {
+  const o = state.overview;
+  const agents = o.agents.map(a => `
+    <tr class="clickable" data-act="watch" data-name="${esc(a.name)}">
+      <td><strong>${esc(a.name)}</strong></td>
+      <td>${esc(a.provider || '')}<div class="muted">${esc(a.description || '')}</div></td>
+      <td>${ago(a.seenSecsAgo)}</td>
+      <td>${a.queued}</td>
+      <td>${a.rooms}</td>
+      <td>${fp(a.fingerprint)}</td>
+    </tr>`).join('');
+  app.innerHTML = `
+    <h1>Overview</h1>
+    ${o.signaturesRequired ? '' : '<div class="notice notice-err">⚠ This daemon runs with MENTISCHAT_UNSIGNED=1: plain writes are accepted, so any local process can write as any name.</div>'}
+    <div class="stats">
+      <div class="stat"><div class="label">Agents</div><div class="value">${o.agentsTotal}</div></div>
+      <div class="stat"><div class="label">Rooms</div><div class="value">${o.rooms.length}</div></div>
+      <div class="stat"><div class="label">Messages sent</div><div class="value">${o.messagesSent}</div></div>
+      <div class="stat"><div class="label">Unread</div><div class="value">${o.unread}</div></div>
+      <div class="stat"><div class="label">Read, kept</div><div class="value">${o.read}</div></div>
+    </div>
+    <h2>Agents</h2>
+    ${o.agents.length ? `<div class="table-wrap"><table>
+      <thead><tr><th>Name</th><th>Runs in</th><th>Last seen</th><th>Queued</th><th>Rooms</th><th>Key</th></tr></thead>
+      <tbody>${agents}</tbody></table></div>` : '<div class="card empty">No agent has registered yet.</div>'}
+    ${o.agentsTotal > o.agents.length ? `<p class="muted">Showing ${o.agents.length} of ${o.agentsTotal}.</p>` : ''}
+    <p class="muted">Click an agent to follow its traffic.</p>`;
+}
+
+function renderRooms() {
+  const rooms = state.overview.rooms;
+  app.innerHTML = `<h1>Rooms</h1>` + (rooms.length ? `<div class="table-wrap"><table>
+    <thead><tr><th>Room</th><th>Kind</th><th>Members</th><th>Admins</th><th>Messages</th><th>Bans</th></tr></thead>
+    <tbody>${rooms.map(r => `
+      <tr class="clickable" data-act="room" data-room="${esc(r.room)}">
+        <td><strong>#${esc(r.room)}</strong><div class="muted">${esc(r.description || '')}</div></td>
+        <td>${roomBadges(r)}</td>
+        <td>${r.members.length}${r.invited.length ? ` <span class="muted">+${r.invited.length} invited</span>` : ''}</td>
+        <td>${esc(r.members.filter(m => m.role === 'admin').map(m => m.agent).join(', ')) || '<span class="muted">—</span>'}</td>
+        <td>${r.messages}</td>
+        <td>${r.banned.length || ''}</td>
+      </tr>`).join('')}</tbody></table></div>` : '<div class="card empty">No rooms yet.</div>');
+}
+
+function renderRoom() {
+  const r = state.overview.rooms.find(x => x.room.toLowerCase() === state.room.toLowerCase());
+  if (!r) { app.innerHTML = `<p><a href="#rooms">← Rooms</a></p><div class="card empty">#${esc(state.room)} is gone.</div>`; return; }
+  app.innerHTML = `
+    <p><a href="#rooms">← Rooms</a></p>
+    <h1>#${esc(r.room)} ${roomBadges(r)}</h1>
+    ${r.description ? `<p>${esc(r.description)}</p>` : ''}
+    <div class="two-col">
+      <div>
+        <div class="card"><div class="card-title">Members</div>
+          <div class="table-wrap"><table>
+            <thead><tr><th>Agent</th><th>Role</th><th>Key fingerprint</th><th>Unread</th></tr></thead>
+            <tbody>${r.members.map(m => `<tr>
+              <td><strong>${esc(m.agent)}</strong></td><td>${role(m.role)}</td>
+              <td>${m.fingerprint ? `<span class="fp">${esc(m.fingerprint)}</span>` : '<span class="muted">—</span>'}</td>
+              <td>${m.unread}</td></tr>`).join('')}</tbody></table></div>
+        </div>
+      </div>
+      <div>
+        <div class="card"><div class="card-title">Invited</div>
+          ${r.invited.length ? r.invited.map(n => `<div>${esc(n)}</div>`).join('') : '<div class="muted">Nobody.</div>'}
+        </div>
+        <div class="card"><div class="card-title">Banned</div>
+          ${r.banned.length ? r.banned.map(b => `<div><strong>${esc(b.agent)}</strong> <span class="muted">${b.publicKey ? 'with its key' : 'by name'}</span></div>`).join('') : '<div class="muted">Nobody.</div>'}
+        </div>
+        <div class="card"><div class="card-title">Room</div>
+          <dl class="kv">
+            <dt>Messages held</dt><dd>${r.messages}</dd>
+            <dt>Writes</dt><dd>${r.signed ? 'signed by each member' : 'unsigned (from before signing)'}</dd>
+            <dt>Bodies</dt><dd>${r.encrypted ? 'end-to-end encrypted' : 'readable by the daemon'}</dd>
+          </dl>
+        </div>
+        <button class="btn" data-act="watch" data-name="#${esc(r.room)}">Follow this room's traffic</button>
+      </div>
+    </div>
+    <p class="muted">The dashboard holds no agent key, so it cannot change a room. Admins manage it from the chat: /invite, /kick, /ban, /promote … (/help lists them).</p>`;
+}
+
+function matches(e) {
+  if (state.kind !== 'all' && e.kind !== state.kind) return false;
+  const f = state.filter.trim().toLowerCase();
+  if (!f) return true;
+  const room = e.room ? '#' + e.room.toLowerCase() : '';
+  return [e.from, e.to, e.reader].some(n => n && n.toLowerCase() === f) || room === f
+    || (f.length > 1 && [e.from, e.to, e.reader, room, e.preview].some(v => v && v.toLowerCase().includes(f)));
+}
+
+function eventRow(e, fresh) {
+  const where = e.room ? `<span class="room">#${esc(e.room)}</span>` : esc(e.to || '');
+  const what = e.kind === 'sent'
+    ? `<span class="who">${esc(e.from)}</span> → ${where}`
+    : `<span class="who">${esc(e.reader)}</span> read ${esc(e.from)}'s message${e.room ? ' in ' + where : ''}`;
+  const badges = (e.encrypted ? '<span class="badge badge-green">encrypted</span>' : '')
+    + (e.signed ? '' : '<span class="badge badge-red">unsigned</span>');
+  const preview = e.kind === 'sent'
+    ? (e.preview != null ? `<span class="preview">${esc(e.preview)}</span>`
+      : e.encrypted ? '<span class="preview muted">ciphertext</span>'
+      : state.previews ? '' : '<span class="preview muted">text hidden</span>')
+    : '';
+  return `<li class="${fresh ? 'fresh' : ''}">
+    <span class="time">${clock(e.at)}</span>
+    <span class="kind-${e.kind}">${e.kind === 'sent' ? '→' : '✓'}</span>
+    <span>${what} ${badges}${preview}</span>
+    <span class="meta">#${e.id} · ${bytes(e.bytes)}</span></li>`;
+}
+
+function renderActivity() {
+  app.innerHTML = `
+    <h1>Activity</h1>
+    <div class="toolbar">
+      <input id="filter" type="search" placeholder="Filter: an agent, #room, or text" value="${esc(state.filter)}" aria-label="Filter">
+      <select id="kind" aria-label="Kind">
+        <option value="all">Sent and read</option><option value="sent">Sent</option><option value="read">Read</option>
+      </select>
+      <button class="btn" data-act="pause">${state.paused ? '▶ Resume' : '⏸ Pause'}</button>
+      <button class="btn" data-act="clear">Clear</button>
+      <span class="muted" id="feed-note"></span>
+    </div>
+    <ul class="feed" id="feed"></ul>`;
+  $('kind').value = state.kind;
+  $('filter').addEventListener('input', ev => { state.filter = ev.target.value; drawFeed(); });
+  $('kind').addEventListener('change', ev => { state.kind = ev.target.value; drawFeed(); });
+  drawFeed();
+}
+
+function drawFeed(freshFrom = Infinity) {
+  const feed = $('feed');
+  if (!feed) return;
+  const shown = state.feed.filter(matches).slice(-500).reverse();
+  feed.innerHTML = shown.length ? shown.map(e => eventRow(e, e.seq >= freshFrom)).join('')
+    : '<li class="empty" style="display:block">Nothing yet. Messages appear here as agents send and read them.</li>';
+  const note = $('feed-note');
+  if (note) note.textContent = state.previews ? '' : (state.pin ? 'Previews are off (Operator).' : 'No PIN: message text is hidden.');
+}
+
+function renderOperator() {
+  const d = state.overview.dashboard;
+  const o = state.overview;
+  app.innerHTML = `
+    <h1>Operator</h1>
+    ${d.pin ? '' : '<div class="notice notice-warn">No PIN is set, so the dashboard shows no message text and these actions are off. Set MENTISCHAT_DASHBOARD_PIN and restart the daemon.</div>'}
+    <div class="two-col">
+      <div>
+        <div class="card"><div class="card-title">Message previews</div>
+          <label class="switch"><input type="checkbox" id="previews" ${d.previews ? 'checked' : ''} ${d.pin ? '' : 'disabled'}>
+            Show the first line of each message in Activity</label>
+          <span class="feedback" id="previews-fb"></span>
+          <p class="muted">End-to-end encrypted messages are never shown. Off hides text from this dashboard only; agents are unaffected.</p>
+        </div>
+        <div class="card"><div class="card-title">Expiry sweep</div>
+          <button class="btn btn-primary" data-act="sweep" ${d.pin ? '' : 'disabled'}>Sweep now</button>
+          <span class="feedback" id="sweep-fb"></span>
+          <p class="muted">Deletes read mail older than ${ago(d.retention.readTtlSecs).replace(' ago', '')} and drops agents idle longer than ${ago(d.retention.agentTtlSecs).replace(' ago', '')}, as the daemon does on its own every so often.</p>
+        </div>
+      </div>
+      <div>
+        <div class="card"><div class="card-title">Daemon</div>
+          <dl class="kv">
+            <dt>Version</dt><dd>${esc(d.version)}</dd>
+            <dt>Writes</dt><dd>${o.signaturesRequired ? '<span class="badge badge-green">signed only</span>' : '<span class="badge badge-red">unsigned accepted</span>'}</dd>
+            <dt>PIN</dt><dd>${d.pin ? 'set' : 'not set'}</dd>
+            <dt>Read mail kept</dt><dd>${ago(d.retention.readTtlSecs).replace(' ago', '')}</dd>
+            <dt>Idle agents kept</dt><dd>${ago(d.retention.agentTtlSecs).replace(' ago', '')}</dd>
+          </dl>
+        </div>
+        <div class="card"><div class="card-title">Rooms</div>
+          <p class="muted">Room management is signed by an agent's key, which this dashboard never holds. Admins use the chat commands (/promote, /ban, …) or <code>mentischat client room</code>.</p>
+        </div>
+      </div>
+    </div>`;
+  $('previews').addEventListener('change', async ev => {
+    const fb = $('previews-fb');
+    try {
+      const r = await api('/previews', { method: 'POST', body: JSON.stringify({ on: ev.target.checked }) });
+      state.previews = r.previews; state.overview.dashboard.previews = r.previews;
+      fb.textContent = '✓ saved'; fb.style.color = 'var(--ok)';
+    } catch (e) { fb.textContent = '✗ ' + e.message; fb.style.color = 'var(--err)'; ev.target.checked = !ev.target.checked; }
+  });
+}
+
+const ACTIONS = {
+  room(el) { location.hash = 'rooms/' + encodeURIComponent(el.dataset.room); },
+  watch(el) { state.filter = el.dataset.name; state.kind = 'all'; location.hash = 'activity'; },
+  pause(el) { state.paused = !state.paused; el.textContent = state.paused ? '▶ Resume' : '⏸ Pause'; },
+  clear() { state.feed = []; drawFeed(); },
+  async sweep() {
+    const fb = $('sweep-fb');
+    try {
+      const r = await api('/sweep', { method: 'POST', body: '{}' });
+      fb.textContent = `✓ ${r.expiredRead} read message(s) deleted, ${r.droppedAgents.length} idle agent(s) dropped`;
+      fb.style.color = 'var(--ok)';
+      refreshOverview();
+    } catch (e) { fb.textContent = '✗ ' + e.message; fb.style.color = 'var(--err)'; }
+  },
+};
+document.addEventListener('click', ev => {
+  const el = ev.target instanceof Element ? ev.target.closest('[data-act]') : null;
+  if (el && ACTIONS[el.dataset.act]) ACTIONS[el.dataset.act](el, ev);
+});
+
+async function refreshOverview() {
+  const seq = renderSeq;
+  try {
+    const o = await api('/overview');
+    state.overview = o;
+    state.pin = o.dashboard.pin;
+    state.previews = o.dashboard.previews;
+    $('version').textContent = 'v' + o.dashboard.version;
+    $('logout').hidden = !o.dashboard.pin;
+    $('signing').innerHTML = o.signaturesRequired ? '<span class="badge badge-green">signed writes</span>' : '<span class="badge badge-red">unsigned writes</span>';
+    // Do not redraw a page the user is typing into, or one they left.
+    if (seq === renderSeq && state.view !== 'activity' && !(state.view === 'operator' && document.activeElement && document.activeElement.id === 'previews')) render();
+  } catch (e) {
+    if (state.view !== 'activity') app.innerHTML = `<div class="notice notice-err">✗ ${esc(e.message)}</div>`;
+  }
+}
+
+async function pollActivity() {
+  if (!state.paused) {
+    try {
+      const r = await api('/activity?after=' + state.latest);
+      state.previews = r.previews;
+      if (r.latest < state.latest) state.feed = [];          // the daemon restarted
+      const first = r.events.length ? r.events[0].seq : Infinity;
+      state.feed.push(...r.events);
+      if (state.feed.length > 2000) state.feed = state.feed.slice(-2000);
+      state.latest = r.latest;
+      if (r.events.length && state.view === 'activity') drawFeed(first);
+    } catch (_) { /* shown by the overview poll */ }
+  }
+  setTimeout(pollActivity, 1500);
+}
+
+window.addEventListener('hashchange', route);
+route();
+refreshOverview();
+setInterval(refreshOverview, 5000);
+pollActivity();
+</script>
+</body>
+</html>

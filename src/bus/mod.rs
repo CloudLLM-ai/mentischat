@@ -42,6 +42,7 @@ mod keyring;
 mod log;
 mod model;
 mod notify;
+mod operator;
 mod ownership;
 mod park;
 mod rooms;
@@ -72,6 +73,7 @@ pub use model::{
     MAX_STREAM_BYTES, MAX_STREAM_IN_FLIGHT,
 };
 pub use notify::{MailDigest, NotifySession};
+pub use operator::{OperatorAgent, OperatorMember, OperatorRoom, OperatorView};
 pub use signed::{
     Ban, KeyBinding, KeyPackageOffer, KeyPackageStock, Role, SignedMember, SignedOutcome,
     SignedRequest, SignedRoomInfo, MAX_BANS, MAX_KEY_PACKAGES, MAX_KEY_PACKAGE_BYTES,
@@ -81,7 +83,7 @@ pub use signed::{
 pub use signed_persist::{verify_signed_record, RecordSummary};
 pub use snapshot::{remove_snapshot, SnapshotError};
 pub use stream::{Push, StreamSession};
-pub use traffic::{TrafficLog, PREVIEW_CHARS};
+pub use traffic::{Activity, ActivityKind, TrafficLog, ACTIVITY_CAPACITY, PREVIEW_CHARS};
 
 use clock::{rfc3339_ms, unix_ms, Clock};
 use delivery::{history_page, history_rows};
@@ -148,7 +150,7 @@ pub struct Bus {
     /// [`with_clock`](Self::with_clock) replaced it.
     clock: Clock,
     /// Whether messages sent and read are logged, and with how much of a body.
-    traffic: TrafficLog,
+    traffic: traffic::Traffic,
 }
 
 impl Bus {
@@ -183,7 +185,7 @@ impl Bus {
             retention,
             data_dir: data_dir.to_path_buf(),
             clock: Clock::System,
-            traffic: TrafficLog::default(),
+            traffic: traffic::Traffic::default(),
         })
     }
 
@@ -262,8 +264,18 @@ impl Bus {
     /// each unsigned body to its sent line, so give it only to a log the
     /// operator alone sees.
     pub fn with_traffic_log(mut self, traffic: TrafficLog) -> Self {
-        self.traffic = traffic;
+        self.traffic.log = traffic;
         self
+    }
+
+    /// The recent activity (messages sent and read) after sequence number
+    /// `after`, oldest first, at most `limit`, and the newest sequence number.
+    /// Each sent event carries the start of the text unless the message is
+    /// end-to-end encrypted. The feed keeps the last [`ACTIVITY_CAPACITY`]
+    /// events, whatever the traffic log is set to, in memory only; reading it
+    /// changes nothing.
+    pub fn activity(&self, after: u64, limit: usize) -> (Vec<Activity>, u64) {
+        self.traffic.feed.since(after, limit)
     }
 
     /// Require a signature on every send and every room operation: plain
@@ -779,7 +791,8 @@ impl Bus {
             Pulled::Gone => Err(state.unregistered(name.as_str())),
             Pulled::Nothing => Ok(None),
             Pulled::Batch(batch) => Ok(Some({
-                self.traffic.read(&agent.name, &batch.messages);
+                self.traffic
+                    .read(&agent.name, &batch.messages, self.now_ms());
                 Taken {
                     agent: agent.name.clone(),
                     messages: batch.messages,

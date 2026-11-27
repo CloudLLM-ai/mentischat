@@ -901,7 +901,7 @@ impl Bus {
             retention: Retention::default(),
             data_dir: PathBuf::new(),
             clock: Clock::System,
-            traffic: super::TrafficLog::default(),
+            traffic: super::traffic::Traffic::default(),
         })
     }
 

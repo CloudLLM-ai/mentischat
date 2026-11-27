@@ -9,10 +9,155 @@
 //! body's size. Only with [`TrafficLog::WithPreviews`] does a sent line also
 //! carry the start of the body, and never for a signed room message.
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Arc;
 
+use parking_lot::Mutex;
+use serde::Serialize;
+
+use super::clock::rfc3339_ms;
 use super::log::Msg;
+
+/// How many recent events the activity feed keeps.
+pub const ACTIVITY_CAPACITY: usize = 1024;
+
+/// Whether an [`Activity`] is a message sent or one read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityKind {
+    /// A message was accepted.
+    Sent,
+    /// A recipient read a message (a pull, or a stream acknowledgement).
+    Read,
+}
+
+/// One event of the activity feed: what the operator's dashboard shows of the
+/// traffic. Built from messages the bus already handed out; recording one
+/// changes nothing in the mailbox.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Activity {
+    /// Position in the feed, increasing for the life of the process.
+    pub seq: u64,
+    /// Sent or read.
+    pub kind: ActivityKind,
+    /// When, UTC RFC 3339.
+    pub at: String,
+    /// The sender.
+    pub from: String,
+    /// The recipient of a direct message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    /// The room of a room message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub room: Option<String>,
+    /// Who read it, for a read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reader: Option<String>,
+    /// The message id.
+    pub id: u64,
+    /// The stored body's size in bytes.
+    pub bytes: usize,
+    /// The body is a signed envelope.
+    pub signed: bool,
+    /// The body is end-to-end encrypted (an MLS message).
+    pub encrypted: bool,
+    /// The start of the text, for a sent message that is not encrypted: the
+    /// first line, cut to [`PREVIEW_CHARS`] characters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+}
+
+/// The recent [`Activity`], oldest first, bounded to [`ACTIVITY_CAPACITY`].
+#[derive(Debug, Default)]
+pub(super) struct Feed {
+    events: Mutex<(u64, VecDeque<Activity>)>,
+}
+
+impl Feed {
+    fn push(&self, make: impl FnOnce(u64) -> Activity) {
+        let mut guard = self.events.lock();
+        let (next, events) = &mut *guard;
+        *next += 1;
+        events.push_back(make(*next));
+        while events.len() > ACTIVITY_CAPACITY {
+            events.pop_front();
+        }
+    }
+
+    /// Events after `after`, oldest first, at most `limit`; and the newest
+    /// sequence number (0 when nothing happened yet).
+    pub(super) fn since(&self, after: u64, limit: usize) -> (Vec<Activity>, u64) {
+        let guard = self.events.lock();
+        let (next, events) = &*guard;
+        let start = events.partition_point(|e| e.seq <= after);
+        (events.range(start..).take(limit).cloned().collect(), *next)
+    }
+}
+
+/// The traffic log and the activity feed together: what the bus reports of
+/// each message sent and read.
+#[derive(Debug, Default)]
+pub(super) struct Traffic {
+    /// What the log shows.
+    pub log: TrafficLog,
+    /// What the dashboard shows.
+    pub feed: Feed,
+}
+
+impl Traffic {
+    /// Report that `msg` was sent.
+    pub(super) fn sent(&self, msg: &Msg, body: Body) {
+        self.log.sent(msg, body);
+        let (signed, encrypted, text) = match body {
+            Body::Plain => (false, false, Some(&*msg.body)),
+            Body::Signed => {
+                let text = crate::signed::Envelope::parse(&msg.body)
+                    .ok()
+                    .map(|e| e.body);
+                let encrypted = text.is_none_or(|t| t.starts_with("mls/"));
+                (true, encrypted, text.filter(|_| !encrypted))
+            }
+        };
+        self.feed.push(|seq| Activity {
+            seq,
+            kind: ActivityKind::Sent,
+            at: rfc3339_ms(msg.created_ms),
+            from: msg.from.to_string(),
+            to: msg.room.is_none().then(|| msg.to.to_string()),
+            room: msg.room.as_deref().map(str::to_string),
+            reader: None,
+            id: msg.id,
+            bytes: msg.body.len(),
+            signed,
+            encrypted,
+            preview: text.map(preview),
+        });
+    }
+
+    /// Report that `reader` read each of `messages` at `now_ms`.
+    pub(super) fn read(&self, reader: &str, messages: &[Arc<Msg>], now_ms: u64) {
+        self.log.read(reader, messages);
+        for msg in messages {
+            let signed = crate::signed::Envelope::parse(&msg.body).ok();
+            self.feed.push(|seq| Activity {
+                seq,
+                kind: ActivityKind::Read,
+                at: rfc3339_ms(now_ms),
+                from: msg.from.to_string(),
+                to: msg.room.is_none().then(|| msg.to.to_string()),
+                room: msg.room.as_deref().map(str::to_string),
+                reader: Some(reader.to_string()),
+                id: msg.id,
+                bytes: msg.body.len(),
+                signed: signed.is_some(),
+                encrypted: signed.is_some_and(|e| e.body.starts_with("mls/")),
+                preview: None,
+            });
+        }
+    }
+}
 
 /// How many characters of a body a preview keeps.
 pub const PREVIEW_CHARS: usize = 100;
@@ -48,7 +193,7 @@ pub(super) enum Body {
 
 impl TrafficLog {
     /// Log that `msg` was sent.
-    pub(super) fn sent(self, msg: &Msg, body: Body) {
+    fn sent(self, msg: &Msg, body: Body) {
         if self != Self::Off {
             let line = Sent {
                 msg,
@@ -60,7 +205,7 @@ impl TrafficLog {
     }
 
     /// Log that `reader` read each of `messages`.
-    pub(super) fn read(self, reader: &str, messages: &[Arc<Msg>]) {
+    fn read(self, reader: &str, messages: &[Arc<Msg>]) {
         if self != Self::Off {
             for msg in messages {
                 tracing::info!("{}", Read { reader, msg });

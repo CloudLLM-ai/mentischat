@@ -29,6 +29,7 @@ compile_error!("mentischat targets Unix (macOS and Linux) only");
 pub mod bus;
 #[cfg(feature = "e2e")]
 pub mod client;
+pub mod dashboard;
 pub mod errors;
 pub mod instructions;
 pub mod names;
@@ -173,6 +174,14 @@ pub fn low_latency_listener(listener: tokio::net::TcpListener) -> LowLatencyList
 /// `into_make_service_with_connect_info::<SocketAddr>()`, which both
 /// the loopback middleware and the upstream MCP handlers need for IP checks.
 pub fn build_router(bus: Arc<bus::Bus>) -> axum::Router {
+    build_router_with(bus, dashboard::DashboardConfig::default())
+}
+
+/// [`build_router`] with the web dashboard set up by `dashboard` (its PIN).
+pub fn build_router_with(
+    bus: Arc<bus::Bus>,
+    dashboard: dashboard::DashboardConfig,
+) -> axum::Router {
     let transport = StreamableHttpConfig::new(SERVER_NAME, SERVER_VERSION)
         .with_endpoint_path("/")
         .with_instructions(instructions::instructions(&bus.retention()));
@@ -198,7 +207,8 @@ pub fn build_router(bus: Arc<bus::Bus>) -> axum::Router {
     let mailbox = Arc::new(tools::MailboxProtocol::new(bus.clone()));
     let mcp_router = streamable_http_router(&http_config, &transport, mailbox as _);
 
-    rest::router(bus)
+    rest::router(bus.clone())
+        .merge(dashboard::router(bus, dashboard))
         .nest(MCP_ENDPOINT_PATH, mcp_router)
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .layer(middleware::from_fn(loopback_headers))

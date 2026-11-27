@@ -1055,7 +1055,8 @@ impl Bus {
     /// [`sweep`](Self::sweep) as of `now` (injectable for tests).
     ///
     /// An agent with a pull parked, a stream or a notify socket open right now
-    /// is never dropped, however old its `last_seen`. A dropped agent's name is held for
+    /// is never dropped, however old its `last_seen`, and neither is a
+    /// [resident](Self::keep_resident) one. A dropped agent's name is held for
     /// [`Retention::name_hold`] from `now`, and holds that ended by `now`
     /// are forgotten.
     pub async fn sweep_at(&self, now: SystemTime) -> Result<SweepOutcome, MailErr> {
@@ -1064,12 +1065,14 @@ impl Bus {
         let cutoff = |ttl: Duration| now_ms.saturating_sub(ttl.as_millis() as u64);
         let expired_read = state.expire_read(cutoff(self.retention.read_ttl));
         let idle_since = cutoff(self.retention.agent_ttl);
+        let residents = state.residents.read().clone();
         let mut stale: Vec<String> = state
             .roster
             .entries()
             .into_iter()
-            .filter(|(_, a)| {
-                a.signal.parked() == 0
+            .filter(|(key, a)| {
+                !residents.contains(key)
+                    && a.signal.parked() == 0
                     && a.signal.watching() == 0
                     && a.inner.lock().last_seen_ms < idle_since
             })

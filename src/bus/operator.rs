@@ -183,3 +183,27 @@ impl Bus {
         })
     }
 }
+
+impl Bus {
+    /// Never let the idle sweep drop `name`: for the daemon's own operator
+    /// agent, which acts only when someone uses the dashboard and must not
+    /// lose its rooms and roles in between. Leaving the roster on purpose
+    /// still works.
+    pub fn keep_resident(&self, name: &crate::names::AgentName) {
+        self.state.residents.write().insert(name.folded());
+    }
+
+    /// Whether `room` exists and, if it does, whether it is end-to-end
+    /// encrypted (it has carried an MLS Commit). Read-only.
+    ///
+    /// # Errors
+    ///
+    /// `shutting_down` once the bus is closed.
+    pub fn room_encrypted(&self, room: &crate::names::RoomName) -> Result<Option<bool>, MailErr> {
+        let state = self.open()?;
+        Ok(state.rooms.get(room.folded().as_str()).and_then(|r| {
+            let st = r.inner.lock();
+            (!st.retired).then(|| st.signed.as_ref().is_some_and(|s| s.epoch > 0))
+        }))
+    }
+}

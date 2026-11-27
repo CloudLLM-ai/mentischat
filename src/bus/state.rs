@@ -53,7 +53,7 @@
 //! Names are folded (ASCII-lowercased) for every key and compared without
 //! regard to case; entries keep the spelling they were registered with.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
@@ -482,6 +482,9 @@ pub(super) struct State {
     /// Every send and every room operation must be signed
     /// ([`Bus::with_signatures_required`](super::Bus::with_signatures_required)).
     pub require_signatures: bool,
+    /// Folded names the idle sweep never drops: the daemon's own operator
+    /// agent ([`Bus::keep_resident`](super::Bus::keep_resident)).
+    pub residents: RwLock<HashSet<String>>,
 }
 
 impl State {
@@ -507,6 +510,7 @@ impl State {
             closed: AtomicBool::new(false),
             keyring: None,
             require_signatures: false,
+            residents: RwLock::default(),
         }
     }
 

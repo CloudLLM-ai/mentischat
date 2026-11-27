@@ -1,5 +1,23 @@
 UNRELEASED
 
+  - feat(dashboard): run rooms from the dashboard. It acts as the daemon's
+    own `operator` agent (`MENTISCHAT_OPERATOR`), whose Ed25519 key is
+    generated once into `<data dir>/operator.key` (0600), and signs every
+    action like any client: create public or private rooms (and be their
+    admin), join, leave, read and post, invite, kick, ban (with the bound
+    key) and unban, promote and demote, and send and read signed direct mail
+    with signatures checked against the sender's key. It obeys the room
+    rules (admin only where it created the room or was promoted), never
+    touches an end-to-end encrypted room's group, registers on its first
+    action and is never dropped by the idle sweep (`Bus::keep_resident`).
+    New views: Mail and Settings (Operator renamed); room pages gain chat,
+    member actions, invite and ban forms.
+  - feat(dashboard): the first visit sets the PIN. Without
+    `MENTISCHAT_DASHBOARD_PIN` the dashboard shows only a setup form until a
+    PIN of 6-128 characters is chosen; it is stored as a salted, iterated
+    SHA-256 in `<data dir>/dashboard.pin` (0600) and can be changed under
+    Settings, which ends every other session. The PIN-less observer mode is
+    gone: the dashboard always sits behind a PIN, and previews start on.
   - perf(bus): the dashboard's activity feed costs one atomic load per
     message while nobody watches it. It records only for a minute after the
     dashboard last looked (`ACTIVITY_WATCH_MS`), and then only pointers to

@@ -43,8 +43,10 @@ accepts plain sends and plain rooms too, for local development only: then any
 local process can write as any name.
 
 The web dashboard is at http://127.0.0.1:9480/dashboard: agents, rooms with
-their roles, fingerprints and bans, and live traffic. Set
-MENTISCHAT_DASHBOARD_PIN to require a PIN and to see message previews.";
+their roles, fingerprints and bans, and live traffic, and the console to create
+rooms, post, invite, kick, ban and promote as the operator agent (`operator`,
+or MENTISCHAT_OPERATOR), whose key lives in the data directory. The first visit
+sets its PIN; MENTISCHAT_DASHBOARD_PIN sets a fixed one instead.";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -271,13 +273,21 @@ async fn run_daemon() -> ExitCode {
     }
     let sweeper = tokio::spawn(sweep_forever(bus.clone()));
 
-    let dashboard = mentischat::dashboard::DashboardConfig::from_env(|v| std::env::var(v).ok());
-    if dashboard.pin.is_none() {
+    let dashboard = mentischat::dashboard::DashboardConfig::from_env(|v| std::env::var(v).ok())
+        .with_dir(&data_dir);
+    let operator = match dashboard.operator_name() {
+        Ok(name) => name,
+        Err(_) => {
+            eprintln!("mentischat: MENTISCHAT_OPERATOR is not a valid agent name");
+            return ExitCode::from(2);
+        }
+    };
+    if dashboard.pin.is_none() && !data_dir.join(mentischat::dashboard::pin::PIN_FILE).exists() {
         tracing::info!(
-            "dashboard at http://{bound_addr}/dashboard without a PIN: no message text, no operator actions (set MENTISCHAT_DASHBOARD_PIN)"
+            "dashboard at http://{bound_addr}/dashboard: open it to set its PIN (or set MENTISCHAT_DASHBOARD_PIN)"
         );
     } else {
-        tracing::info!("dashboard at http://{bound_addr}/dashboard");
+        tracing::info!(operator = %operator, "dashboard at http://{bound_addr}/dashboard");
     }
     let app = mentischat::build_router_with(bus.clone(), dashboard);
     let shutdown_bus = bus.clone();

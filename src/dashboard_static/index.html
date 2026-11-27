@@ -112,6 +112,38 @@
   .feedback { margin-left: 10px; font-size: 0.85rem; }
   .fp { font-family: var(--mono); font-size: 0.78rem; color: var(--code); white-space: nowrap; }
 
+  .form-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .form-row input[type=text], .form-row input[type=password], .form-row textarea, .form-row select {
+    background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px;
+    padding: 6px 10px; font-size: 0.9rem; font-family: inherit; min-width: 0;
+  }
+  .form-row input:focus, .form-row textarea:focus, .form-row select:focus { outline: none; border-color: var(--accent); }
+  .form-row .grow { flex: 1; }
+  .form-stack { display: grid; gap: 8px; }
+  .field { padding: 6px 10px; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; font-family: inherit; }
+  .field:focus { outline: none; border-color: var(--accent); }
+  .actions { white-space: nowrap; text-align: right; }
+  .actions .btn { margin-left: 4px; }
+  .btn-danger { color: var(--err); border-color: rgba(248,81,73,.4); }
+  .btn-danger:hover { background: rgba(248,81,73,.12); }
+  .chat { display: flex; flex-direction: column; height: 460px; }
+  .chat .log { flex: 1; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; background: var(--bg); }
+  .chat .msg { padding: 4px 0; border-bottom: 1px solid var(--surface-hover); }
+  .chat .msg:last-child { border-bottom: 0; }
+  .chat .msg .head { font-size: 0.8rem; color: var(--muted); }
+  .chat .msg .head strong { color: var(--text); }
+  .chat .msg.mine .head strong { color: var(--accent); }
+  .chat .msg .body { white-space: pre-wrap; word-break: break-word; color: var(--text-body); }
+  .chat form { margin-top: 8px; }
+  .chat textarea { resize: vertical; min-height: 38px; max-height: 200px; }
+  .you { color: var(--accent); font-weight: 600; }
+  #toast {
+    position: fixed; right: 16px; bottom: 16px; max-width: min(420px, calc(100vw - 32px)); z-index: 20;
+    padding: 10px 14px; border-radius: 6px; display: none; box-shadow: 0 4px 16px rgba(0,0,0,.4);
+  }
+  #toast.ok { display: block; color: var(--ok); background: #0f2418; border: 1px solid rgba(63,185,80,.4); }
+  #toast.err { display: block; color: var(--err); background: #2a1414; border: 1px solid rgba(248,81,73,.4); }
+
   @media (max-width: 860px) { .two-col { grid-template-columns: 1fr; } }
   @media (max-width: 600px) {
     nav { padding: 0 12px; height: auto; min-height: 56px; flex-wrap: wrap; }
@@ -127,8 +159,9 @@
   <span class="brand">💬 MentisChat <small id="version"></small></span>
   <a class="link" href="#overview" data-view="overview">Overview</a>
   <a class="link" href="#rooms" data-view="rooms">Rooms</a>
+  <a class="link" href="#mail" data-view="mail">Mail</a>
   <a class="link" href="#activity" data-view="activity">Activity</a>
-  <a class="link" href="#operator" data-view="operator">Operator</a>
+  <a class="link" href="#settings" data-view="settings">Settings</a>
   <span class="spacer"></span>
   <span id="signing"></span>
   <form id="logout" method="POST" action="/dashboard/logout" hidden>
@@ -136,28 +169,38 @@
   </form>
 </nav>
 <main id="app"></main>
+<div id="toast" role="status" aria-live="polite"></div>
 <script>
 'use strict';
 
 // Every request goes through here: one fetch, the CSRF header, and a 401
-// sends the browser to the login form.
+// sends the browser to the login form (or the PIN setup on a first run).
 async function api(path, opts = {}) {
   const headers = { ...(opts.headers || {}), 'X-MentisChat-Dashboard': '1' };
   if (opts.body && !headers['Content-Type']) headers['Content-Type'] = 'application/json';
   const r = await fetch('/dashboard/api' + path, { credentials: 'same-origin', ...opts, headers });
-  if (r.status === 401) { location.href = '/dashboard/login'; throw new Error('login required'); }
   const text = await r.text();
   let body = null;
   try { body = JSON.parse(text); } catch (_) {}
-  if (!r.ok) throw new Error((body && (body.message || body.error)) || text || r.statusText);
+  if (r.status === 401) {
+    location.href = body && body.error === 'setup_required' ? '/dashboard/setup' : '/dashboard/login';
+    throw new Error('login required');
+  }
+  if (!r.ok) {
+    const err = new Error((body && (body.message || body.error)) || text || r.statusText);
+    err.code = body && body.error;
+    throw err;
+  }
   return body;
 }
+const post = (path, body) => api(path, { method: 'POST', body: JSON.stringify(body || {}) });
 
 function esc(v) {
   return String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 const $ = id => document.getElementById(id);
 const app = $('app');
+const enc = encodeURIComponent;
 
 const state = {
   view: 'overview',
@@ -169,9 +212,21 @@ const state = {
   filter: '',
   kind: 'all',
   previews: false,
-  pin: false,
+  mailTo: '',
+  chat: { room: null, messages: [], error: null },
+  mail: { messages: [], error: null },
+  drafts: {},
 };
 let renderSeq = 0;
+
+let toastTimer = null;
+function toast(text, ok = true) {
+  const t = $('toast');
+  t.textContent = (ok ? '✓ ' : '✗ ') + text;
+  t.className = ok ? 'ok' : 'err';
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.className = ''; }, ok ? 2500 : 6000);
+}
 
 function ago(secs) {
   if (secs < 60) return secs + 's ago';
@@ -179,6 +234,7 @@ function ago(secs) {
   if (secs < 86400) return Math.floor(secs / 3600) + 'h ago';
   return Math.floor(secs / 86400) + 'd ago';
 }
+function span(secs) { return ago(secs).replace(' ago', ''); }
 function bytes(n) { return n < 1024 ? n + ' B' : (n / 1024).toFixed(1) + ' KB'; }
 function clock(iso) { const d = new Date(iso); return isNaN(d) ? '' : d.toLocaleTimeString(); }
 function fp(f) { return f ? `<span class="fp" title="${esc(f)}">${esc(f.split(' ').slice(0, 2).join(' '))}…</span>` : '<span class="muted">no key</span>'; }
@@ -191,38 +247,64 @@ function roomBadges(r) {
   return (r.public ? '<span class="badge badge-blue">public</span>' : '<span class="badge badge-purple">private</span>')
     + (r.encrypted ? '<span class="badge badge-green">encrypted</span>' : r.signed ? '<span class="badge badge-gray">signed</span>' : '<span class="badge badge-red">unsigned</span>');
 }
+const lower = s => String(s || '').toLowerCase();
+function me() { const op = state.overview && state.overview.dashboard.operator; return op ? op.name : null; }
+function isMe(name) { return me() && lower(name) === lower(me()); }
+
+// Where the operator stands in room `r`.
+function standing(r) {
+  const m = r.members.find(x => isMe(x.agent));
+  if (m) return m.role === 'admin' ? 'admin' : 'member';
+  if (r.banned.some(b => isMe(b.agent))) return 'banned';
+  if (r.invited.some(n => isMe(n))) return 'invited';
+  return 'outside';
+}
 
 function setNav() {
   document.querySelectorAll('nav a.link').forEach(a => a.classList.toggle('active', a.dataset.view === state.view));
 }
 
+const VIEWS = ['overview', 'rooms', 'mail', 'activity', 'settings'];
 function route() {
   renderSeq++;
   const [view, arg] = (location.hash.slice(1) || 'overview').split('/');
-  state.view = ['overview', 'rooms', 'activity', 'operator'].includes(view) ? view : 'overview';
+  state.view = VIEWS.includes(view) ? view : view === 'operator' ? 'settings' : 'overview';
   state.room = state.view === 'rooms' && arg ? decodeURIComponent(arg) : null;
+  if (state.view === 'mail' && arg) state.mailTo = decodeURIComponent(arg);
   setNav();
   render();
+  if (state.room) loadChat(true);
+  if (state.view === 'mail') loadMail(true);
 }
 
 function render() {
   if (state.view === 'activity') return renderActivity();
   if (!state.overview) { app.innerHTML = '<p class="muted">Loading…</p>'; return; }
   if (state.view === 'rooms') return state.room ? renderRoom() : renderRooms();
-  if (state.view === 'operator') return renderOperator();
+  if (state.view === 'mail') return renderMail();
+  if (state.view === 'settings') return renderSettings();
   renderOverview();
+}
+
+function agentOptions(filter = () => true) {
+  return state.overview.agents.filter(a => a.fingerprint && !isMe(a.name) && filter(a))
+    .map(a => `<option value="${esc(a.name)}">`).join('');
 }
 
 function renderOverview() {
   const o = state.overview;
   const agents = o.agents.map(a => `
-    <tr class="clickable" data-act="watch" data-name="${esc(a.name)}">
-      <td><strong>${esc(a.name)}</strong></td>
+    <tr>
+      <td><strong>${esc(a.name)}</strong>${isMe(a.name) ? ' <span class="badge badge-blue">you</span>' : ''}</td>
       <td>${esc(a.provider || '')}<div class="muted">${esc(a.description || '')}</div></td>
       <td>${ago(a.seenSecsAgo)}</td>
       <td>${a.queued}</td>
       <td>${a.rooms}</td>
       <td>${fp(a.fingerprint)}</td>
+      <td class="actions">
+        <button class="btn btn-sm" data-act="watch" data-name="${esc(a.name)}">Traffic</button>
+        ${isMe(a.name) ? '' : `<button class="btn btn-sm" data-act="message" data-name="${esc(a.name)}">Message</button>`}
+      </td>
     </tr>`).join('');
   app.innerHTML = `
     <h1>Overview</h1>
@@ -236,17 +318,30 @@ function renderOverview() {
     </div>
     <h2>Agents</h2>
     ${o.agents.length ? `<div class="table-wrap"><table>
-      <thead><tr><th>Name</th><th>Runs in</th><th>Last seen</th><th>Queued</th><th>Rooms</th><th>Key</th></tr></thead>
+      <thead><tr><th>Name</th><th>Runs in</th><th>Last seen</th><th>Queued</th><th>Rooms</th><th>Key</th><th></th></tr></thead>
       <tbody>${agents}</tbody></table></div>` : '<div class="card empty">No agent has registered yet.</div>'}
-    ${o.agentsTotal > o.agents.length ? `<p class="muted">Showing ${o.agents.length} of ${o.agentsTotal}.</p>` : ''}
-    <p class="muted">Click an agent to follow its traffic.</p>`;
+    ${o.agentsTotal > o.agents.length ? `<p class="muted">Showing ${o.agents.length} of ${o.agentsTotal}.</p>` : ''}`;
 }
 
 function renderRooms() {
   const rooms = state.overview.rooms;
-  app.innerHTML = `<h1>Rooms</h1>` + (rooms.length ? `<div class="table-wrap"><table>
-    <thead><tr><th>Room</th><th>Kind</th><th>Members</th><th>Admins</th><th>Messages</th><th>Bans</th></tr></thead>
-    <tbody>${rooms.map(r => `
+  app.innerHTML = `<h1>Rooms</h1>
+    <div class="card"><div class="card-title">New room</div>
+      <form id="create-room" class="form-row">
+        <input type="text" name="room" placeholder="name" required maxlength="64" aria-label="Room name">
+        <input type="text" name="description" class="grow" placeholder="What it is for (optional)" maxlength="256" aria-label="Description">
+        <select name="public" aria-label="Visibility">
+          <option value="1">Public: any keyed agent may join</option>
+          <option value="0">Private: invited agents only</option>
+        </select>
+        <button class="btn btn-primary" type="submit">Create</button>
+      </form>
+      <p class="muted">You create it as <span class="you">${esc(me() || 'the operator')}</span> and are its first admin. Every operation is signed with the operator's key.</p>
+    </div>` + (rooms.length ? `<div class="table-wrap"><table>
+    <thead><tr><th>Room</th><th>Kind</th><th>Members</th><th>Admins</th><th>Messages</th><th>Bans</th><th>You</th></tr></thead>
+    <tbody>${rooms.map(r => {
+      const st = standing(r);
+      return `
       <tr class="clickable" data-act="room" data-room="${esc(r.room)}">
         <td><strong>#${esc(r.room)}</strong><div class="muted">${esc(r.description || '')}</div></td>
         <td>${roomBadges(r)}</td>
@@ -254,25 +349,75 @@ function renderRooms() {
         <td>${esc(r.members.filter(m => m.role === 'admin').map(m => m.agent).join(', ')) || '<span class="muted">—</span>'}</td>
         <td>${r.messages}</td>
         <td>${r.banned.length || ''}</td>
-      </tr>`).join('')}</tbody></table></div>` : '<div class="card empty">No rooms yet.</div>');
+        <td>${st === 'admin' ? role('admin') : st === 'member' ? role('participant') : st === 'invited' ? '<span class="badge badge-yellow">invited</span>' : st === 'banned' ? '<span class="badge badge-red">banned</span>' : ''}</td>
+      </tr>`; }).join('')}</tbody></table></div>` : '<div class="card empty">No rooms yet.</div>');
+  $('create-room').addEventListener('submit', async ev => {
+    ev.preventDefault();
+    const f = new FormData(ev.target);
+    const room = String(f.get('room')).trim();
+    try {
+      await post('/rooms', { room, description: f.get('description'), public: f.get('public') === '1' });
+      toast(`#${room} created`);
+      await refreshOverview(true);
+      location.hash = 'rooms/' + enc(room);
+    } catch (e) { toast(e.message, false); }
+  });
 }
 
 function renderRoom() {
-  const r = state.overview.rooms.find(x => x.room.toLowerCase() === state.room.toLowerCase());
+  const r = state.overview.rooms.find(x => lower(x.room) === lower(state.room));
   if (!r) { app.innerHTML = `<p><a href="#rooms">← Rooms</a></p><div class="card empty">#${esc(state.room)} is gone.</div>`; return; }
+  const st = standing(r);
+  const admin = st === 'admin';
+  const manage = admin && r.signed;
+  const groupOk = !r.encrypted;
+  const memberRows = r.members.map(m => {
+    const self = isMe(m.agent);
+    const a = esc(m.agent);
+    const buttons = !manage ? '' : [
+      m.role === 'admin'
+        ? `<button class="btn btn-sm" data-act="op" data-op="demote" data-agent="${a}">Demote</button>`
+        : `<button class="btn btn-sm" data-act="op" data-op="promote" data-agent="${a}">Make admin</button>`,
+      !self && groupOk ? `<button class="btn btn-sm" data-act="op" data-op="kick" data-agent="${a}">Kick</button>` : '',
+      !self && groupOk ? `<button class="btn btn-sm btn-danger" data-act="op" data-op="ban" data-agent="${a}" data-confirm="Ban ${a} from #${esc(r.room)}? It is removed and its name and key cannot join again until unbanned.">Ban</button>` : '',
+    ].join('');
+    return `<tr>
+      <td><strong>${a}</strong>${self ? ' <span class="badge badge-blue">you</span>' : ''}</td><td>${role(m.role)}</td>
+      <td>${m.fingerprint ? `<span class="fp">${esc(m.fingerprint)}</span>` : '<span class="muted">—</span>'}</td>
+      <td>${m.unread}</td><td class="actions">${buttons}</td></tr>`;
+  }).join('');
+  const inRoom = new Set(r.members.map(m => lower(m.agent)).concat(r.invited.map(lower)));
+  const standingText = {
+    admin: 'You are an <strong>admin</strong> here.',
+    member: 'You are a <strong>participant</strong> here. An admin can promote you.',
+    invited: 'You are invited.',
+    banned: 'You are banned from this room.',
+    outside: r.public ? 'You are not in this room. It is public: you can join.' : 'You are not in this room. It is private: an admin must invite you.',
+  }[st];
+  const joinable = !r.encrypted && r.signed && (st === 'invited' || (st === 'outside' && r.public));
   app.innerHTML = `
     <p><a href="#rooms">← Rooms</a></p>
     <h1>#${esc(r.room)} ${roomBadges(r)}</h1>
     ${r.description ? `<p>${esc(r.description)}</p>` : ''}
+    <div class="notice ${st === 'banned' ? 'notice-err' : 'notice-warn'}" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+      <span>${standingText}</span>
+      ${joinable ? '<button class="btn btn-primary btn-sm" data-act="op" data-op="join">Join</button>' : ''}
+      ${st === 'admin' || st === 'member' ? `<button class="btn btn-sm" data-act="op" data-op="leave" data-confirm="Leave #${esc(r.room)}?">Leave</button>` : ''}
+    </div>
+    ${r.encrypted ? '<div class="notice notice-warn">This room is end-to-end encrypted. Its group (invites, kicks, bans, messages) is run by its members\' clients; from here you can change roles and leave.</div>' : ''}
+    ${!r.signed ? '<div class="notice notice-err">This room is unsigned (MENTISCHAT_UNSIGNED=1); the operator cannot manage it.</div>' : ''}
     <div class="two-col">
       <div>
+        <div class="card"><div class="card-title">Chat</div><div id="chat-slot"></div></div>
         <div class="card"><div class="card-title">Members</div>
           <div class="table-wrap"><table>
-            <thead><tr><th>Agent</th><th>Role</th><th>Key fingerprint</th><th>Unread</th></tr></thead>
-            <tbody>${r.members.map(m => `<tr>
-              <td><strong>${esc(m.agent)}</strong></td><td>${role(m.role)}</td>
-              <td>${m.fingerprint ? `<span class="fp">${esc(m.fingerprint)}</span>` : '<span class="muted">—</span>'}</td>
-              <td>${m.unread}</td></tr>`).join('')}</tbody></table></div>
+            <thead><tr><th>Agent</th><th>Role</th><th>Key fingerprint</th><th>Unread</th><th></th></tr></thead>
+            <tbody>${memberRows}</tbody></table></div>
+          ${manage && groupOk ? `<form id="invite" class="form-row" style="margin-top:12px">
+            <input type="text" name="agent" list="invitees" class="grow" placeholder="Agent to invite" required aria-label="Agent to invite">
+            <datalist id="invitees">${agentOptions(a => !inRoom.has(lower(a.name)))}</datalist>
+            <button class="btn btn-primary" type="submit">Invite</button>
+          </form><p class="muted">Invites pin the key the agent has registered now; it joins with that key.</p>` : ''}
         </div>
       </div>
       <div>
@@ -280,19 +425,155 @@ function renderRoom() {
           ${r.invited.length ? r.invited.map(n => `<div>${esc(n)}</div>`).join('') : '<div class="muted">Nobody.</div>'}
         </div>
         <div class="card"><div class="card-title">Banned</div>
-          ${r.banned.length ? r.banned.map(b => `<div><strong>${esc(b.agent)}</strong> <span class="muted">${b.publicKey ? 'with its key' : 'by name'}</span></div>`).join('') : '<div class="muted">Nobody.</div>'}
+          ${r.banned.length ? r.banned.map(b => `<div class="form-row" style="justify-content:space-between"><span><strong>${esc(b.agent)}</strong> <span class="muted">${b.publicKey ? 'with its key' : 'by name'}</span></span>
+            ${manage ? `<button class="btn btn-sm" data-act="op" data-op="unban" data-agent="${esc(b.agent)}">Unban</button>` : ''}</div>`).join('') : '<div class="muted">Nobody.</div>'}
+          ${manage && groupOk ? `<form id="ban" class="form-row" style="margin-top:10px">
+            <input type="text" name="agent" list="bannable" class="grow" placeholder="Ban a name" required aria-label="Agent to ban">
+            <datalist id="bannable">${agentOptions()}</datalist>
+            <button class="btn btn-danger" type="submit">Ban</button></form>` : ''}
         </div>
         <div class="card"><div class="card-title">Room</div>
           <dl class="kv">
             <dt>Messages held</dt><dd>${r.messages}</dd>
-            <dt>Writes</dt><dd>${r.signed ? 'signed by each member' : 'unsigned (from before signing)'}</dd>
+            <dt>Writes</dt><dd>${r.signed ? 'signed by each member' : 'unsigned'}</dd>
             <dt>Bodies</dt><dd>${r.encrypted ? 'end-to-end encrypted' : 'readable by the daemon'}</dd>
           </dl>
         </div>
         <button class="btn" data-act="watch" data-name="#${esc(r.room)}">Follow this room's traffic</button>
       </div>
-    </div>
-    <p class="muted">The dashboard holds no agent key, so it cannot change a room. Admins manage it from the chat: /invite, /kick, /ban, /promote … (/help lists them).</p>`;
+    </div>`;
+  const bind = (id, op) => { const f = $(id); if (f) f.addEventListener('submit', ev => { ev.preventDefault(); roomOp(op, String(new FormData(f).get('agent')).trim()); }); };
+  bind('invite', 'invite');
+  bind('ban', 'ban');
+  drawChat(r, st);
+}
+
+const OP_DONE = { join: 'joined', leave: 'left', invite: 'invited', kick: 'kicked', ban: 'banned', unban: 'unbanned', promote: 'promoted', demote: 'demoted', send: 'sent' };
+async function roomOp(op, agent, extra) {
+  const room = state.room;
+  try {
+    await post(`/rooms/${enc(room)}/${op}`, agent ? { agent } : (extra || {}));
+    if (op !== 'send') toast(agent ? `${agent} ${OP_DONE[op]}` : `${OP_DONE[op]} #${room}`);
+    await refreshOverview(true);
+    loadChat(false);
+  } catch (e) { toast(e.message, false); }
+}
+
+function chatMessage(m) {
+  const mine = isMe(m.from);
+  const body = m.encrypted ? '<span class="muted">ciphertext</span>' : esc(m.text);
+  const flag = m.signed ? (m.verified ? '' : ' <span class="badge badge-red">bad signature</span>') : ' <span class="badge badge-red">unsigned</span>';
+  return `<div class="msg ${mine ? 'mine' : ''}"><div class="head"><strong>${esc(m.from)}</strong>${m.to && !m.room ? ` → ${esc(m.to)}` : ''} · ${clock(m.createdAt)}${flag}</div><div class="body">${body}</div></div>`;
+}
+
+function drawChat(r, st) {
+  const slot = $('chat-slot');
+  if (!slot) return;
+  const member = st === 'admin' || st === 'member';
+  if (!member) { slot.innerHTML = '<div class="muted">Join the room to read and post.</div>'; return; }
+  const c = state.chat;
+  const log = c.room && lower(c.room) === lower(r.room)
+    ? (c.error ? `<div class="muted">${esc(c.error)}</div>` : c.messages.length ? c.messages.map(chatMessage).join('') : '<div class="muted">No messages yet.</div>')
+    : '<div class="muted">Loading…</div>';
+  const existing = $('chat-log');
+  if (existing) {
+    const atBottom = existing.scrollHeight - existing.scrollTop - existing.clientHeight < 40;
+    existing.innerHTML = log;
+    if (atBottom) existing.scrollTop = existing.scrollHeight;
+    return;
+  }
+  slot.innerHTML = `<div class="chat"><div class="log" id="chat-log">${log}</div>
+    ${r.encrypted ? '<p class="muted">Posting needs an MLS client.</p>' : `<form id="chat-form" class="form-row">
+      <textarea id="chat-text" class="grow" rows="1" maxlength="65536" placeholder="Message #${esc(r.room)} as ${esc(me())}  (Enter sends, Shift+Enter breaks a line)" aria-label="Message">${esc(state.drafts[lower(r.room)] || '')}</textarea>
+      <button class="btn btn-primary" type="submit">Send</button></form>`}</div>`;
+  const logEl = $('chat-log'); logEl.scrollTop = logEl.scrollHeight;
+  const form = $('chat-form');
+  if (form) {
+    const text = $('chat-text');
+    text.addEventListener('input', () => { state.drafts[lower(r.room)] = text.value; });
+    text.addEventListener('keydown', ev => { if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); form.requestSubmit(); } });
+    form.addEventListener('submit', async ev => {
+      ev.preventDefault();
+      const value = text.value;
+      if (!value.trim()) return;
+      text.value = '';
+      state.drafts[lower(r.room)] = '';
+      await roomOp('send', null, { text: value });
+      text.focus();
+    });
+  }
+}
+
+async function loadChat(reset) {
+  const room = state.room;
+  if (!room || !state.overview) return;
+  const r = state.overview.rooms.find(x => lower(x.room) === lower(room));
+  if (!r) return;
+  const st = standing(r);
+  if (st !== 'admin' && st !== 'member') return;
+  if (reset && lower(state.chat.room) !== lower(room)) state.chat = { room, messages: [], error: null };
+  try {
+    const page = await api(`/rooms/${enc(room)}/messages`);
+    if (state.room !== room) return;
+    state.chat = { room, messages: page.messages, error: null };
+  } catch (e) {
+    state.chat = { room, messages: [], error: e.message };
+  }
+  if (state.view === 'rooms' && state.room === room) drawChat(r, st);
+}
+
+function renderMail() {
+  const m = state.mail;
+  app.innerHTML = `<h1>Mail <span class="muted" style="font-size:.9rem;font-weight:400">as ${esc(me() || 'the operator')}</span></h1>
+    <div class="card"><div class="card-title">Direct messages</div>
+      <div class="chat"><div class="log" id="mail-log"></div>
+      <form id="mail-form" class="form-stack">
+        <div class="form-row">
+          <input type="text" id="mail-to" name="to" list="recipients" placeholder="To" required value="${esc(state.mailTo)}" aria-label="Recipient" style="width:220px">
+          <datalist id="recipients">${agentOptions()}</datalist>
+          <textarea id="mail-text" class="grow" rows="1" maxlength="65536" placeholder="Signed direct message (Enter sends)" aria-label="Message"></textarea>
+          <button class="btn btn-primary" type="submit">Send</button>
+        </div>
+      </form></div>
+      <p class="muted">Signed with the operator's key. "bad signature" marks a message whose envelope does not match its sender's registered key.</p>
+    </div>`;
+  drawMail();
+  const form = $('mail-form');
+  const text = $('mail-text');
+  $('mail-to').addEventListener('input', ev => { state.mailTo = ev.target.value; });
+  text.addEventListener('keydown', ev => { if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); form.requestSubmit(); } });
+  form.addEventListener('submit', async ev => {
+    ev.preventDefault();
+    const to = $('mail-to').value.trim();
+    const value = text.value;
+    if (!to || !value.trim()) return;
+    try {
+      await post('/direct', { to, text: value });
+      text.value = '';
+      loadMail(false);
+    } catch (e) { toast(e.message, false); }
+    text.focus();
+  });
+}
+
+function drawMail() {
+  const log = $('mail-log');
+  if (!log) return;
+  const m = state.mail;
+  const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+  log.innerHTML = m.error ? `<div class="muted">${esc(m.error)}</div>`
+    : m.messages.length ? m.messages.slice().sort((a, b) => Number(a.id) - Number(b.id)).map(chatMessage).join('')
+    : '<div class="muted">No direct mail yet.</div>';
+  if (atBottom || !log.dataset.drawn) log.scrollTop = log.scrollHeight;
+  log.dataset.drawn = '1';
+}
+
+async function loadMail() {
+  try {
+    const page = await api('/mail');
+    state.mail = { messages: page.messages, error: null };
+  } catch (e) { state.mail = { messages: [], error: e.message }; }
+  if (state.view === 'mail') drawMail();
 }
 
 function matches(e) {
@@ -335,7 +616,8 @@ function renderActivity() {
       <button class="btn" data-act="clear">Clear</button>
       <span class="muted" id="feed-note"></span>
     </div>
-    <ul class="feed" id="feed"></ul>`;
+    <ul class="feed" id="feed"></ul>
+    <p class="muted">The feed records while this dashboard is open; traffic from before it was opened is not shown.</p>`;
   $('kind').value = state.kind;
   $('filter').addEventListener('input', ev => { state.filter = ev.target.value; drawFeed(); });
   $('kind').addEventListener('change', ev => { state.kind = ev.target.value; drawFeed(); });
@@ -349,67 +631,95 @@ function drawFeed(freshFrom = Infinity) {
   feed.innerHTML = shown.length ? shown.map(e => eventRow(e, e.seq >= freshFrom)).join('')
     : '<li class="empty" style="display:block">Nothing yet. Messages appear here as agents send and read them.</li>';
   const note = $('feed-note');
-  if (note) note.textContent = state.previews ? '' : (state.pin ? 'Previews are off (Operator).' : 'No PIN: message text is hidden.');
+  if (note) note.textContent = state.previews ? '' : 'Previews are off (Settings).';
 }
 
-function renderOperator() {
+function renderSettings() {
   const d = state.overview.dashboard;
   const o = state.overview;
+  const op = d.operator;
   app.innerHTML = `
-    <h1>Operator</h1>
-    ${d.pin ? '' : '<div class="notice notice-warn">No PIN is set, so the dashboard shows no message text and these actions are off. Set MENTISCHAT_DASHBOARD_PIN and restart the daemon.</div>'}
+    <h1>Settings</h1>
     <div class="two-col">
       <div>
-        <div class="card"><div class="card-title">Message previews</div>
-          <label class="switch"><input type="checkbox" id="previews" ${d.previews ? 'checked' : ''} ${d.pin ? '' : 'disabled'}>
-            Show the first line of each message in Activity</label>
-          <span class="feedback" id="previews-fb"></span>
-          <p class="muted">End-to-end encrypted messages are never shown. Off hides text from this dashboard only; agents are unaffected.</p>
+        <div class="card"><div class="card-title">Operator agent</div>
+          ${op ? `<dl class="kv">
+            <dt>Name</dt><dd><strong>${esc(op.name)}</strong></dd>
+            <dt>Fingerprint</dt><dd><span class="fp">${esc(op.fingerprint)}</span></dd>
+            <dt>Public key</dt><dd><code style="word-break:break-all">${esc(op.publicKey)}</code></dd>
+          </dl>
+          <p class="muted">Everything you do from this dashboard is signed by this agent. Its key is kept in the daemon's data directory (<code>operator.key</code>). It is admin of the rooms it creates; in other rooms an admin must promote it. Set MENTISCHAT_OPERATOR to use another name.</p>`
+          : '<div class="notice notice-err">The operator agent is unavailable; see the daemon log.</div>'}
         </div>
-        <div class="card"><div class="card-title">Expiry sweep</div>
-          <button class="btn btn-primary" data-act="sweep" ${d.pin ? '' : 'disabled'}>Sweep now</button>
-          <span class="feedback" id="sweep-fb"></span>
-          <p class="muted">Deletes read mail older than ${ago(d.retention.readTtlSecs).replace(' ago', '')} and drops agents idle longer than ${ago(d.retention.agentTtlSecs).replace(' ago', '')}, as the daemon does on its own every so often.</p>
+        <div class="card"><div class="card-title">Dashboard PIN</div>
+          ${d.pinSource === 'env' ? '<p class="muted">Set by MENTISCHAT_DASHBOARD_PIN; change it there and restart the daemon.</p>' : `
+          <form id="pin-form" class="form-stack" style="max-width:360px">
+            <input type="password" name="current" placeholder="Current PIN" required autocomplete="current-password" aria-label="Current PIN" class="field">
+            <input type="password" name="new" placeholder="New PIN (6+ characters)" required minlength="6" maxlength="128" autocomplete="new-password" aria-label="New PIN" class="field">
+            <input type="password" name="confirm" placeholder="Confirm new PIN" required minlength="6" maxlength="128" autocomplete="new-password" aria-label="Confirm new PIN" class="field">
+            <div><button class="btn btn-primary" type="submit">Change PIN</button></div>
+          </form>
+          <p class="muted">Changing it logs out every other browser.</p>`}
         </div>
       </div>
       <div>
+        <div class="card"><div class="card-title">Message previews</div>
+          <label class="switch"><input type="checkbox" id="previews" ${d.previews ? 'checked' : ''}>
+            Show the first line of each message in Activity</label>
+          <p class="muted">End-to-end encrypted messages are never shown. Off hides text from this dashboard only; agents are unaffected.</p>
+        </div>
+        <div class="card"><div class="card-title">Expiry sweep</div>
+          <button class="btn btn-primary" data-act="sweep">Sweep now</button>
+          <p class="muted">Deletes read mail older than ${span(d.retention.readTtlSecs)} and drops agents idle longer than ${span(d.retention.agentTtlSecs)}, as the daemon does on its own every so often. The operator agent is never dropped.</p>
+        </div>
         <div class="card"><div class="card-title">Daemon</div>
           <dl class="kv">
             <dt>Version</dt><dd>${esc(d.version)}</dd>
             <dt>Writes</dt><dd>${o.signaturesRequired ? '<span class="badge badge-green">signed only</span>' : '<span class="badge badge-red">unsigned accepted</span>'}</dd>
-            <dt>PIN</dt><dd>${d.pin ? 'set' : 'not set'}</dd>
-            <dt>Read mail kept</dt><dd>${ago(d.retention.readTtlSecs).replace(' ago', '')}</dd>
-            <dt>Idle agents kept</dt><dd>${ago(d.retention.agentTtlSecs).replace(' ago', '')}</dd>
+            <dt>PIN</dt><dd>${d.pinSource === 'env' ? 'from MENTISCHAT_DASHBOARD_PIN' : 'set on the dashboard'}</dd>
+            <dt>Read mail kept</dt><dd>${span(d.retention.readTtlSecs)}</dd>
+            <dt>Idle agents kept</dt><dd>${span(d.retention.agentTtlSecs)}</dd>
           </dl>
-        </div>
-        <div class="card"><div class="card-title">Rooms</div>
-          <p class="muted">Room management is signed by an agent's key, which this dashboard never holds. Admins use the chat commands (/promote, /ban, …) or <code>mentischat client room</code>.</p>
         </div>
       </div>
     </div>`;
   $('previews').addEventListener('change', async ev => {
-    const fb = $('previews-fb');
     try {
-      const r = await api('/previews', { method: 'POST', body: JSON.stringify({ on: ev.target.checked }) });
+      const r = await post('/previews', { on: ev.target.checked });
       state.previews = r.previews; state.overview.dashboard.previews = r.previews;
-      fb.textContent = '✓ saved'; fb.style.color = 'var(--ok)';
-    } catch (e) { fb.textContent = '✗ ' + e.message; fb.style.color = 'var(--err)'; ev.target.checked = !ev.target.checked; }
+      toast(r.previews ? 'Previews on' : 'Previews off');
+    } catch (e) { toast(e.message, false); ev.target.checked = !ev.target.checked; }
+  });
+  const pin = $('pin-form');
+  if (pin) pin.addEventListener('submit', async ev => {
+    ev.preventDefault();
+    const f = new FormData(pin);
+    if (f.get('new') !== f.get('confirm')) { toast('The new PINs differ', false); return; }
+    try {
+      await post('/pin', { current: f.get('current'), new: f.get('new') });
+      pin.reset();
+      toast('PIN changed; other browsers are logged out');
+    } catch (e) { toast(e.message, false); }
   });
 }
 
 const ACTIONS = {
-  room(el) { location.hash = 'rooms/' + encodeURIComponent(el.dataset.room); },
-  watch(el) { state.filter = el.dataset.name; state.kind = 'all'; location.hash = 'activity'; },
+  room(el) { location.hash = 'rooms/' + enc(el.dataset.room); },
+  watch(el, ev) { ev.stopPropagation(); state.filter = el.dataset.name; state.kind = 'all'; location.hash = 'activity'; },
+  message(el, ev) { ev.stopPropagation(); state.mailTo = el.dataset.name; location.hash = 'mail'; },
+  op(el, ev) {
+    ev.stopPropagation();
+    if (el.dataset.confirm && !window.confirm(el.dataset.confirm)) return;
+    roomOp(el.dataset.op, el.dataset.agent || null);
+  },
   pause(el) { state.paused = !state.paused; el.textContent = state.paused ? '▶ Resume' : '⏸ Pause'; },
   clear() { state.feed = []; drawFeed(); },
   async sweep() {
-    const fb = $('sweep-fb');
     try {
-      const r = await api('/sweep', { method: 'POST', body: '{}' });
-      fb.textContent = `✓ ${r.expiredRead} read message(s) deleted, ${r.droppedAgents.length} idle agent(s) dropped`;
-      fb.style.color = 'var(--ok)';
-      refreshOverview();
-    } catch (e) { fb.textContent = '✗ ' + e.message; fb.style.color = 'var(--err)'; }
+      const r = await post('/sweep');
+      toast(`${r.expiredRead} read message(s) deleted, ${r.droppedAgents.length} idle agent(s) dropped`);
+      refreshOverview(true);
+    } catch (e) { toast(e.message, false); }
   },
 };
 document.addEventListener('click', ev => {
@@ -417,18 +727,24 @@ document.addEventListener('click', ev => {
   if (el && ACTIONS[el.dataset.act]) ACTIONS[el.dataset.act](el, ev);
 });
 
-async function refreshOverview() {
+// Whether the user is typing into the page: a redraw would lose it.
+function typing() {
+  const a = document.activeElement;
+  return a && app.contains(a) && ['INPUT', 'TEXTAREA', 'SELECT'].includes(a.tagName)
+    && (a.type !== 'checkbox' || a.id === 'previews');
+}
+
+async function refreshOverview(force) {
   const seq = renderSeq;
   try {
     const o = await api('/overview');
     state.overview = o;
-    state.pin = o.dashboard.pin;
     state.previews = o.dashboard.previews;
     $('version').textContent = 'v' + o.dashboard.version;
-    $('logout').hidden = !o.dashboard.pin;
+    $('logout').hidden = false;
     $('signing').innerHTML = o.signaturesRequired ? '<span class="badge badge-green">signed writes</span>' : '<span class="badge badge-red">unsigned writes</span>';
     // Do not redraw a page the user is typing into, or one they left.
-    if (seq === renderSeq && state.view !== 'activity' && !(state.view === 'operator' && document.activeElement && document.activeElement.id === 'previews')) render();
+    if (seq === renderSeq && state.view !== 'activity' && state.view !== 'mail' && (force || !typing())) render();
   } catch (e) {
     if (state.view !== 'activity') app.innerHTML = `<div class="notice notice-err">✗ ${esc(e.message)}</div>`;
   }
@@ -450,9 +766,15 @@ async function pollActivity() {
   setTimeout(pollActivity, 1500);
 }
 
+// The open room's chat and the mail view refresh faster than the overview.
+setInterval(() => {
+  if (document.hidden) return;
+  if (state.view === 'rooms' && state.room) loadChat(false);
+  if (state.view === 'mail') loadMail(false);
+}, 2000);
+
 window.addEventListener('hashchange', route);
-route();
-refreshOverview();
+refreshOverview().then(route);
 setInterval(refreshOverview, 5000);
 pollActivity();
 </script>

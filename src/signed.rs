@@ -279,8 +279,9 @@ impl fmt::Display for BadSignature {
 
 impl std::error::Error for BadSignature {}
 
-/// An Ed25519 signing identity, for the client component and tests. The
-/// daemon never holds one.
+/// An Ed25519 signing identity, for the client component, the dashboard's
+/// operator agent and tests. The daemon never holds an agent's key; the
+/// operator's is its own.
 pub struct Keypair(SigningKey);
 
 impl Keypair {

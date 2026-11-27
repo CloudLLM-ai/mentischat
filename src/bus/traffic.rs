@@ -90,7 +90,9 @@ impl Entry {
     fn activity(&self) -> Activity {
         let msg = &self.msg;
         let envelope = crate::signed::Envelope::parse(&msg.body).ok();
-        let encrypted = envelope.as_ref().is_some_and(|e| e.body.starts_with("mls/"));
+        let encrypted = envelope
+            .as_ref()
+            .is_some_and(|e| e.body.starts_with("mls/"));
         let text = match &envelope {
             None => Some(&*msg.body),
             Some(e) if !encrypted => Some(e.body),
@@ -186,8 +188,12 @@ impl Traffic {
     pub(super) fn sent(&self, msg: &Arc<Msg>, body: Body) {
         self.log.sent(msg, body);
         if self.feed.watched(msg.created_ms) {
-            self.feed
-                .push(ActivityKind::Sent, msg.created_ms, std::slice::from_ref(msg), None);
+            self.feed.push(
+                ActivityKind::Sent,
+                msg.created_ms,
+                std::slice::from_ref(msg),
+                None,
+            );
         }
     }
 

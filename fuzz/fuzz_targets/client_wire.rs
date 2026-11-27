@@ -36,6 +36,18 @@ fuzz_target!(|data: &[u8]| {
                 .windows(2)
                 .any(|w| w[0] == "--seed-file" && std::path::Path::new(&w[1]) == seed_file));
         }
+        Ok(Command::KeyRotate { agent, addr }) => {
+            assert!(AgentName::parse(&agent).is_ok());
+            assert!(addr.ip().is_loopback());
+        }
+        Ok(Command::Whois { agent, target, .. }) => {
+            assert!(AgentName::parse(&agent).is_ok());
+            assert!(AgentName::parse(&target).is_ok());
+        }
+        Ok(Command::Room { agent, room, .. }) => {
+            assert!(AgentName::parse(&agent).is_ok());
+            assert!(mentischat::names::RoomName::parse(&room).is_ok());
+        }
         Err(_) => {}
     }
 });

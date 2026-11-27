@@ -1137,3 +1137,123 @@ fn the_command_line_parses_room_commands() {
         assert!(parse(&args(bad)).is_err(), "{bad}");
     }
 }
+
+/// The remaining chat commands: `/help`, `/invite` and `/leave` in a private
+/// room, `/unban` and `/demote`, and `/leave` from a secure room.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_other_chat_commands_run_too() {
+    let w = world().await;
+    let (mut alice, mut bob) = (w.harness("alice"), w.harness("bob"));
+    for (h, n) in [(&mut alice, "alice"), (&mut bob, "bob")] {
+        h.tool("register", json!({ "agent": n })).await;
+    }
+    let say =
+        |who: &str, room: &str, body: &str| json!({ "from": who, "room": room, "body": body });
+    alice
+        .tool(
+            "create_room",
+            json!({ "agent": "alice", "room": "den", "private": true }),
+        )
+        .await;
+    let (err, v) = alice
+        .tool("send_message", say("alice", "den", "/help"))
+        .await;
+    assert!(!err, "{v}");
+    assert!(v["result"].as_array().unwrap().len() > 5);
+    let (err, v) = alice
+        .tool("send_message", say("alice", "den", "/invite bob"))
+        .await;
+    assert!(!err, "{v}");
+    bob.tool("join_room", json!({ "agent": "bob", "room": "den" }))
+        .await;
+    let (err, v) = alice
+        .tool("send_message", say("alice", "den", "/promote bob"))
+        .await;
+    assert!(!err, "{v}");
+    let (err, v) = alice
+        .tool("send_message", say("alice", "den", "/demote bob"))
+        .await;
+    assert!(!err, "{v}");
+    let (err, v) = alice
+        .tool("send_message", say("alice", "den", "/ban bob"))
+        .await;
+    assert!(!err, "{v}");
+    let (err, v) = alice
+        .tool("send_message", say("alice", "den", "/unban bob"))
+        .await;
+    assert!(!err, "{v}");
+    assert_eq!(v["command"], "unban");
+    let (err, v) = alice
+        .tool("send_message", say("alice", "den", "/leave"))
+        .await;
+    assert!(!err, "{v}");
+    assert_eq!(v["result"]["deleted"], true);
+
+    alice
+        .tool(
+            "create_room",
+            json!({ "agent": "alice", "room": "vault", "secure": true }),
+        )
+        .await;
+    let (err, v) = alice
+        .tool("send_message", say("alice", "vault", "/leave"))
+        .await;
+    assert!(!err, "{v}");
+    assert_eq!(v["command"], "leave");
+    // `//` in a secure room is sent as text too.
+    let (err, _) = alice
+        .tool("send_message", say("alice", "vault", "//x"))
+        .await;
+    assert!(err, "alice left the vault");
+}
+
+/// Every write in another agent's name is refused before it is signed, and an
+/// invitation to a keyless name says the name has no key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_proxy_never_signs_as_someone_else() {
+    let w = world().await;
+    let mut alice = w.harness("alice");
+    alice.tool("register", json!({ "agent": "alice" })).await;
+    for (tool, args) in [
+        ("create_room", json!({ "agent": "bob", "room": "r" })),
+        ("join_room", json!({ "agent": "bob", "room": "r" })),
+        ("leave_room", json!({ "agent": "bob", "room": "r" })),
+        (
+            "invite",
+            json!({ "agent": "bob", "room": "r", "invitee": "carol" }),
+        ),
+        (
+            "send_message",
+            json!({ "from": "bob", "room": "r", "body": "x" }),
+        ),
+    ] {
+        let (err, v) = alice.tool(tool, args).await;
+        assert!(err, "{tool}: {v}");
+        assert_eq!(v["error"], "invalid_body", "{tool}");
+    }
+    alice
+        .tool(
+            "create_room",
+            json!({ "agent": "alice", "room": "den", "private": "true" }),
+        )
+        .await;
+    w.bus
+        .register(&mentischat::names::AgentName::parse("keyless").unwrap())
+        .await
+        .unwrap();
+    let (err, v) = alice
+        .tool(
+            "invite",
+            json!({ "agent": "alice", "room": "den", "invitee": "keyless" }),
+        )
+        .await;
+    assert!(err, "{v}");
+    let (err, v) = alice
+        .tool("send_message", json!({ "from": "alice", "room": "den" }))
+        .await;
+    assert!(err, "no body: {v}");
+    let (err, v) = alice
+        .tool("send_message", json!({ "from": "alice", "body": "x" }))
+        .await;
+    assert!(err, "no recipient: {v}");
+}

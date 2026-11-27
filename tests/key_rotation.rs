@@ -326,3 +326,87 @@ async fn the_key_registry_keeps_the_new_key() {
     let bound = bus.agent_key(&name("vega")).await.unwrap().unwrap();
     assert_eq!(bound.public_key, vega.keys.public().to_hex());
 }
+
+/// A forged or out-of-order `rotate` line in the key registry is dropped on
+/// load, and the binding stays with the key it had.
+#[tokio::test]
+async fn a_forged_rotation_in_the_registry_is_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join(KEY_REGISTRY_FILE);
+    let open = |dir: &std::path::Path| {
+        Bus::new(dir)
+            .unwrap()
+            .with_key_registry(&dir.join(KEY_REGISTRY_FILE))
+            .unwrap()
+    };
+    let vega = Actor::new("vega", 7);
+    {
+        let (bus, _) = open(dir.path());
+        vega.enroll(&bus).await;
+    }
+    let mallory = Keypair::from_seed([66; 32]);
+    let new = mallory.public();
+    let line = |signer: &Keypair, old: &Keypair, counter: u64| {
+        serde_json::json!({ "rotate": {
+            "agent": "vega",
+            "old_key": old.public().to_hex(),
+            "new_key": new.to_hex(),
+            "counter": counter,
+            "signature": signer.sign(&rotate_key_payload("vega", counter, &new)).to_hex(),
+            "proof": mallory.sign(&register_key_payload("vega", &new)).to_hex(),
+        }})
+        .to_string()
+    };
+    let mut text = std::fs::read_to_string(&file).unwrap();
+    // Signed by the wrong key; then naming an old key that is not bound;
+    // then garbage.
+    text.push_str(&format!("{}\n", line(&mallory, &vega.keys, 5)));
+    text.push_str(&format!("{}\n", line(&mallory, &mallory, 5)));
+    text.push_str("{\"rotate\":{\"agent\":\"vega\"}}\n");
+    std::fs::write(&file, text).unwrap();
+
+    let (bus, load) = open(dir.path());
+    assert_eq!(load.dropped, 3);
+    assert_eq!(load.bound, 1);
+    let reclaim = Registration {
+        reclaim: true,
+        proof: Some(KeyProof {
+            counter: 9,
+            signature: vega.keys.sign(&reclaim_payload("vega", 9)),
+        }),
+        ..Registration::default()
+    };
+    bus.register_with(&name("vega"), reclaim).await.unwrap();
+    let bound = bus.agent_key(&name("vega")).await.unwrap().unwrap();
+    assert_eq!(bound.public_key, vega.keys.public().to_hex());
+}
+
+/// A genuine rotation line replays on load and compacts to a binding of the
+/// new key.
+#[tokio::test]
+async fn a_rotation_line_replays_and_compacts() {
+    let dir = tempfile::tempdir().unwrap();
+    let open = |dir: &std::path::Path| {
+        Bus::new(dir)
+            .unwrap()
+            .with_key_registry(&dir.join(KEY_REGISTRY_FILE))
+            .unwrap()
+    };
+    let mut vega = Actor::new("vega", 7);
+    {
+        let (bus, _) = open(dir.path());
+        vega.enroll(&bus).await;
+        vega.rotate(&bus, Keypair::from_seed([77; 32]), 3)
+            .await
+            .unwrap();
+    }
+    let raw = std::fs::read_to_string(dir.path().join(KEY_REGISTRY_FILE)).unwrap();
+    assert!(raw.contains("\"rotate\""), "{raw}");
+    {
+        let (_bus, load) = open(dir.path());
+        assert_eq!((load.bound, load.dropped), (1, 0));
+    }
+    let raw = std::fs::read_to_string(dir.path().join(KEY_REGISTRY_FILE)).unwrap();
+    assert!(!raw.contains("\"rotate\""), "compacted: {raw}");
+    assert!(raw.contains(&vega.keys.public().to_hex()));
+}

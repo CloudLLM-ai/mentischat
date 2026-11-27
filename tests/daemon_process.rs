@@ -498,3 +498,70 @@ fn test_client_key_rotate_replaces_the_key_everywhere() {
     assert!(body.contains(&new.public().fingerprint()), "{body}");
     assert_eq!(daemon.terminate().code(), Some(0));
 }
+
+/// `mentischat client room` and `client whois` run against a live daemon: the
+/// founder sees itself as admin, a refused admin op exits non-zero with the
+/// daemon's code, and a malformed command line exits 2.
+#[test]
+fn test_client_room_and_whois_commands() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let clients = dir.path().join("clients");
+    let daemon = Running::start(command(&dir.path().join("daemon")));
+    let addr = daemon.addr.to_string();
+    let client = |args: &[&str]| {
+        Command::new(BIN)
+            .arg("client")
+            .args(args)
+            .args(["--addr", &addr])
+            .env("MENTISCHAT_CLIENT_DIR", &clients)
+            .stdin(Stdio::null())
+            .output()
+            .expect("client runs")
+    };
+    let out = Command::new(BIN)
+        .args(["client", "key", "init", "--agent", "Vega"])
+        .env("MENTISCHAT_CLIENT_DIR", &clients)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let text = std::fs::read_to_string(clients.join("vega").join("identity.key")).unwrap();
+    let vega = Keypair::from_seed(mentischat::signed::hex_decode::<32>(text.trim()).unwrap());
+    enroll(daemon.addr, "Vega", &vega);
+
+    // Vega founds a public room (the CLI has no create; sign it here).
+    let create = mentischat::signed::SignedOp::Create {
+        description: String::new(),
+        public: true,
+    };
+    let body = serde_json::json!({
+        "op": "create", "agent": "Vega", "room": "lobby", "counter": 1,
+        "public": true, "description": "",
+        "signature": vega.sign(&create.payload("lobby", "Vega", 1)).to_hex(),
+    });
+    let (status, reply) = http(daemon.addr, "POST", "/signed/ops", Some(&body.to_string()));
+    assert_eq!(status, 200, "{reply}");
+
+    let out = client(&["room", "members", "lobby", "--agent", "Vega"]);
+    let shown = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert!(shown.contains("\"role\": \"admin\""), "{shown}");
+    assert!(shown.contains(&vega.public().fingerprint()), "{shown}");
+
+    let out = client(&["whois", "Vega", "--agent", "Vega"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains(&vega.public().to_hex()));
+
+    let out = client(&["room", "promote", "lobby", "Orion", "--agent", "Vega"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not_a_member"),
+        "{out:?}"
+    );
+
+    let out = client(&["room", "ban", "lobby", "--agent", "Vega"]);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+
+    let out = client(&["room", "members", "lobby", "--agent", "Nobody"]);
+    assert_eq!(out.status.code(), Some(1), "no identity: {out:?}");
+    assert_eq!(daemon.terminate().code(), Some(0));
+}

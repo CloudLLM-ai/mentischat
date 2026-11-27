@@ -667,3 +667,69 @@ async fn public_rooms_limit_how_often_a_key_joins() {
         .await
         .unwrap();
 }
+
+/// Every admin operation a journal could fake is refused on replay: a ban
+/// naming the wrong key, removing or banning oneself, demoting a participant,
+/// promoting or unbanning nobody, and a rotation the room never saw.
+#[test]
+fn the_journal_refuses_faked_admin_operations() {
+    let (alice, bob) = (Actor::new("alice", 1), Actor::new("bob", 2));
+    let verify = |records: Vec<Value>| {
+        verify_signed_record(
+            "lobby",
+            &serde_json::to_vec(&json!({ "journal": records })).unwrap(),
+        )
+    };
+    let base = || {
+        vec![
+            alice.rec("lobby", 1, &create(true)),
+            bob.rec("lobby", 1, &SignedOp::Join),
+        ]
+    };
+    let with = |op: SignedOp| {
+        let mut records = base();
+        records.push(alice.rec("lobby", 2, &op));
+        verify(records).unwrap_err()
+    };
+    let wrong_key = SignedOp::Ban {
+        target: "bob".into(),
+        target_key: Some(alice.keys.public()),
+    };
+    for op in [
+        wrong_key,
+        alice.ban(&alice),
+        target(remove, &alice),
+        target(demote, &bob),
+        SignedOp::Promote {
+            target: "ghost".into(),
+        },
+        SignedOp::Unban {
+            target: "ghost".into(),
+        },
+        SignedOp::Remove {
+            target: "bad!name".into(),
+        },
+    ] {
+        assert_eq!(with(op.clone()), "admin operation not allowed", "{op:?}");
+    }
+
+    let mut records = base();
+    let mut rotate = alice.rec("lobby", 5, &SignedOp::Leave);
+    rotate["kind"] = json!("rotate_key");
+    rotate["key"] = json!(Keypair::from_seed([9; 32]).public().to_hex());
+    rotate["target_key"] = json!(Keypair::from_seed([8; 32]).public().to_hex());
+    records.push(rotate);
+    assert_eq!(verify(records).unwrap_err(), "signature does not verify");
+
+    let mut records = base();
+    let mut drop = json!({
+        "agent": "", "key": "", "counter": 0, "signature": "", "kind": "drop", "target": "ghost",
+    });
+    records.push(drop.clone());
+    assert_eq!(verify(records).unwrap_err(), "drop of a non-member");
+    drop["target"] = json!("bob");
+    drop["body"] = json!("x");
+    let mut records = base();
+    records.push(drop);
+    assert_eq!(verify(records).unwrap_err(), "malformed drop record");
+}

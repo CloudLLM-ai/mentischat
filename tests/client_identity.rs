@@ -313,3 +313,27 @@ fn test_key_import_command_line() {
     ]))
     .is_err());
 }
+
+/// A staged rotation key sits beside the identity until it is finished or
+/// abandoned; staging again finds the same key (an interrupted rotation).
+#[test]
+fn a_staged_rotation_is_kept_finished_or_abandoned() {
+    use mentischat::client::Identity;
+    let dir = tempfile::tempdir().unwrap();
+    let mut id = Identity::open(dir.path(), "Vega").unwrap();
+    let old = id.public();
+    let next = id.stage_rotation().unwrap();
+    let staged = dir.path().join("vega").join("identity.key.next");
+    assert!(staged.exists());
+    assert_ne!(next.public(), old);
+    assert_eq!(id.stage_rotation().unwrap().public(), next.public());
+
+    id.abandon_rotation();
+    assert!(!staged.exists());
+    let next = id.stage_rotation().unwrap();
+    let want = next.public();
+    id.finish_rotation(next).unwrap();
+    assert_eq!(id.public(), want);
+    assert!(!staged.exists());
+    assert_eq!(Identity::open(dir.path(), "Vega").unwrap().public(), want);
+}

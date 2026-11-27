@@ -446,3 +446,69 @@ async fn roles_rotation_and_whois_over_rest() {
     let (status, _) = call(&app, "GET", "/agents/nobody/whois", None).await;
     assert_eq!(status, 404);
 }
+
+/// Malformed role, ban and rotation requests are contract errors.
+#[tokio::test]
+async fn malformed_role_and_rotation_requests_are_refused() {
+    let (_d, app) = app();
+    let alice = Keypair::from_seed([1; 32]);
+    enroll(&app, "alice", &alice).await;
+    let post = |body: Value| call(&app, "POST", "/signed/ops", Some(body));
+    let base = |op: &str| json!({ "op": op, "agent": "alice", "room": "r", "counter": 1, "signature": "00".repeat(64) });
+    let with = |mut v: Value, k: &str, x: Value| {
+        v[k] = x;
+        v
+    };
+    let cases = [
+        (
+            with(base("create"), "description", json!(5)),
+            "invalid_description",
+        ),
+        (with(base("create"), "public", json!("yes")), "invalid_body"),
+        (base("promote"), "invalid_body"),
+        (base("demote"), "invalid_body"),
+        (base("unban"), "invalid_body"),
+        (
+            with(
+                with(base("ban"), "target", json!("x")),
+                "target_key",
+                json!("zz"),
+            ),
+            "invalid_key",
+        ),
+        (base("rotate_key"), "invalid_body"),
+        (base("direct"), "invalid_body"),
+    ];
+    for (body, want) in cases {
+        let (_, v) = post(body.clone()).await;
+        assert_eq!(v["error"], want, "{body}");
+    }
+    let rotate = |body: Value| call(&app, "POST", "/agents/alice/key/rotate", Some(body));
+    let key = Keypair::from_seed([2; 32]).public().to_hex();
+    let sig = "00".repeat(64);
+    for (body, want) in [
+        (
+            json!({ "counter": 1, "signature": sig, "proof": sig }),
+            "invalid_body",
+        ),
+        (
+            json!({ "new_key": key, "signature": sig, "proof": sig }),
+            "invalid_body",
+        ),
+        (
+            json!({ "new_key": key, "counter": 1, "signature": sig }),
+            "invalid_body",
+        ),
+        (
+            json!({ "new_key": key, "counter": 1, "signature": sig, "proof": "zz" }),
+            "invalid_signature",
+        ),
+        (
+            json!({ "new_key": key, "counter": 1, "signature": sig, "proof": sig }),
+            "invalid_signature",
+        ),
+    ] {
+        let (_, v) = rotate(body.clone()).await;
+        assert_eq!(v["error"], want, "{body}");
+    }
+}

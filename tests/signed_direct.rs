@@ -223,3 +223,78 @@ async fn the_send_contract_takes_a_signature() {
     .unwrap_err();
     assert_eq!(code(half), "invalid_body");
 }
+
+/// A room send with `counter` and `signature` through the send contract (REST
+/// and WebSocket) is the signed room `send`.
+#[tokio::test]
+async fn a_signed_room_send_goes_through_the_send_contract() {
+    use serde_json::json;
+    let (_d, bus) = strict("strict-room-tools");
+    let (vega, orion) = (keys(1), keys(2));
+    enroll(&bus, "vega", &vega).await;
+    enroll(&bus, "orion", &orion).await;
+    let create = SignedOp::Create {
+        description: String::new(),
+        public: true,
+    };
+    bus.signed_op(SignedRequest {
+        agent: name("vega"),
+        room: room("lobby"),
+        counter: 1,
+        signature: vega.sign(&create.payload("lobby", "vega", 1)),
+        op: create,
+    })
+    .await
+    .unwrap();
+    let send = SignedOp::Send {
+        body: "hi all".into(),
+    };
+    let sig = vega.sign(&send.payload("lobby", "vega", 2));
+    let reply = mentischat::tools::send_message(
+        &bus,
+        &json!({ "from": "vega", "room": "lobby", "body": "hi all", "counter": 2, "signature": sig.to_hex() }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reply["room"], "lobby");
+    let bad = mentischat::tools::send_message(
+        &bus,
+        &json!({ "from": "vega", "room": "lobby", "body": "x", "counter": 3, "signature": "zz" }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(code(bad), "invalid_signature");
+}
+
+/// A room keeps at most `MAX_BANS` bans; one more is `room_full`.
+#[tokio::test]
+async fn a_room_keeps_a_bounded_number_of_bans() {
+    use mentischat::bus::MAX_BANS;
+    let (_d, bus) = fresh_bus("bans-cap");
+    let vega = keys(1);
+    enroll(&bus, "vega", &vega).await;
+    let op = |counter: u64, op: SignedOp| SignedRequest {
+        agent: name("vega"),
+        room: room("lobby"),
+        counter,
+        signature: vega.sign(&op.payload("lobby", "vega", counter)),
+        op,
+    };
+    let create = SignedOp::Create {
+        description: String::new(),
+        public: true,
+    };
+    bus.signed_op(op(1, create)).await.unwrap();
+    let ban = |i: usize| SignedOp::Ban {
+        target: format!("ghost{i}"),
+        target_key: None,
+    };
+    for i in 0..MAX_BANS {
+        bus.signed_op(op(2 + i as u64, ban(i))).await.unwrap();
+    }
+    let err = bus
+        .signed_op(op(2 + MAX_BANS as u64, ban(MAX_BANS)))
+        .await
+        .unwrap_err();
+    assert_eq!(code(err), "room_full");
+}

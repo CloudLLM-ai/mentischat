@@ -320,6 +320,8 @@ async fn responses_carry_security_headers() {
 #[tokio::test]
 async fn the_overview_and_activity_show_the_mailbox() {
     let (_d, bus, app) = app_with(Some("4242"));
+    // The feed records only while the dashboard is open.
+    bus.watch_activity();
     traffic(&bus).await;
     let cookie = login(&app).await;
     let o = send(&app, get("/dashboard/api/overview", Some(&cookie)))
@@ -407,6 +409,7 @@ async fn the_overview_and_activity_show_the_mailbox() {
 #[tokio::test]
 async fn without_a_pin_there_is_no_text_and_no_actions() {
     let (_d, bus, app) = app_with(None);
+    bus.watch_activity();
     traffic(&bus).await;
     let r = send(&app, get("/dashboard", None)).await;
     assert_eq!(r.status, 200);

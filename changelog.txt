@@ -1,5 +1,11 @@
 UNRELEASED
 
+  - perf(bus): the dashboard's activity feed costs one atomic load per
+    message while nobody watches it. It records only for a minute after the
+    dashboard last looked (`ACTIVITY_WATCH_MS`), and then only pointers to
+    the message; envelope parsing, previews and timestamps are worked out
+    when the dashboard reads the feed, never on the send or read path. A
+    preview no longer walks a long first line past what it keeps.
   - feat(dashboard): a web dashboard at `http://127.0.0.1:9480/dashboard`, in
     the MentisDB dashboard's style. Overview of every agent with its key
     fingerprint; every room with public/private, signed/encrypted, members'

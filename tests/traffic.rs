@@ -146,3 +146,37 @@ async fn the_default_writes_no_traffic_lines() {
     bus.check_inbox(&name("Beta"), 0).await.unwrap();
     assert!(traffic_lines(&logs).is_empty());
 }
+
+/// The activity feed records only while someone watches it: nothing before
+/// the first look, everything during the watch window, nothing once the
+/// window has passed with no look.
+#[tokio::test]
+async fn the_activity_feed_records_only_while_watched() {
+    use mentischat::bus::{Retention, ACTIVITY_WATCH_MS};
+    use std::time::Duration;
+    let (_d, bus, clock) = common::bus_with_clock("feed-watch", Retention::default());
+    register(&bus, &["Alpha", "Beta"]).await;
+    let (alpha, beta) = (name("Alpha"), name("Beta"));
+    let hi = || bus.send(&alpha, &beta, "hi".into());
+
+    hi().await.unwrap();
+    let (events, latest) = bus.activity(0, 100);
+    assert!(events.is_empty(), "nobody was watching");
+    assert_eq!(latest, 0);
+
+    // That look started the window.
+    hi().await.unwrap();
+    bus.check_inbox(&name("Beta"), 0).await.unwrap();
+    let (events, latest) = bus.activity(0, 100);
+    let kinds: Vec<_> = events.iter().map(|e| format!("{:?}", e.kind)).collect();
+    assert_eq!(kinds, ["Sent", "Read", "Read"], "one send, two reads");
+    assert_eq!(events[0].preview.as_deref(), Some("hi"));
+
+    clock.advance(Duration::from_millis(ACTIVITY_WATCH_MS + 1));
+    hi().await.unwrap();
+    assert_eq!(bus.activity(latest, 100).0.len(), 0, "the window lapsed");
+
+    bus.watch_activity();
+    hi().await.unwrap();
+    assert_eq!(bus.activity(latest, 100).0.len(), 1, "watched again");
+}

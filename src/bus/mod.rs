@@ -83,7 +83,9 @@ pub use signed::{
 pub use signed_persist::{verify_signed_record, RecordSummary};
 pub use snapshot::{remove_snapshot, SnapshotError};
 pub use stream::{Push, StreamSession};
-pub use traffic::{Activity, ActivityKind, TrafficLog, ACTIVITY_CAPACITY, PREVIEW_CHARS};
+pub use traffic::{
+    Activity, ActivityKind, TrafficLog, ACTIVITY_CAPACITY, ACTIVITY_WATCH_MS, PREVIEW_CHARS,
+};
 
 use clock::{rfc3339_ms, unix_ms, Clock};
 use delivery::{history_page, history_rows};
@@ -273,9 +275,20 @@ impl Bus {
     /// Each sent event carries the start of the text unless the message is
     /// end-to-end encrypted. The feed keeps the last [`ACTIVITY_CAPACITY`]
     /// events, whatever the traffic log is set to, in memory only; reading it
-    /// changes nothing.
+    /// changes nothing in the mailbox.
+    ///
+    /// The feed records only while someone watches it: for
+    /// [`ACTIVITY_WATCH_MS`] after a call to this or to
+    /// [`watch_activity`](Self::watch_activity). Otherwise sends and reads pay
+    /// one atomic load for it, nothing more.
     pub fn activity(&self, after: u64, limit: usize) -> (Vec<Activity>, u64) {
-        self.traffic.feed.since(after, limit)
+        self.traffic.feed.since(after, limit, self.now_ms())
+    }
+
+    /// Start (or keep) the activity feed recording for [`ACTIVITY_WATCH_MS`],
+    /// without reading it.
+    pub fn watch_activity(&self) {
+        self.traffic.feed.watch(self.now_ms());
     }
 
     /// Require a signature on every send and every room operation: plain

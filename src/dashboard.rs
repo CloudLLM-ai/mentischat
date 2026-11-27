@@ -441,6 +441,8 @@ fn error(e: &crate::errors::MailboxError) -> Response {
 /// `GET /dashboard/api/overview`: agents, rooms, counts and the dashboard's
 /// own settings.
 async fn api_overview(State(ctx): State<Ctx>) -> Response {
+    // An open dashboard is what the activity feed records for.
+    ctx.bus.watch_activity();
     match ctx.bus.operator_view().await {
         Ok(view) => {
             let mut body = serde_json::to_value(&view).unwrap_or(Value::Null);

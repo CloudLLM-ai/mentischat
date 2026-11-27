@@ -11,6 +11,7 @@
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -69,30 +70,103 @@ pub struct Activity {
     pub preview: Option<String>,
 }
 
-/// The recent [`Activity`], oldest first, bounded to [`ACTIVITY_CAPACITY`].
+/// How long one look at the feed keeps it recording, in milliseconds. While
+/// nobody has looked for this long the feed records nothing, so a daemon
+/// without its dashboard open pays one atomic load per message for it.
+pub const ACTIVITY_WATCH_MS: u64 = 60_000;
+
+/// One recorded event: pointers only. The text, the times and the flags are
+/// worked out when the feed is read, not on the send or read path.
+#[derive(Debug, Clone)]
+struct Entry {
+    seq: u64,
+    kind: ActivityKind,
+    at_ms: u64,
+    msg: Arc<Msg>,
+    reader: Option<Arc<str>>,
+}
+
+impl Entry {
+    fn activity(&self) -> Activity {
+        let msg = &self.msg;
+        let envelope = crate::signed::Envelope::parse(&msg.body).ok();
+        let encrypted = envelope.as_ref().is_some_and(|e| e.body.starts_with("mls/"));
+        let text = match &envelope {
+            None => Some(&*msg.body),
+            Some(e) if !encrypted => Some(e.body),
+            Some(_) => None,
+        };
+        Activity {
+            seq: self.seq,
+            kind: self.kind,
+            at: rfc3339_ms(self.at_ms),
+            from: msg.from.to_string(),
+            to: msg.room.is_none().then(|| msg.to.to_string()),
+            room: msg.room.as_deref().map(str::to_string),
+            reader: self.reader.as_deref().map(str::to_string),
+            id: msg.id,
+            bytes: msg.body.len(),
+            signed: envelope.is_some(),
+            encrypted,
+            preview: match self.kind {
+                ActivityKind::Sent => text.map(preview),
+                ActivityKind::Read => None,
+            },
+        }
+    }
+}
+
+/// The recent [`Activity`], oldest first, bounded to [`ACTIVITY_CAPACITY`],
+/// recorded only while someone watches it (see [`ACTIVITY_WATCH_MS`]).
 #[derive(Debug, Default)]
 pub(super) struct Feed {
-    events: Mutex<(u64, VecDeque<Activity>)>,
+    /// Milliseconds since the Unix epoch until which the feed records.
+    watched_until: AtomicU64,
+    events: Mutex<(u64, VecDeque<Entry>)>,
 }
 
 impl Feed {
-    fn push(&self, make: impl FnOnce(u64) -> Activity) {
+    #[inline]
+    fn watched(&self, now_ms: u64) -> bool {
+        now_ms < self.watched_until.load(Ordering::Relaxed)
+    }
+
+    /// Keep recording for [`ACTIVITY_WATCH_MS`] from `now_ms`.
+    pub(super) fn watch(&self, now_ms: u64) {
+        self.watched_until
+            .fetch_max(now_ms.saturating_add(ACTIVITY_WATCH_MS), Ordering::Relaxed);
+    }
+
+    fn push(&self, kind: ActivityKind, at_ms: u64, msgs: &[Arc<Msg>], reader: Option<&Arc<str>>) {
         let mut guard = self.events.lock();
         let (next, events) = &mut *guard;
-        *next += 1;
-        events.push_back(make(*next));
-        while events.len() > ACTIVITY_CAPACITY {
-            events.pop_front();
+        for msg in msgs {
+            *next += 1;
+            if events.len() == ACTIVITY_CAPACITY {
+                events.pop_front();
+            }
+            events.push_back(Entry {
+                seq: *next,
+                kind,
+                at_ms,
+                msg: msg.clone(),
+                reader: reader.cloned(),
+            });
         }
     }
 
     /// Events after `after`, oldest first, at most `limit`; and the newest
-    /// sequence number (0 when nothing happened yet).
-    pub(super) fn since(&self, after: u64, limit: usize) -> (Vec<Activity>, u64) {
-        let guard = self.events.lock();
-        let (next, events) = &*guard;
-        let start = events.partition_point(|e| e.seq <= after);
-        (events.range(start..).take(limit).cloned().collect(), *next)
+    /// sequence number (0 when nothing happened yet). Reading the feed keeps
+    /// it recording (see [`ACTIVITY_WATCH_MS`]).
+    pub(super) fn since(&self, after: u64, limit: usize, now_ms: u64) -> (Vec<Activity>, u64) {
+        self.watch(now_ms);
+        let (picked, latest): (Vec<Entry>, u64) = {
+            let guard = self.events.lock();
+            let (next, events) = &*guard;
+            let start = events.partition_point(|e| e.seq <= after);
+            (events.range(start..).take(limit).cloned().collect(), *next)
+        };
+        (picked.iter().map(Entry::activity).collect(), latest)
     }
 }
 
@@ -108,53 +182,22 @@ pub(super) struct Traffic {
 
 impl Traffic {
     /// Report that `msg` was sent.
-    pub(super) fn sent(&self, msg: &Msg, body: Body) {
+    #[inline]
+    pub(super) fn sent(&self, msg: &Arc<Msg>, body: Body) {
         self.log.sent(msg, body);
-        let (signed, encrypted, text) = match body {
-            Body::Plain => (false, false, Some(&*msg.body)),
-            Body::Signed => {
-                let text = crate::signed::Envelope::parse(&msg.body)
-                    .ok()
-                    .map(|e| e.body);
-                let encrypted = text.is_none_or(|t| t.starts_with("mls/"));
-                (true, encrypted, text.filter(|_| !encrypted))
-            }
-        };
-        self.feed.push(|seq| Activity {
-            seq,
-            kind: ActivityKind::Sent,
-            at: rfc3339_ms(msg.created_ms),
-            from: msg.from.to_string(),
-            to: msg.room.is_none().then(|| msg.to.to_string()),
-            room: msg.room.as_deref().map(str::to_string),
-            reader: None,
-            id: msg.id,
-            bytes: msg.body.len(),
-            signed,
-            encrypted,
-            preview: text.map(preview),
-        });
+        if self.feed.watched(msg.created_ms) {
+            self.feed
+                .push(ActivityKind::Sent, msg.created_ms, std::slice::from_ref(msg), None);
+        }
     }
 
     /// Report that `reader` read each of `messages` at `now_ms`.
-    pub(super) fn read(&self, reader: &str, messages: &[Arc<Msg>], now_ms: u64) {
+    #[inline]
+    pub(super) fn read(&self, reader: &Arc<str>, messages: &[Arc<Msg>], now_ms: u64) {
         self.log.read(reader, messages);
-        for msg in messages {
-            let signed = crate::signed::Envelope::parse(&msg.body).ok();
-            self.feed.push(|seq| Activity {
-                seq,
-                kind: ActivityKind::Read,
-                at: rfc3339_ms(now_ms),
-                from: msg.from.to_string(),
-                to: msg.room.is_none().then(|| msg.to.to_string()),
-                room: msg.room.as_deref().map(str::to_string),
-                reader: Some(reader.to_string()),
-                id: msg.id,
-                bytes: msg.body.len(),
-                signed: signed.is_some(),
-                encrypted: signed.is_some_and(|e| e.body.starts_with("mls/")),
-                preview: None,
-            });
+        if !messages.is_empty() && self.feed.watched(now_ms) {
+            self.feed
+                .push(ActivityKind::Read, now_ms, messages, Some(reader));
         }
     }
 }
@@ -291,7 +334,8 @@ fn preview(body: &str) -> String {
         .take(PREVIEW_CHARS)
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
-    let cut = first.len() < text.len() || first.chars().count() > PREVIEW_CHARS;
+    // Bounded: never walks more of a long line than it keeps.
+    let cut = first.len() < text.len() || first.chars().nth(PREVIEW_CHARS).is_some();
     if cut {
         format!("{kept}…")
     } else {
